@@ -209,7 +209,11 @@ def build_sparse_attn_sharedkv(
                             # Causal s-position in the kv sequence.
                             s_global = act_kv - act_q + s_i
                             ori_right = s_global
-                            ori_left = T.max(s_global - ori_win_left, 0)
+                            # Clamp window start to 0. T.if_then_else (a
+                            # ternary) avoids the ambiguous C++ ``max()``
+                            # overload that T.max generates here.
+                            ori_left_raw = s_global - ori_win_left
+                            ori_left = T.if_then_else(ori_left_raw < 0, 0, ori_left_raw)
                             cmp_threshold = (s_global + 1) // cmp_ratio
 
                             # ================= CUBE =================

@@ -32,20 +32,31 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import golden as G  # noqa: E402
 
 
-# ---- Try to set the default device to NPU; tolerate CPU-only hosts. ----
+# ---- Detect the NPU; tolerate CPU-only hosts. ----
+# NOTE: we deliberately do NOT call torch.set_default_device("npu").
+# Data generation and the golden run on CPU; only the kernel call is
+# wrapped in `with torch.device("npu")`. Setting the default device
+# globally makes torch.randperm(generator=<cpu-gen>) fail with a
+# device-mismatch error.
 def _try_set_npu():
     try:
         import torch_npu  # noqa: F401
 
-        torch.set_default_device("npu")
-        return True
-    except Exception:
-        return False
+        return torch.npu.is_available(), None
+    except Exception as exc:
+        return False, repr(exc)
 
 
-HAS_NPU = _try_set_npu()
+HAS_NPU, _NPU_ERR = _try_set_npu()
+# Print a diagnostic banner so a silent run is at least somewhat decipherable.
+print(
+    f"[test_sparse_attn_sharedkv] HAS_NPU={HAS_NPU} "
+    f"(reason: {'OK' if HAS_NPU else _NPU_ERR})",
+    flush=True,
+)
 requires_npu = pytest.mark.skipif(
-    not HAS_NPU, reason="Ascend NPU not available; can't run TileLang kernel"
+    not HAS_NPU,
+    reason=f"Ascend NPU not available ({_NPU_ERR})",
 )
 
 
@@ -361,6 +372,7 @@ def test_sparse_attn_sharedkv(case_name, dtype):
     from api import sparse_attn_sharedkv
 
     cfg = SCENARIOS[case_name]
+    # Data generation + golden run on CPU (default device).
     case = _build_case(cfg, dtype)
 
     # Move tensors to NPU.
@@ -369,28 +381,33 @@ def test_sparse_attn_sharedkv(case_name, dtype):
             return None
         return t.npu().contiguous() if hasattr(t, "npu") else t
 
-    out = sparse_attn_sharedkv(
-        _dev(case["q"]),
-        ori_kv=_dev(case["ori_pa"]),
-        cmp_kv=_dev(case["cmp_pa"]),
-        cmp_sparse_indices=_dev(case["cmp_idx"]),
-        ori_block_table=_dev(case["ori_bt"]),
-        cmp_block_table=_dev(case["cmp_bt"]),
-        cu_seqlens_q=_dev(case["cu_seqlens_q"]) if cfg["layout_q"] == "TND" else None,
-        seqused_kv=_dev(case["seqused_kv"]),
-        sinks=_dev(case["sinks"]),
-        softmax_scale=cfg["softmax_scale"],
-        cmp_ratio=cfg["cmp_ratio"] if cfg["scenario"] >= 2 else None,
-        ori_mask_mode=cfg["ori_mask_mode"],
-        cmp_mask_mode=cfg["cmp_mask_mode"],
-        ori_win_left=cfg["ori_win_left"],
-        ori_win_right=cfg["ori_win_right"],
-        layout_q=cfg["layout_q"],
-        layout_kv="PA_ND",
-        topk_cmp=cfg.get("K", 0),
-    )
+    # The kernel call (and TileLang's auto-allocated output / workspaces)
+    # must run with the NPU as the default device.
+    with torch.device("npu"):
+        out = sparse_attn_sharedkv(
+            _dev(case["q"]),
+            ori_kv=_dev(case["ori_pa"]),
+            cmp_kv=_dev(case["cmp_pa"]),
+            cmp_sparse_indices=_dev(case["cmp_idx"]),
+            ori_block_table=_dev(case["ori_bt"]),
+            cmp_block_table=_dev(case["cmp_bt"]),
+            cu_seqlens_q=_dev(case["cu_seqlens_q"])
+            if cfg["layout_q"] == "TND"
+            else None,
+            seqused_kv=_dev(case["seqused_kv"]),
+            sinks=_dev(case["sinks"]),
+            softmax_scale=cfg["softmax_scale"],
+            cmp_ratio=cfg["cmp_ratio"] if cfg["scenario"] >= 2 else None,
+            ori_mask_mode=cfg["ori_mask_mode"],
+            cmp_mask_mode=cfg["cmp_mask_mode"],
+            ori_win_left=cfg["ori_win_left"],
+            ori_win_right=cfg["ori_win_right"],
+            layout_q=cfg["layout_q"],
+            layout_kv="PA_ND",
+            topk_cmp=cfg.get("K", 0),
+        )
+        torch.npu.synchronize()
 
-    torch.npu.synchronize() if hasattr(torch, "npu") else None
     out_cpu = out.cpu()
     ref = case["cpu_ref"]
     torch.testing.assert_close(out_cpu, ref, rtol=2e-2, atol=2e-2)
