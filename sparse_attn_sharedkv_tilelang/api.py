@@ -324,20 +324,7 @@ def sparse_attn_sharedkv(
     ori_bt = ori_block_table.to(torch.int32).to(q.device)
     cmp_bt = cmp_block_table.to(torch.int32).to(q.device)
 
-    # ---- Allocate workspaces (matches the kernel signature). ----
-    BI = 64
-    H_per_block = N1
-    workspace_dtype = dtype
-    ws_kv = torch.zeros((core_num, BI, D), dtype=workspace_dtype, device=q.device)
-    ws_score = torch.zeros(
-        (core_num, H_per_block, BI), dtype=torch.float32, device=q.device
-    )
-    ws_p = torch.zeros(
-        (core_num, H_per_block, BI), dtype=workspace_dtype, device=q.device
-    )
-    ws_o = torch.zeros((core_num, H_per_block, D), dtype=torch.float32, device=q.device)
-
-    # ---- Run kernel. ----
+    # ---- Run kernel. Workspaces are auto-allocated via workspace_idx. ----
     out_bsnd = func(
         q_bsnd.contiguous(),
         ori_kv.contiguous(),
@@ -348,10 +335,6 @@ def sparse_attn_sharedkv(
         act_q_lens.contiguous(),
         seqused_kv_dev.contiguous(),
         sinks_dev.contiguous(),
-        ws_kv,
-        ws_score,
-        ws_p,
-        ws_o,
     )
 
     # ---- Convert layout back. ----
