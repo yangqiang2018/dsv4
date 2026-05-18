@@ -134,7 +134,7 @@ def build_sparse_attn_sharedkv(
         "acc_o_half": 88 * KB,  # aliases acc_o_ub (disjoint phases)
     }
 
-    @tilelang.jit(out_idx=[7], workspace_idx=[8, 9, 10, 11])
+    @tilelang.jit(out_idx=[7, 12], workspace_idx=[8, 9, 10, 11])
     def _make():
         @T.prim_func
         def main(
@@ -150,6 +150,7 @@ def build_sparse_attn_sharedkv(
             ws_score: T.Tensor([core_num, H_per_block, BI], accum_dtype),  # type: ignore[valid-type]
             ws_p: T.Tensor([core_num, H_per_block, BI], dtype),  # type: ignore[valid-type]
             ws_o: T.Tensor([core_num, H_per_block, D], accum_dtype),  # type: ignore[valid-type]
+            dbg_acc_o: T.Tensor([NI_total, n_heads, D], accum_dtype),  # type: ignore[valid-type]
         ):
             with T.Kernel(core_num, is_npu=True) as (cid, vid):
                 # ---- L1 / L0 (cube). ----
@@ -480,6 +481,18 @@ def build_sparse_attn_sharedkv(
                                     )
                                     T.barrier_all()
                                     T.tile.add(acc_o, acc_o, acc_o_ub)
+                                    T.barrier_all()
+                                    # DEBUG: dump pre-normalization acc_o after
+                                    # each chunk to localize the ori->cmp
+                                    # online-softmax divergence.
+                                    T.copy(
+                                        acc_o,
+                                        dbg_acc_o[
+                                            chunk,
+                                            vid * v_block : vid * v_block + v_block,
+                                            0:D,
+                                        ],
+                                    )
                                     T.barrier_all()
                                     T.set_cross_flag("V", _FLAG_ITER_DONE)
 

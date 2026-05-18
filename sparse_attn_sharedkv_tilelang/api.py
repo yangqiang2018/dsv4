@@ -223,6 +223,7 @@ def sparse_attn_sharedkv(
     layout_kv: str = "PA_ND",
     core_num: int = DEFAULT_CORE_NUM,
     topk_cmp: Optional[int] = None,
+    return_chunk_dump: bool = False,
 ) -> torch.Tensor:
     """Forward pass. Returns ``attention_out`` with the same layout as ``q``.
 
@@ -359,7 +360,7 @@ def sparse_attn_sharedkv(
     sinks_dev = sinks.to(torch.float32).to(q.device)
 
     # ---- Run kernel. Workspaces are auto-allocated via workspace_idx. ----
-    out_bsnd = func(
+    out_bsnd, dbg_acc_o = func(
         q_bsnd.contiguous(),
         ori_kv_logical.contiguous(),
         cmp_kv_logical.contiguous(),
@@ -373,5 +374,9 @@ def sparse_attn_sharedkv(
     if layout_q == "TND":
         cu = cu_seqlens_q.to(torch.int32).cpu()
         out_tnd = _bsnd_to_tnd_out(out_bsnd, cu)
+        if return_chunk_dump:
+            return out_tnd, dbg_acc_o
         return out_tnd
+    if return_chunk_dump:
+        return out_bsnd, dbg_acc_o
     return out_bsnd
