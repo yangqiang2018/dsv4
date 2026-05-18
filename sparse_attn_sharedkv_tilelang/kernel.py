@@ -112,7 +112,11 @@ def build_sparse_attn_sharedkv(
     out_shape = [batch, max_seq, n_heads, D]
     ori_kv_shape = [batch, max_ori_s, n_kv_heads, D]
     cmp_kv_shape = [batch, max_cmp_s, n_kv_heads, D]
-    indices_shape = [batch, max_seq, n_kv_heads, max(topk_cmp, 1)]
+    # cmp_indices is front-padded host-side by NI_ori*BI dummy slots so
+    # the cmp gather can address it with a plain `chunk*BI` slice start.
+    # A GM->UB DMA whose slice start is `loop_var - const` mis-resolves
+    # the source on Ascend and leaves idx_int stale (the chunk-2 bug).
+    indices_shape = [batch, max_seq, n_kv_heads, NI_total * BI]
 
     # ---- Manual address maps (bytes). ----
     KB = 1024
@@ -327,13 +331,12 @@ def build_sparse_attn_sharedkv(
                                             )
                                             T.barrier_all()
                                     else:
-                                        cmp_chunk = chunk - NI_ori
                                         T.copy(
                                             cmp_indices[
                                                 b_i,
                                                 s_i,
                                                 0,
-                                                cmp_chunk * BI : cmp_chunk * BI + BI,
+                                                chunk * BI : chunk * BI + BI,
                                             ],
                                             idx_int,
                                         )

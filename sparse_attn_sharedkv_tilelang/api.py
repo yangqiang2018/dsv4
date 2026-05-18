@@ -310,9 +310,24 @@ def sparse_attn_sharedkv(
     else:
         N2 = ori_kv.shape[2]
         K = 0
-        cmp_indices_dev = torch.zeros(
-            (B, S_max, N2, 1), dtype=torch.int32, device=q.device
-        )
+        cmp_indices_dev = None
+
+    # ---- Front-pad cmp_indices with NI_ori*BI dummy slots. ----
+    # The kernel walks the ori chunks then the cmp chunks in one loop;
+    # cmp chunk `chunk` reads cmp_indices[..., chunk*BI : chunk*BI+BI].
+    # Padding the front by the ori-chunk span keeps that slice start a
+    # plain `chunk*BI`. A TileLang GM->UB DMA whose slice start is
+    # `loop_var - const` mis-resolves the source and leaves idx_int
+    # stale -- this was the SCFA chunk-2 divergence.
+    _bi = 64
+    _pad_cols = ((ori_win_left + 1 + _bi - 1) // _bi) * _bi
+    _front = torch.full(
+        (B, S_max, N2, _pad_cols), -1, dtype=torch.int32, device=q.device
+    )
+    if cmp_indices_dev is not None:
+        cmp_indices_dev = torch.cat([_front, cmp_indices_dev.to(torch.int32)], dim=3)
+    else:
+        cmp_indices_dev = _front
 
     if N1 != 64 or N2 != 1 or D != 512:
         raise ValueError(
