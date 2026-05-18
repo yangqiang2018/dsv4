@@ -36,6 +36,14 @@ The ``cmp_kv[i] = i`` tests make each gathered row reveal the token
 index the kernel actually fetched, so a mismatch names the exact
 (chunk, lane) and the wrong index.
 
+A second section (``_poison_test``) adds one ``T.tile.createvecindex``
+to the otherwise-identical kernel. The baseline cmp gather is known
+good; the full kernel's cmp-pass index ``T.copy`` silently no-ops even
+after fix (1) gave it a private buffer. The only structural feature the
+full kernel then still shares with this probe and the baseline does not
+is a createvecindex elsewhere in the V scope. This section isolates
+whether that op is what breaks a subsequent GM->UB index copy.
+
 Run on the NPU host:  python3 gather_probe.py
 """
 
@@ -64,6 +72,7 @@ def build_gather_probe(
     block_I: int = 64,
     core_num: int = DEFAULT_CORE_NUM,
     dtype: str = "bfloat16",
+    with_createvecindex: bool = False,
 ):
     """Build the isolated vector-only cmp-gather kernel.
 
@@ -71,6 +80,14 @@ def build_gather_probe(
     the row the kernel gathered for sparse slot ``k`` of work item
     ``(b, s)`` -- i.e. ``cmp_KV[b, cmp_indices[b, s, 0, k], 0, :]`` if
     the gather is correct.
+
+    With ``with_createvecindex=True`` the kernel runs one
+    ``T.tile.createvecindex`` (into a separate UB buffer) at the top of
+    the V scope, before the cmp-copy loop -- mirroring kernel.py's ori
+    chunks under fix (1). It then also returns ``cvi_out``, the dumped
+    createvecindex result, which both keeps the op alive (no DCE) and
+    proves it executed. This isolates whether a createvecindex anywhere
+    in the V scope poisons a subsequent GM->UB index ``T.copy``.
     """
     assert topk % block_I == 0, "topk must be a multiple of block_I"
     BI = block_I
@@ -81,6 +98,72 @@ def build_gather_probe(
     cmp_kv_shape = [batch, max_cmp_s, 1, D]
     indices_shape = [batch, max_seq, 1, topk]
     out_shape = [batch, max_seq, topk, D]
+    cvi_shape = [batch, max_seq, BI]
+
+    # Recognisable base: cvi_out reads back as [cvi_base, cvi_base+1, ...],
+    # proof the createvecindex actually ran rather than being optimised out.
+    cvi_base = 4096
+
+    if with_createvecindex:
+
+        @tilelang.jit(out_idx=[2, 3])
+        def _make():
+            @T.prim_func
+            def main(
+                cmp_KV: T.Tensor(cmp_kv_shape, dtype),  # type: ignore[valid-type]
+                cmp_indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore[valid-type]
+                Output: T.Tensor(out_shape, dtype),  # type: ignore[valid-type]
+                cvi_out: T.Tensor(cvi_shape, indices_dtype),  # type: ignore[valid-type]
+            ):
+                with T.Kernel(core_num, is_npu=True) as (cid, vid):
+                    idx_int = T.alloc_ub([BI], indices_dtype)
+                    idx_cvi = T.alloc_ub([BI], indices_dtype)
+                    kv_ub = T.alloc_ub([D], dtype)
+                    T.annotate_address({idx_int: 0, idx_cvi: 1024, kv_ub: 2048})
+
+                    total_work = batch * max_seq
+                    for slot in T.serial(T.ceildiv(total_work, core_num)):
+                        pid = slot * core_num + cid
+                        if pid < total_work:
+                            b_i = pid // max_seq
+                            s_i = pid % max_seq
+                            with T.Scope("V"):
+                                # One createvecindex into a private buffer,
+                                # before the cmp-copy loop -- mirrors the
+                                # ori chunks of kernel.py under fix (1).
+                                # The cvi_out dump keeps it live (no DCE)
+                                # and proves it executed.
+                                T.tile.createvecindex(idx_cvi, cvi_base)
+                                T.barrier_all()
+                                T.copy(idx_cvi, cvi_out[b_i, s_i, :])
+                                T.barrier_all()
+                                for ci in range(NI):
+                                    T.copy(
+                                        cmp_indices[
+                                            b_i,
+                                            s_i,
+                                            0,
+                                            ci * BI : ci * BI + BI,
+                                        ],
+                                        idx_int,
+                                    )
+                                    T.barrier_all()
+                                    for bi_i in range(BI // 2):
+                                        lane = bi_i + vid * (BI // 2)
+                                        T.copy(
+                                            cmp_KV[b_i, idx_int[lane], 0, :],
+                                            kv_ub,
+                                        )
+                                        T.barrier_all()
+                                        T.copy(
+                                            kv_ub,
+                                            Output[b_i, s_i, ci * BI + lane, :],
+                                        )
+                                        T.barrier_all()
+
+            return main
+
+        return _make()
 
     @tilelang.jit(out_idx=[2])
     def _make():
@@ -181,6 +264,57 @@ def _run(build_kwargs, cmp_kv, cmp_idx):
     return out.cpu()
 
 
+def _poison_test():
+    """Decisive isolation test for the SCFA chunk-2 bug.
+
+    The full kernel's cmp-pass GM->UB index ``T.copy`` silently no-ops,
+    and kernel.py fix (1) (a private cmp index buffer) did not fix it --
+    so the cause is not which buffer createvecindex writes. This runs
+    the known-good baseline gather and an *identical* kernel with one
+    createvecindex added (separate buffer), on the same inputs:
+
+    * baseline OK + variant OK  -> createvecindex is exonerated; the
+      kernel.py poison is some other structural feature.
+    * baseline OK + variant MISMATCH -> a createvecindex anywhere in the
+      V scope breaks a later GM->UB copy; fix (2) (delete it) is right.
+
+    ``cvi_out[:8]`` must read back as ``[4096..4103]``; if not, the
+    createvecindex was optimised away and the variant proves nothing.
+    """
+    print("\n==== createvecindex poison test (topk=512, random idx) ====")
+    B, MAXS, D = 1, 1, 512
+    MAX_CMP = 2048
+    topk = 512
+    cmp_kv_idx = (
+        torch.arange(MAX_CMP, dtype=torch.float32)
+        .view(1, MAX_CMP, 1, 1)
+        .expand(1, MAX_CMP, 1, D)
+        .to(torch.bfloat16)
+    )
+    rand_idx = (
+        torch.randperm(MAX_CMP)[:topk].to(torch.int32).view(1, 1, 1, topk).contiguous()
+    )
+    ref = _ref_gather(cmp_kv_idx, rand_idx)
+    kw = dict(batch=B, max_seq=MAXS, max_cmp_s=MAX_CMP, topk=topk, head_dim=D)
+
+    def dev(t):
+        return t.npu().contiguous()
+
+    func0 = build_gather_probe(**kw)
+    with torch.device("npu"):
+        out0 = func0(dev(cmp_kv_idx), dev(rand_idx))
+        torch.npu.synchronize()
+    _report("baseline  (no createvecindex)", out0.cpu(), ref, rand_idx)
+
+    func1 = build_gather_probe(with_createvecindex=True, **kw)
+    with torch.device("npu"):
+        out1, cvi = func1(dev(cmp_kv_idx), dev(rand_idx))
+        torch.npu.synchronize()
+    _report("variant   (+ createvecindex)", out1.cpu(), ref, rand_idx)
+    cvi8 = cvi.cpu()[0, 0, :8].tolist()
+    print(f"    cvi_out[:8] = {cvi8}  (expect [4096..4103] => createvecindex ran)")
+
+
 def main():
     if not hasattr(torch, "npu"):
         print("torch_npu not available; run this on the NPU host.")
@@ -238,6 +372,8 @@ def main():
             _ref_gather(cmp_kv_rand, rand_idx),
             rand_idx,
         )
+
+    _poison_test()
 
 
 if __name__ == "__main__":
