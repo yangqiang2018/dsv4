@@ -18,6 +18,13 @@ This uses the default (non-pto) Ascend C lowering path: explicit
 ``example_sparse_flash_attn_mask_pa.py`` example. The whole kernel body
 is flat (no helper calls inside the ``@T.prim_func``).
 
+The kernel takes **logical** (un-paged) KV: ``ori_KV`` /  ``cmp_KV`` are
+``[batch, max_s, n_kv_heads, D]``. PageAttention block-table resolution
+is done host-side in :mod:`api` -- the kernel only does a single-level
+indirect gather ``KV[b, idx, 0, :]``, matching the verified
+``example_sparse_flash_attn_gqa_pto`` pattern (a two-level indirect
+paged gather with a non-trivial block table mis-resolves on Ascend).
+
 The kernel takes a padded BSND layout for ``Q`` / ``Output``; :mod:`api`
 converts TND inputs to BSND before invocation.
 """
@@ -45,18 +52,14 @@ def build_sparse_attn_sharedkv(
     *,
     batch: int,
     max_seq: int,
-    ori_table_len: int,
-    cmp_table_len: int,
+    max_ori_s: int,
+    max_cmp_s: int,
     n_heads: int = 64,
     n_kv_heads: int = 1,
     head_dim: int = 512,
     topk_cmp: int = 512,
     cmp_ratio: int = 4,
     ori_win_left: int = 127,
-    ori_block_size: int = 128,
-    cmp_block_size: int = 128,
-    ori_block_num: int = 256,
-    cmp_block_num: int = 64,
     softmax_scale: float = 0.04419417,
     dtype: str = "bfloat16",
     block_I: int = 64,
@@ -65,9 +68,9 @@ def build_sparse_attn_sharedkv(
     """Build a JIT-compiled TileLang kernel for SparseAttnSharedKV.
 
     Arguments are all compile-time constants. Call the returned kernel
-    object with the runtime tensors (BSND-padded Q + paged KV + tables +
-    sinks). :mod:`api` provides a high-level wrapper that converts
-    layouts and synthesises the cmp scenario inputs.
+    object with the runtime tensors (BSND-padded Q + logical KV + sinks).
+    :mod:`api` provides a high-level wrapper that converts layouts,
+    un-pages the KV and synthesises the cmp scenario inputs.
     """
     _check_dtypes(dtype)
     assert n_heads == 64, "API constraint: n_heads must be 64"
@@ -76,8 +79,8 @@ def build_sparse_attn_sharedkv(
     assert ori_win_left == 127, "API constraint: ori_win_left must be 127"
     assert topk_cmp >= 0
     assert topk_cmp % block_I == 0, "topk_cmp must be a multiple of block_I"
-    assert ori_block_size > 0 and ori_block_size % block_I == 0
-    assert cmp_block_size > 0
+    assert batch > 0 and max_seq > 0
+    assert max_ori_s > 0 and max_cmp_s > 0
 
     gqa_group = n_heads // n_kv_heads  # 64
     BI = block_I  # 64
@@ -95,16 +98,10 @@ def build_sparse_attn_sharedkv(
     v_block = H_per_block // 2  # 32 -- each AIV handles half the heads
     ub_len = max(32 // 4, v_block)  # 32-byte UB alignment for fp32 scalars
 
-    # Runtime dims are passed as compile-time constants (the kernel is
-    # JIT-specialised per shape). Avoids TileLang symbolic-var resolution,
-    # which mis-resolved 'batch' for the TND-padded inputs.
-    assert batch > 0 and max_seq > 0
-    assert ori_table_len > 0 and cmp_table_len > 0
-
     q_shape = [batch, max_seq, n_heads, D]
     out_shape = [batch, max_seq, n_heads, D]
-    ori_kv_shape = [ori_block_num, ori_block_size, n_kv_heads, D]
-    cmp_kv_shape = [cmp_block_num, cmp_block_size, n_kv_heads, D]
+    ori_kv_shape = [batch, max_ori_s, n_kv_heads, D]
+    cmp_kv_shape = [batch, max_cmp_s, n_kv_heads, D]
     indices_shape = [batch, max_seq, n_kv_heads, max(topk_cmp, 1)]
 
     # ---- Manual address maps (bytes). ----
@@ -130,7 +127,7 @@ def build_sparse_attn_sharedkv(
         "acc_o_half": 88 * KB,  # aliases acc_o_ub (disjoint phases)
     }
 
-    @tilelang.jit(out_idx=[9], workspace_idx=[10, 11, 12, 13])
+    @tilelang.jit(out_idx=[7], workspace_idx=[8, 9, 10, 11])
     def _make():
         @T.prim_func
         def main(
@@ -138,8 +135,6 @@ def build_sparse_attn_sharedkv(
             ori_KV: T.Tensor(ori_kv_shape, dtype),  # type: ignore[valid-type]
             cmp_KV: T.Tensor(cmp_kv_shape, dtype),  # type: ignore[valid-type]
             cmp_indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore[valid-type]
-            ori_block_table: T.Tensor([batch, ori_table_len], indices_dtype),  # type: ignore[valid-type]
-            cmp_block_table: T.Tensor([batch, cmp_table_len], indices_dtype),  # type: ignore[valid-type]
             actual_q_len: T.Tensor([batch], indices_dtype),  # type: ignore[valid-type]
             actual_kv_len: T.Tensor([batch], indices_dtype),  # type: ignore[valid-type]
             Sinks: T.Tensor([n_heads], accum_dtype),  # type: ignore[valid-type]
@@ -214,7 +209,7 @@ def build_sparse_attn_sharedkv(
                             s_global = act_kv - act_q + s_i
                             ori_right = s_global
                             # Clamp window start to 0. T.if_then_else (a
-                            # ternary) avoids the ambiguous C++ ``max()``
+                            # ternary) avoids the ambiguous C++ max()
                             # overload that T.max generates here.
                             ori_left_raw = s_global - ori_win_left
                             ori_left = T.if_then_else(ori_left_raw < 0, 0, ori_left_raw)
@@ -300,15 +295,8 @@ def build_sparse_attn_sharedkv(
                                             lane = bi_i + vid * (BI // 2)
                                             g_idx = chunk_start + lane
                                             if g_idx <= ori_right:
-                                                page = g_idx // ori_block_size
-                                                phys = ori_block_table[b_i, page]
-                                                off = g_idx % ori_block_size
-                                                # Let the block_table GM load
-                                                # land before its result is
-                                                # used as a DMA source address.
-                                                T.barrier_all()
                                                 T.copy(
-                                                    ori_KV[phys, off, 0, :],
+                                                    ori_KV[b_i, g_idx, 0, :],
                                                     kv_ub,
                                                 )
                                             else:
@@ -332,6 +320,7 @@ def build_sparse_attn_sharedkv(
                                         )
                                         T.copy(idx_int, idx_float)
                                         T.barrier_all()
+                                        # mask = (idx >= 0) AND (idx < thr)
                                         T.tile.compare(
                                             mask_ub,
                                             idx_float,
@@ -354,20 +343,9 @@ def build_sparse_attn_sharedkv(
                                         for bi_i in range(BI // 2):
                                             lane = bi_i + vid * (BI // 2)
                                             raw = idx_int[lane]
-                                            # Let the idx_int UB load land
-                                            # before its result feeds the
-                                            # block_table GM-load address.
-                                            T.barrier_all()
                                             if raw >= 0:
-                                                page = raw // cmp_block_size
-                                                phys = cmp_block_table[b_i, page]
-                                                off = raw % cmp_block_size
-                                                # Let the block_table GM load
-                                                # land before its result is
-                                                # used as a DMA source address.
-                                                T.barrier_all()
                                                 T.copy(
-                                                    cmp_KV[phys, off, 0, :],
+                                                    cmp_KV[b_i, raw, 0, :],
                                                     kv_ub,
                                                 )
                                             else:
