@@ -11,6 +11,11 @@ Localises the SCFA mismatch with several probes on scfa_decode
   broken regardless of indices.
 * cmp_kv-zeroed probe -- isolates the cmp control-flow/softmax from the
   cmp KV values.
+* Probe I -- sets cmp_kv[token i] = i and zeroes ori_kv, so each head's
+  output reads out the softmax-weighted mean of the token indices the
+  kernel actually gathered. Probe I-seq repeats it with sequential
+  indices as a control. A per-head I/I-seq split pinpoints a gather that
+  substitutes lane-position for the loaded index value.
 
 Run on the NPU host:  python3 debug_scfa.py
 """
@@ -92,6 +97,54 @@ def _head_match(name, kernel, golden):
         print(
             f"    kernel head {h:2d}: self-dist={self_dist:.4f}  "
             f"closest golden head={best:2d} (dist={dists[best].item():.4f})"
+        )
+
+
+def _indexed_cmp_paged(cmp_pa, cmp_bt, block_size):
+    """Paged cmp_kv whose *logical* token i carries the constant value i.
+
+    Inverts the block table so that ``_unpage_kv`` (and the golden's
+    ``unpack_paged_kv``) resolve logical token i to a [D] vector of all
+    ``i``. bf16 rounds indices >256 to the nearest representable value;
+    that is fine for spotting a mis-gather.
+    """
+    pa = torch.zeros(cmp_pa.shape, dtype=torch.float32)
+    _, bsz, _, _ = cmp_pa.shape
+    B, table_len = cmp_bt.shape
+    off = torch.arange(bsz, dtype=torch.float32).view(bsz, 1, 1)
+    for b in range(B):
+        for blk in range(table_len):
+            phys = int(cmp_bt[b, blk])
+            if phys < 0:
+                continue
+            pa[phys] = blk * block_size + off
+    return pa.to(cmp_pa.dtype)
+
+
+def _per_head_idx(name, kernel, golden, q_bnsd):
+    """Per-head gathered-index readout for the cmp_kv[i]=i probe.
+
+    ``kernel`` / ``golden``: [T1, n_heads, D] with T1=1. With cmp_kv[i]=i
+    and ori_kv=0 every head row is ~constant over D and equals the
+    softmax-weighted mean of the cmp-token indices that head attended to.
+    A per-head mismatch therefore means the kernel gathered a different
+    cmp-token multiset than the golden expects.
+    """
+    k = kernel.float()[0]  # [n_heads, D]
+    g = golden.float()[0]
+    n_heads, _ = k.shape
+    bad = []
+    for h in range(n_heads):
+        km = k[h].mean().item()
+        gm = g[h].mean().item()
+        if abs(km - gm) > 2e-2:
+            bad.append((h, km, gm, k[h].std().item()))
+    print(f"  {name}: {len(bad)}/{n_heads} heads mismatch (weighted-mean readout)")
+    for h, km, gm, kstd in bad[:40]:
+        qsum = q_bnsd[0, h, 0, :].float().sum().item()
+        print(
+            f"    head {h:2d}: kernel={km:+9.3f} golden={gm:+9.3f} "
+            f"diff={km - gm:+8.3f} kstd_over_D={kstd:.3f} sum(q_h)={qsum:+.1f}"
         )
 
 
@@ -299,6 +352,79 @@ def main():
     )
     ref_z = G.bnsd_to_tnd_out(ref_z_bnsd, case["cu_seqlens_q"])
     _diff("kernel Z vs golden Z", out_z, ref_z)
+
+    # ---- Probe I: cmp_kv[i] = i, ori_kv = 0 -- gathered-index readout. ----
+    # Every logical cmp token i carries the constant value i across D and
+    # ori_kv is zeroed. The kernel output for each head is then constant
+    # across D and equals the cmp-softmax-weighted mean of the token
+    # indices the kernel ACTUALLY gathered; the golden (same cmp_kv, true
+    # indices) yields the weighted mean of the TRUE set. A per-head
+    # mismatch pinpoints a wrong gather. CFA passing already proves the
+    # gather is correct for `arange` indices, so Probe I-seq below is the
+    # control: if I-seq matches the golden but Probe I (random) does not,
+    # the gather is substituting lane-position for the loaded index value.
+    q_bnsd_i = G.tnd_to_bnsd_q(case["q"], case["cu_seqlens_q"])
+    act_q_i = (case["cu_seqlens_q"][1:] - case["cu_seqlens_q"][:-1]).tolist()
+    cmp_seqs_i = int(case["seqused_kv"].max()) // cfg["cmp_ratio"]
+    cmp_k_idx_bnsd = (
+        torch.arange(cmp_seqs_i, dtype=torch.float32)
+        .view(1, 1, cmp_seqs_i, 1)
+        .expand(1, cfg["N2"], cmp_seqs_i, cfg["D"])
+        .to(dtype)
+    )
+    ori_zero_bnsd = torch.zeros(
+        (1, cfg["N2"], int(case["seqused_kv"].max()), cfg["D"]), dtype=dtype
+    )
+    common_i = dict(common)
+    common_i["ori_kv"] = dev(torch.zeros_like(case["ori_pa"]))
+    common_i["cmp_kv"] = dev(
+        _indexed_cmp_paged(case["cmp_pa"], case["cmp_bt"], cfg["block_size2"])
+    )
+
+    def _golden_idx(cmp_idx_bsnd):
+        ref_bnsd = G.sparse_attn_sharedkv_golden_bnsd(
+            q_bnsd_i,
+            ori_zero_bnsd,
+            case["sinks"],
+            act_q_lens=act_q_i,
+            act_kv_lens=case["seqused_kv"].tolist(),
+            softmax_scale=cfg["softmax_scale"],
+            cmp_k_bnsd=cmp_k_idx_bnsd,
+            cmp_sparse_indices=cmp_idx_bsnd,
+            cmp_ratio=cfg["cmp_ratio"],
+            ori_win_left=cfg["ori_win_left"],
+            ori_win_right=cfg["ori_win_right"],
+        )
+        return G.bnsd_to_tnd_out(ref_bnsd, case["cu_seqlens_q"])
+
+    print("\n-- Probe I: cmp_kv[i]=i, ori_kv=0 (gathered-index readout) --")
+    with torch.device("npu"):
+        out_i = sparse_attn_sharedkv(
+            dev(case["q"]),
+            cmp_sparse_indices=dev(case["cmp_idx"]),
+            **common_i,
+        )
+        torch.npu.synchronize()
+    out_i = out_i.cpu()
+    ref_i = _golden_idx(case["cmp_idx"].unsqueeze(0))
+    _diff("kernel I vs golden I", out_i, ref_i)
+    _per_head_idx("per-head (I)", out_i, ref_i, q_bnsd_i)
+
+    # ---- Probe I-seq: same readout, sequential indices (control). ----
+    print("\n-- Probe I-seq: cmp_kv[i]=i, ori_kv=0, sequential indices --")
+    seq_idx_tnd = (
+        torch.arange(cfg["K"], dtype=torch.int32).view(1, 1, cfg["K"]).contiguous()
+    )
+    with torch.device("npu"):
+        out_iseq = sparse_attn_sharedkv(
+            dev(case["q"]),
+            cmp_sparse_indices=dev(seq_idx_tnd),
+            **common_i,
+        )
+        torch.npu.synchronize()
+    out_iseq = out_iseq.cpu()
+    ref_iseq = _golden_idx(seq_idx_tnd.unsqueeze(0))
+    _diff("kernel I-seq vs golden I-seq", out_iseq, ref_iseq)
 
 
 if __name__ == "__main__":
