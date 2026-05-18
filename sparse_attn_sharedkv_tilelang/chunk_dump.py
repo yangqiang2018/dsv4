@@ -1,22 +1,22 @@
 """Per-chunk online-softmax dump -- localizes the ori->cmp divergence.
 
-Established so far (gather_probe.py + debug_scfa.py):
+Established so far (gather_probe.py + debug_scfa.py + the acc_o dump):
 
 * the cmp gather is correct (gather_probe: all OK);
 * the cmp pass in isolation is correct (Probe I: ori_kv=0, bit-exact);
 * SWA -- the ori pass alone -- is correct;
+* the per-chunk acc_o dump shows chunk 0/1 (ori) bit-exact and the
+  divergence appearing abruptly at chunk 2, the FIRST cmp chunk.
 
-yet Probe A (real ori + real cmp) fails ~9.9%. So the bug is the
-ori->cmp interaction: the ori chunks leave a non-zero online-softmax
-state (acc_o != 0, m_i ~ +85) and the cmp chunks mishandle it. Probe I
-hides it because ori_kv=0 leaves acc_o == 0 and 0 * alpha == 0.
+So the bug fires inside the first cmp chunk: it processes the non-zero
+online-softmax state the ori chunks left behind (acc_o != 0, m_i ~ +85)
+and corrupts acc_o by ~|acc_o_ori|.
 
-The kernel debug build (api: ``return_chunk_dump=True``) now dumps the
-pre-normalization ``acc_o`` after every chunk into ``dbg_acc_o``. This
-script reruns scfa_decode, pulls that dump, and compares it
-chunk-by-chunk against a CPU reference that replays the exact 64-wide
-chunked online softmax. The first chunk where a bad head (2/31/...)
-diverges while head 0 stays clean pins where the merge goes wrong.
+This script dumps four per-chunk quantities -- post-chunk ``acc_o``,
+``m_i``, ``sumexp`` and the chunk's own ``P@V`` -- and compares each
+against a CPU replay of the exact 64-wide chunked online softmax. At
+chunk 2 this tells us directly whether the running max ``m_i`` is wrong
+(alpha mis-scales acc_o) or ``P@V`` is wrong (gemm2 / softmax probs).
 
 Run on the NPU host:  python3 chunk_dump.py
 """
@@ -35,16 +35,15 @@ from test_sparse_attn_sharedkv import SCENARIOS, _build_case  # noqa: E402
 def _simulate_chunks(case, cfg):
     """Replay the kernel's 64-wide chunked online softmax on CPU.
 
-    Returns ``[NI_total, n_heads, D]`` -- the pre-normalization ``acc_o``
-    after each chunk, matching what the kernel dumps into ``dbg_acc_o``.
+    Returns ``(acc_o, m_i, sumexp, pv)`` per chunk, matching the kernel's
+    ``dbg_acc_o`` / ``dbg_m`` / ``dbg_s`` / ``dbg_pv`` dumps.
     """
     BI = 64
     D = cfg["D"]
     scale = cfg["softmax_scale"]
     cmp_ratio = cfg["cmp_ratio"]
     act_kv = int(case["seqused_kv"][0])
-    act_q = 1  # scfa_decode: S1 = 1
-    s_global = act_kv - act_q  # s_i = 0
+    s_global = act_kv - 1  # act_q = 1, s_i = 0
     ori_left = max(s_global - cfg["ori_win_left"], 0)
     ori_right = s_global
     threshold = (s_global + 1) // cmp_ratio
@@ -62,7 +61,10 @@ def _simulate_chunks(case, cfg):
 
     s = torch.ones(n_heads)
     o = torch.zeros(n_heads, D)
-    dump = torch.zeros(ni_total, n_heads, D)
+    dump_o = torch.zeros(ni_total, n_heads, D)
+    dump_m = torch.zeros(ni_total, n_heads)
+    dump_s = torch.zeros(ni_total, n_heads)
+    dump_pv = torch.zeros(ni_total, n_heads, D)
     for ci in range(ni_total):
         if ci < ni_ori:
             g0 = ori_left + ci * BI
@@ -78,10 +80,10 @@ def _simulate_chunks(case, cfg):
         alpha = torch.exp(m_old - m)
         p = torch.exp(score - m.unsqueeze(1))
         s = alpha * s + p.sum(dim=1)
-        p_low = p.to(torch.bfloat16).to(torch.float32)
-        o = o * alpha.unsqueeze(1) + p_low @ k_tile
-        dump[ci] = o
-    return dump
+        pv = p.to(torch.bfloat16).to(torch.float32) @ k_tile
+        o = o * alpha.unsqueeze(1) + pv
+        dump_o[ci], dump_m[ci], dump_s[ci], dump_pv[ci] = o, m, s, pv
+    return dump_o, dump_m, dump_s, dump_pv
 
 
 def main():
@@ -98,7 +100,7 @@ def main():
         return None if t is None else t.npu().contiguous()
 
     with torch.device("npu"):
-        _, dbg = sparse_attn_sharedkv(
+        _, k_o, k_m, k_s, k_pv = sparse_attn_sharedkv(
             dev(case["q"]),
             ori_kv=dev(case["ori_pa"]),
             cmp_kv=dev(case["cmp_pa"]),
@@ -120,26 +122,39 @@ def main():
             return_chunk_dump=True,
         )
         torch.npu.synchronize()
-    dbg = dbg.float().cpu()  # [NI_total, n_heads, D]
+    k_o = k_o.float().cpu()
+    k_m = k_m.float().cpu()
+    k_s = k_s.float().cpu()
+    k_pv = k_pv.float().cpu()
 
-    ref = _simulate_chunks(case, cfg)
-    ni_total = dbg.shape[0]
+    r_o, r_m, r_s, r_pv = _simulate_chunks(case, cfg)
+    ni_total = k_o.shape[0]
 
     # head 0 is bit-exact in Probe A; the rest are its worst bad heads.
     watch = [0, 2, 18, 31, 42, 52, 59, 62]
-    print(
-        f"=== per-chunk acc_o: kernel dump vs CPU reference (NI_total={ni_total}) ==="
-    )
-    print("    chunk 0-1 = ori window, chunk 2+ = cmp; per-head numbers are max|diff|")
+    print(f"=== per-chunk dump: kernel vs CPU reference (NI_total={ni_total}) ===")
+    print("    chunk 0-1 = ori window, chunk 2+ = cmp")
     for ci in range(ni_total):
-        d = (dbg[ci] - ref[ci]).abs()
-        per_head = d.amax(dim=1)  # [n_heads]
-        worst = int(per_head.argmax())
         tag = "ori " if ci < 2 else f"cmp{ci - 2}"
-        cols = "  ".join(f"h{h}={per_head[h].item():8.3f}" for h in watch)
+        do = (k_o[ci] - r_o[ci]).abs().max().item()
+        dpv = (k_pv[ci] - r_pv[ci]).abs().max().item()
+        dm = (k_m[ci] - r_m[ci]).abs().max().item()
+        ds = (k_s[ci] - r_s[ci]).abs().max().item()
         print(
-            f"  chunk {ci:2d} [{tag}]: max|diff|={d.max().item():9.3f} "
-            f"@head{worst:2d} | {cols}"
+            f"  chunk {ci:2d} [{tag}]: acc_o|d|={do:9.3f}  pv|d|={dpv:9.3f}  "
+            f"m|d|={dm:11.4f}  s|d|={ds:13.3f}"
+        )
+
+    print("\n  --- chunk 2 (cmp0) per-head detail ---")
+    print("  (m: running max -> if kernel != ref the alpha rescale is wrong;")
+    print("   pv: this chunk's P@V -> if |d| is large the softmax/gemm2 is wrong)")
+    for h in watch:
+        pvd = (k_pv[2, h] - r_pv[2, h]).abs().max().item()
+        od = (k_o[2, h] - r_o[2, h]).abs().max().item()
+        print(
+            f"    h{h:2d}: m kernel={k_m[2, h]:9.3f} ref={r_m[2, h]:9.3f}  |  "
+            f"s kernel={k_s[2, h]:13.3f} ref={r_s[2, h]:13.3f}  |  "
+            f"pv|d|={pvd:9.3f}  acc_o|d|={od:9.3f}"
         )
 
 

@@ -134,7 +134,7 @@ def build_sparse_attn_sharedkv(
         "acc_o_half": 88 * KB,  # aliases acc_o_ub (disjoint phases)
     }
 
-    @tilelang.jit(out_idx=[7, 12], workspace_idx=[8, 9, 10, 11])
+    @tilelang.jit(out_idx=[7, 12, 13, 14, 15], workspace_idx=[8, 9, 10, 11])
     def _make():
         @T.prim_func
         def main(
@@ -151,6 +151,9 @@ def build_sparse_attn_sharedkv(
             ws_p: T.Tensor([core_num, H_per_block, BI], dtype),  # type: ignore[valid-type]
             ws_o: T.Tensor([core_num, H_per_block, D], accum_dtype),  # type: ignore[valid-type]
             dbg_acc_o: T.Tensor([NI_total, n_heads, D], accum_dtype),  # type: ignore[valid-type]
+            dbg_m: T.Tensor([NI_total, n_heads], accum_dtype),  # type: ignore[valid-type]
+            dbg_s: T.Tensor([NI_total, n_heads], accum_dtype),  # type: ignore[valid-type]
+            dbg_pv: T.Tensor([NI_total, n_heads, D], accum_dtype),  # type: ignore[valid-type]
         ):
             with T.Kernel(core_num, is_npu=True) as (cid, vid):
                 # ---- L1 / L0 (cube). ----
@@ -491,6 +494,28 @@ def build_sparse_attn_sharedkv(
                                             chunk,
                                             vid * v_block : vid * v_block + v_block,
                                             0:D,
+                                        ],
+                                    )
+                                    T.copy(
+                                        acc_o_ub,
+                                        dbg_pv[
+                                            chunk,
+                                            vid * v_block : vid * v_block + v_block,
+                                            0:D,
+                                        ],
+                                    )
+                                    T.copy(
+                                        m_i,
+                                        dbg_m[
+                                            chunk,
+                                            vid * v_block : vid * v_block + v_block,
+                                        ],
+                                    )
+                                    T.copy(
+                                        sumexp,
+                                        dbg_s[
+                                            chunk,
+                                            vid * v_block : vid * v_block + v_block,
                                         ],
                                     )
                                     T.barrier_all()
