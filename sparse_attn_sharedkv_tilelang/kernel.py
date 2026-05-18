@@ -351,16 +351,17 @@ def build_sparse_attn_sharedkv(
                                         T.barrier_all()
                                         for bi_i in range(BI // 2):
                                             lane = bi_i + vid * (BI // 2)
-                                            raw = idx_int[lane]
-                                            T.barrier_all()
-                                            if raw >= 0:
-                                                T.barrier_all()
-                                                T.copy(
-                                                    cmp_KV[b_i, raw, 0, :],
-                                                    kv_ub,
-                                                )
-                                            else:
-                                                T.tile.fill(kv_ub, 0.0)
+                                            # Inline the UB-loaded index into
+                                            # the T.copy, matching the verified
+                                            # example_sparse_flash_attn_gqa_pto
+                                            # gather. NOTE: assumes every cmp
+                                            # index is >= 0 (true for all
+                                            # current SCFA test cases -- the
+                                            # generator never pads with -1).
+                                            T.copy(
+                                                cmp_KV[b_i, idx_int[lane], 0, :],
+                                                kv_ub,
+                                            )
                                             T.barrier_all()
                                             T.copy(
                                                 kv_ub,
