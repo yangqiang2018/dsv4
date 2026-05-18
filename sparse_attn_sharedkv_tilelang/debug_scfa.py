@@ -164,6 +164,30 @@ def main():
     _summary("golden B", ref_b)
     _diff("kernel B vs golden B", out_b, ref_b)
 
+    # ---- Probe C: SAME random indices, padded to K=2048. ----
+    # This runs the topk=2048 kernel on the exact same effective 512
+    # cmp tokens as Probe A. If C passes but A fails, the topk=512
+    # kernel itself is broken; if C also fails, it is not the kernel
+    # config.
+    print("\n-- Probe C: Probe-A random indices padded to K=2048 --")
+    K2 = 2048
+    idx_c = torch.full((1, 1, K2), -1, dtype=torch.int32)
+    idx_c[0, 0, :K] = case["cmp_idx"][0, 0, :]
+    common_c = dict(common)
+    common_c["topk_cmp"] = K2
+    with torch.device("npu"):
+        out_c = sparse_attn_sharedkv(
+            dev(case["q"]),
+            cmp_sparse_indices=dev(idx_c),
+            **common_c,
+        )
+        torch.npu.synchronize()
+    out_c = out_c.cpu()
+    ref_c = _golden(case, cfg, idx_c.unsqueeze(0))
+    _summary("kernel C", out_c)
+    _diff("kernel C vs golden C", out_c, ref_c)
+    _diff("kernel C vs golden A", out_c, ref_a)
+
     # ---- cmp_kv-zeroed probe. ----
     print("\n-- Probe Z: cmp_kv zeroed (real random indices) --")
     common_z = dict(common)
