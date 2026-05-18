@@ -73,6 +73,28 @@ def _per_head(name, a, b):
         print(f"    ... and {len(bad_heads) - 20} more")
 
 
+def _head_match(name, kernel, golden):
+    """For each badly-wrong kernel head, find the closest golden head.
+
+    If kernel head h matches golden head h' != h, the kernel is mixing
+    up heads (a head-permutation / wrong-slice bug).
+    """
+    k = kernel.float()[0]  # [n_heads, D]
+    g = golden.float()[0]
+    n_heads = k.shape[0]
+    print(f"  {name}: closest-golden-head for each wrong kernel head")
+    for h in range(n_heads):
+        self_dist = (k[h] - g[h]).abs().mean().item()
+        if self_dist <= 2e-2:
+            continue
+        dists = (k[h : h + 1] - g).abs().mean(dim=1)  # [n_heads]
+        best = int(dists.argmin())
+        print(
+            f"    kernel head {h:2d}: self-dist={self_dist:.4f}  "
+            f"closest golden head={best:2d} (dist={dists[best].item():.4f})"
+        )
+
+
 def _golden(case, cfg, cmp_idx_bsnd):
     """Recompute the BNSD golden for scfa_decode with given BSND indices."""
     q_bnsd = G.tnd_to_bnsd_q(case["q"], case["cu_seqlens_q"])
@@ -154,6 +176,7 @@ def main():
     _summary("golden A", ref_a)
     _diff("kernel A vs golden A", out_a, ref_a)
     _per_head("per-head (A)", out_a, ref_a)
+    _head_match("head-match (A)", out_a, ref_a)
 
     # ---- Probe B: SAME kernel, sequential indices (arange). ----
     print("\n-- Probe B: scenario-3 path, sequential indices [0..K-1] --")
