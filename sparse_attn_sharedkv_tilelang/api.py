@@ -261,13 +261,13 @@ def sparse_attn_sharedkv(
         cmp_indices_dev = cmp_sparse_indices_bsnd.to(q.device)
     elif scenario == 2:
         N2 = cmp_kv.shape[2]
-        # Synthesize dense indices. K is bounded by topk_cmp (caller-supplied)
-        # or max(seqused_kv) / cmp_ratio.
-        if topk_cmp is not None:
-            K = topk_cmp
-        else:
-            max_cmp = int(seqused_kv.max().item()) // cmp_ratio
-            K = max(64, ((max_cmp + 63) // 64) * 64)
+        # CFA attends to ALL compressed tokens up to the per-row causal
+        # threshold (NOT a fixed top-K). The dense synthesized indices
+        # must therefore span the largest possible threshold, i.e.
+        # floor(max(seqused_kv) / cmp_ratio). topk_cmp is meaningless for
+        # CFA and is intentionally ignored here.
+        max_cmp = int(seqused_kv.max().item()) // cmp_ratio
+        K = max(64, ((max_cmp + 63) // 64) * 64)
         cmp_indices_dev = _synthesize_dense_cmp_indices(
             B=B,
             S_max=S_max,

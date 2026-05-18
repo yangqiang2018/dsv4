@@ -299,6 +299,10 @@ def build_sparse_attn_sharedkv(
                                                 page = g_idx // ori_block_size
                                                 phys = ori_block_table[b_i, page]
                                                 off = g_idx % ori_block_size
+                                                # Let the block_table GM load
+                                                # land before its result is
+                                                # used as a DMA source address.
+                                                T.barrier_all()
                                                 T.copy(
                                                     ori_KV[phys, off, 0, :],
                                                     kv_ub,
@@ -346,10 +350,18 @@ def build_sparse_attn_sharedkv(
                                         for bi_i in range(BI // 2):
                                             lane = bi_i + vid * (BI // 2)
                                             raw = idx_int[lane]
+                                            # Let the idx_int UB load land
+                                            # before its result feeds the
+                                            # block_table GM-load address.
+                                            T.barrier_all()
                                             if raw >= 0:
                                                 page = raw // cmp_block_size
                                                 phys = cmp_block_table[b_i, page]
                                                 off = raw % cmp_block_size
+                                                # Let the block_table GM load
+                                                # land before its result is
+                                                # used as a DMA source address.
+                                                T.barrier_all()
                                                 T.copy(
                                                     cmp_KV[phys, off, 0, :],
                                                     kv_ub,
