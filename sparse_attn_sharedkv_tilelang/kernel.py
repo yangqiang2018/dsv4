@@ -309,6 +309,7 @@ def build_sparse_attn_sharedkv(
                                     ],
                                     idx_int_cmp,
                                 )
+                                T.barrier_all()
                                 T.copy(idx_int_cmp, idx_float)
                                 T.barrier_all()
                                 T.copy(idx_float, dbg_idxf[NI_total, :])
@@ -370,6 +371,13 @@ def build_sparse_attn_sharedkv(
                                             ],
                                             idx_int_cmp,
                                         )
+                                        # The cmp index load is an async
+                                        # GM->UB DMA. Wait for it before
+                                        # idx_int_cmp is read below, else
+                                        # the UB->UB copy lands the
+                                        # previous cmp chunk's DMA result
+                                        # in idx_float (off-by-one chunk).
+                                        T.barrier_all()
                                         T.copy(idx_int_cmp, idx_float)
                                         T.barrier_all()
                                         # mask = (idx >= 0) AND (idx < thr)
