@@ -113,9 +113,9 @@ def build_sparse_attn_sharedkv(
     ori_kv_shape = [batch, max_ori_s, n_kv_heads, D]
     cmp_kv_shape = [batch, max_cmp_s, n_kv_heads, D]
     # cmp_indices is front-padded host-side by NI_ori*BI dummy slots so
-    # the cmp gather can address it with a plain `chunk*BI` slice start.
-    # A GM->UB DMA whose slice start is `loop_var - const` mis-resolves
-    # the source on Ascend and leaves idx_int stale (the chunk-2 bug).
+    # the cmp chunks address it with a plain `chunk*BI` slice start
+    # (cmp chunk indices run NI_ori..NI_total-1). The padded slots also
+    # double as the dummy cmp_indices for the SWA scenario (no cmp pass).
     indices_shape = [batch, max_seq, n_kv_heads, NI_total * BI]
 
     # ---- Manual address maps (bytes). ----
@@ -137,12 +137,11 @@ def build_sparse_attn_sharedkv(
         "kv_ub": 84 * KB + 1280,
         "mask_ub": 84 * KB + 2304,
         "mask_ub_2": 84 * KB + 2336,
-        "idx_int_cmp": 84 * KB + 2368,
         "acc_o_ub": 88 * KB,
         "acc_o_half": 88 * KB,  # aliases acc_o_ub (disjoint phases)
     }
 
-    @tilelang.jit(out_idx=[7, 12, 13, 14, 15, 16, 17, 18], workspace_idx=[8, 9, 10, 11])
+    @tilelang.jit(out_idx=[7], workspace_idx=[8, 9, 10, 11])
     def _make():
         @T.prim_func
         def main(
@@ -158,13 +157,6 @@ def build_sparse_attn_sharedkv(
             ws_score: T.Tensor([core_num, H_per_block, BI], accum_dtype),  # type: ignore[valid-type]
             ws_p: T.Tensor([core_num, H_per_block, BI], dtype),  # type: ignore[valid-type]
             ws_o: T.Tensor([core_num, H_per_block, D], accum_dtype),  # type: ignore[valid-type]
-            dbg_acc_o: T.Tensor([NI_total, n_heads, D], accum_dtype),  # type: ignore[valid-type]
-            dbg_m: T.Tensor([NI_total, n_heads], accum_dtype),  # type: ignore[valid-type]
-            dbg_s: T.Tensor([NI_total, n_heads], accum_dtype),  # type: ignore[valid-type]
-            dbg_pv: T.Tensor([NI_total, n_heads, D], accum_dtype),  # type: ignore[valid-type]
-            dbg_mprev: T.Tensor([NI_total, n_heads], accum_dtype),  # type: ignore[valid-type]
-            dbg_score: T.Tensor([NI_total, n_heads, BI], accum_dtype),  # type: ignore[valid-type]
-            dbg_idxf: T.Tensor([NI_total + 1, BI], accum_dtype),  # type: ignore[valid-type]
         ):
             with T.Kernel(core_num, is_npu=True) as (cid, vid):
                 # ---- L1 / L0 (cube). ----
@@ -187,11 +179,6 @@ def build_sparse_attn_sharedkv(
                 acc_s_ub_ = T.alloc_ub([v_block, BI], accum_dtype)
                 acc_s_half = T.alloc_ub([v_block, BI], dtype)
                 idx_int = T.alloc_ub([BI], indices_dtype)
-                # Separate cmp-pass index buffer: T.tile.createvecindex
-                # writes idx_int in the ori branch, and sharing that
-                # buffer makes the cmp branch's GM->UB index DMA silently
-                # no-op (idx_int keeps the last ori createvecindex value).
-                idx_int_cmp = T.alloc_ub([BI], indices_dtype)
                 idx_float = T.alloc_ub([BI], accum_dtype)
                 kv_ub = T.alloc_ub([D], dtype)
                 mask_ub = T.alloc_ub([BI // 8], "uint8")
@@ -214,7 +201,6 @@ def build_sparse_attn_sharedkv(
                         sumexp_i_ub: ub_addr["sumexp_i_ub"],
                         sinks_ub: ub_addr["sinks_ub"],
                         idx_int: ub_addr["idx_int"],
-                        idx_int_cmp: ub_addr["idx_int_cmp"],
                         idx_float: ub_addr["idx_float"],
                         kv_ub: ub_addr["kv_ub"],
                         mask_ub: ub_addr["mask_ub"],
@@ -291,30 +277,6 @@ def build_sparse_attn_sharedkv(
 
                             # ================ VECTOR ================
                             with T.Scope("V"):
-                                # PROBE (fix-2 investigation): run chunk
-                                # 2's cmp index copy here, at the very top
-                                # of the V scope -- before any chunk,
-                                # cross-flag or cube handshake. The result
-                                # lands in dbg_idxf's extra row [NI_total].
-                                # If it matches the real cmp indices but
-                                # the in-loop chunk-2 copy does not, then
-                                # something executed between here and
-                                # chunk 2 poisons the copy.
-                                T.copy(
-                                    cmp_indices[
-                                        b_i,
-                                        s_i,
-                                        0,
-                                        NI_ori * BI : NI_ori * BI + BI,
-                                    ],
-                                    idx_int_cmp,
-                                )
-                                T.barrier_all()
-                                T.copy(idx_int_cmp, idx_float)
-                                T.barrier_all()
-                                T.copy(idx_float, dbg_idxf[NI_total, :])
-                                T.barrier_all()
-
                                 # Seed online softmax from sinks.
                                 T.copy(
                                     Sinks[vid * v_block : vid * v_block + v_block],
@@ -369,16 +331,16 @@ def build_sparse_attn_sharedkv(
                                                 0,
                                                 chunk * BI : chunk * BI + BI,
                                             ],
-                                            idx_int_cmp,
+                                            idx_int,
                                         )
                                         # The cmp index load is an async
                                         # GM->UB DMA. Wait for it before
-                                        # idx_int_cmp is read below, else
-                                        # the UB->UB copy lands the
-                                        # previous cmp chunk's DMA result
-                                        # in idx_float (off-by-one chunk).
+                                        # idx_int is read below, else the
+                                        # UB->UB copy lands the previous
+                                        # cmp chunk's DMA result in
+                                        # idx_float (off-by-one chunk).
                                         T.barrier_all()
-                                        T.copy(idx_int_cmp, idx_float)
+                                        T.copy(idx_int, idx_float)
                                         T.barrier_all()
                                         # mask = (idx >= 0) AND (idx < thr)
                                         T.tile.compare(
@@ -410,7 +372,7 @@ def build_sparse_attn_sharedkv(
                                             # current SCFA test cases -- the
                                             # generator never pads with -1).
                                             T.copy(
-                                                cmp_KV[b_i, idx_int_cmp[lane], 0, :],
+                                                cmp_KV[b_i, idx_int[lane], 0, :],
                                                 kv_ub,
                                             )
                                             T.barrier_all()
@@ -460,20 +422,6 @@ def build_sparse_attn_sharedkv(
                                         softmax_scale,
                                     )
                                     T.barrier_all()
-                                    # DEBUG: dump the masked+scaled score
-                                    # (the reduce_max input) so chunk_dump
-                                    # can tell whether the chunk-2 cmp
-                                    # scores are wrong (gather/gemm) or some
-                                    # lanes are -inf (mask).
-                                    T.copy(
-                                        acc_s_ub,
-                                        dbg_score[
-                                            chunk,
-                                            vid * v_block : vid * v_block + v_block,
-                                            :,
-                                        ],
-                                    )
-                                    T.barrier_all()
 
                                     T.reduce_max(acc_s_ub, m_i, dim=-1)
                                     T.barrier_all()
@@ -487,19 +435,6 @@ def build_sparse_attn_sharedkv(
                                     # dst-last form matches the verified
                                     # example_online_softmax.py.
                                     T.tile.max(m_i, m_i_prev, m_i)
-                                    T.barrier_all()
-                                    # DEBUG: dump m_i_prev right after
-                                    # tile.max -- still the copy(m_i) value
-                                    # (the running max entering this chunk).
-                                    # If this != the CPU reference the bug
-                                    # is upstream of tile.max (copy m_i).
-                                    T.copy(
-                                        m_i_prev,
-                                        dbg_mprev[
-                                            chunk,
-                                            vid * v_block : vid * v_block + v_block,
-                                        ],
-                                    )
                                     T.barrier_all()
                                     T.tile.sub(m_i_prev, m_i_prev, m_i)
                                     T.barrier_all()
@@ -567,43 +502,6 @@ def build_sparse_attn_sharedkv(
                                     )
                                     T.barrier_all()
                                     T.tile.add(acc_o, acc_o, acc_o_ub)
-                                    T.barrier_all()
-                                    # DEBUG: dump pre-normalization acc_o after
-                                    # each chunk to localize the ori->cmp
-                                    # online-softmax divergence.
-                                    T.copy(
-                                        acc_o,
-                                        dbg_acc_o[
-                                            chunk,
-                                            vid * v_block : vid * v_block + v_block,
-                                            0:D,
-                                        ],
-                                    )
-                                    T.copy(
-                                        acc_o_ub,
-                                        dbg_pv[
-                                            chunk,
-                                            vid * v_block : vid * v_block + v_block,
-                                            0:D,
-                                        ],
-                                    )
-                                    T.copy(
-                                        m_i,
-                                        dbg_m[
-                                            chunk,
-                                            vid * v_block : vid * v_block + v_block,
-                                        ],
-                                    )
-                                    T.copy(
-                                        sumexp,
-                                        dbg_s[
-                                            chunk,
-                                            vid * v_block : vid * v_block + v_block,
-                                        ],
-                                    )
-                                    # DEBUG: dump idx_float (the cmp/ori
-                                    # indices that feed the mask compares).
-                                    T.copy(idx_float, dbg_idxf[chunk, :])
                                     T.barrier_all()
                                     T.set_cross_flag("V", _FLAG_ITER_DONE)
 

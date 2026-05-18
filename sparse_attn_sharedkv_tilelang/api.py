@@ -223,7 +223,6 @@ def sparse_attn_sharedkv(
     layout_kv: str = "PA_ND",
     core_num: int = DEFAULT_CORE_NUM,
     topk_cmp: Optional[int] = None,
-    return_chunk_dump: bool = False,
 ) -> torch.Tensor:
     """Forward pass. Returns ``attention_out`` with the same layout as ``q``.
 
@@ -316,9 +315,8 @@ def sparse_attn_sharedkv(
     # The kernel walks the ori chunks then the cmp chunks in one loop;
     # cmp chunk `chunk` reads cmp_indices[..., chunk*BI : chunk*BI+BI].
     # Padding the front by the ori-chunk span keeps that slice start a
-    # plain `chunk*BI`. A TileLang GM->UB DMA whose slice start is
-    # `loop_var - const` mis-resolves the source and leaves idx_int
-    # stale -- this was the SCFA chunk-2 divergence.
+    # plain `chunk*BI`, and the dummy slots double as the SWA scenario's
+    # cmp_indices (scenario 1 has no cmp pass).
     _bi = 64
     _pad_cols = ((ori_win_left + 1 + _bi - 1) // _bi) * _bi
     _front = torch.full(
@@ -375,16 +373,7 @@ def sparse_attn_sharedkv(
     sinks_dev = sinks.to(torch.float32).to(q.device)
 
     # ---- Run kernel. Workspaces are auto-allocated via workspace_idx. ----
-    (
-        out_bsnd,
-        dbg_acc_o,
-        dbg_m,
-        dbg_s,
-        dbg_pv,
-        dbg_mprev,
-        dbg_score,
-        dbg_idxf,
-    ) = func(
+    out_bsnd = func(
         q_bsnd.contiguous(),
         ori_kv_logical.contiguous(),
         cmp_kv_logical.contiguous(),
@@ -397,28 +386,5 @@ def sparse_attn_sharedkv(
     # ---- Convert layout back. ----
     if layout_q == "TND":
         cu = cu_seqlens_q.to(torch.int32).cpu()
-        out_tnd = _bsnd_to_tnd_out(out_bsnd, cu)
-        if return_chunk_dump:
-            return (
-                out_tnd,
-                dbg_acc_o,
-                dbg_m,
-                dbg_s,
-                dbg_pv,
-                dbg_mprev,
-                dbg_score,
-                dbg_idxf,
-            )
-        return out_tnd
-    if return_chunk_dump:
-        return (
-            out_bsnd,
-            dbg_acc_o,
-            dbg_m,
-            dbg_s,
-            dbg_pv,
-            dbg_mprev,
-            dbg_score,
-            dbg_idxf,
-        )
+        return _bsnd_to_tnd_out(out_bsnd, cu)
     return out_bsnd
