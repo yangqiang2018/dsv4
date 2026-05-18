@@ -32,6 +32,13 @@ converts TND inputs to BSND before invocation.
 import tilelang
 from tilelang import language as T
 
+# Disable TileLang's on-disk kernel cache. Without this, a kernel
+# compiled from an earlier (buggy) revision is silently reused even
+# after the source changes -- the JIT cache key does not always track
+# every source edit. Every TileLang-Ascend example disables the cache
+# for exactly this reason.
+tilelang.disable_cache()
+
 # Atlas A3 cube/vector pair count.
 DEFAULT_CORE_NUM = 24
 
