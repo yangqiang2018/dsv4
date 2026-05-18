@@ -164,7 +164,7 @@ def build_sparse_attn_sharedkv(
             dbg_pv: T.Tensor([NI_total, n_heads, D], accum_dtype),  # type: ignore[valid-type]
             dbg_mprev: T.Tensor([NI_total, n_heads], accum_dtype),  # type: ignore[valid-type]
             dbg_score: T.Tensor([NI_total, n_heads, BI], accum_dtype),  # type: ignore[valid-type]
-            dbg_idxf: T.Tensor([NI_total, BI], accum_dtype),  # type: ignore[valid-type]
+            dbg_idxf: T.Tensor([NI_total + 1, BI], accum_dtype),  # type: ignore[valid-type]
         ):
             with T.Kernel(core_num, is_npu=True) as (cid, vid):
                 # ---- L1 / L0 (cube). ----
@@ -291,6 +291,29 @@ def build_sparse_attn_sharedkv(
 
                             # ================ VECTOR ================
                             with T.Scope("V"):
+                                # PROBE (fix-2 investigation): run chunk
+                                # 2's cmp index copy here, at the very top
+                                # of the V scope -- before any chunk,
+                                # cross-flag or cube handshake. The result
+                                # lands in dbg_idxf's extra row [NI_total].
+                                # If it matches the real cmp indices but
+                                # the in-loop chunk-2 copy does not, then
+                                # something executed between here and
+                                # chunk 2 poisons the copy.
+                                T.copy(
+                                    cmp_indices[
+                                        b_i,
+                                        s_i,
+                                        0,
+                                        NI_ori * BI : NI_ori * BI + BI,
+                                    ],
+                                    idx_int_cmp,
+                                )
+                                T.copy(idx_int_cmp, idx_float)
+                                T.barrier_all()
+                                T.copy(idx_float, dbg_idxf[NI_total, :])
+                                T.barrier_all()
+
                                 # Seed online softmax from sinks.
                                 T.copy(
                                     Sinks[vid * v_block : vid * v_block + v_block],

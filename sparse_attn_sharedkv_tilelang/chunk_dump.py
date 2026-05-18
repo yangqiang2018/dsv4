@@ -199,6 +199,32 @@ def main():
     print(f"    kernel[:8]={[round(x, 1) for x in ki[:8].tolist()]}")
     print(f"    ref   [:8]={[round(x, 1) for x in ri[:8].tolist()]}")
 
+    print("\n  --- all-chunk idx_float overview (kernel vs ref) ---")
+    for ci in range(ni_total):
+        tag = "ori " if ci < 2 else f"cmp{ci - 2}"
+        kc = k_idxf[ci]
+        rc = r_idxf[ci]
+        mm = int(((kc - rc).abs() > 0.5).sum())
+        print(
+            f"    chunk {ci:2d} [{tag}]: mismatch={mm:2d}/{kc.numel()}  "
+            f"kernel[:4]={[round(x, 1) for x in kc[:4].tolist()]}  "
+            f"ref[:4]={[round(x, 1) for x in rc[:4].tolist()]}"
+        )
+
+    print("\n  --- PROBE: chunk-2 cmp copy executed at V-scope top ---")
+    print("  (probe == ref  => the cmp copy works in-kernel; something")
+    print("   between V-scope top and chunk 2 poisons the in-loop copy.")
+    print("   probe == garbage => cmp copy fails kernel-wide, order-free.)")
+    probe = k_idxf[ni_total]
+    rc2 = r_idxf[2]
+    pd = (probe - rc2).abs()
+    print(
+        f"    probe mismatch={int((pd > 0.5).sum())}/{probe.numel()}  "
+        f"max|diff|={pd.max().item():.3f}"
+    )
+    print(f"    probe[:8]={[round(x, 1) for x in probe[:8].tolist()]}")
+    print(f"    ref  [:8]={[round(x, 1) for x in rc2[:8].tolist()]}")
+
 
 if __name__ == "__main__":
     main()
