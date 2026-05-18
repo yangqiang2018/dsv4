@@ -32,12 +32,15 @@ converts TND inputs to BSND before invocation.
 import tilelang
 from tilelang import language as T
 
-# Disable TileLang's on-disk kernel cache. Without this, a kernel
-# compiled from an earlier (buggy) revision is silently reused even
-# after the source changes -- the JIT cache key does not always track
-# every source edit. Every TileLang-Ascend example disables the cache
-# for exactly this reason.
+# Disable AND clear TileLang's on-disk kernel cache. disable_cache()
+# alone is not enough: the JIT cache key tracks the prim_func signature
+# but not every body edit, so a kernel compiled from an earlier (buggy)
+# revision is silently reused when only the body changes (e.g. an
+# address-map tweak or an operand-order fix). clear_cache() wipes any
+# stale artefact -- TileLang-Ascend's own test-suite clears the cache
+# before every test for exactly this reason.
 tilelang.disable_cache()
+tilelang.cache.clear_cache()
 
 # Atlas A3 cube/vector pair count.
 DEFAULT_CORE_NUM = 24
