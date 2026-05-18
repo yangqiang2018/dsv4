@@ -67,15 +67,19 @@ def _simulate_chunks(case, cfg):
     dump_pv = torch.zeros(ni_total, n_heads, D)
     dump_mprev = torch.zeros(ni_total, n_heads)
     dump_score = torch.zeros(ni_total, n_heads, BI)
+    dump_idxf = torch.zeros(ni_total, BI)
     for ci in range(ni_total):
         if ci < ni_ori:
             g0 = ori_left + ci * BI
             k_tile = ori_k[g0 : g0 + BI]
             valid = torch.arange(g0, g0 + BI) <= ori_right
+            idxf = torch.arange(g0, g0 + BI, dtype=torch.float32)
         else:
             idx = cmp_idx[(ci - ni_ori) * BI : (ci - ni_ori) * BI + BI]
             k_tile = cmp_k[idx]
             valid = (idx >= 0) & (idx < threshold)
+            idxf = idx.float()
+        dump_idxf[ci] = idxf
         score = ((q @ k_tile.T) * scale).masked_fill(~valid.unsqueeze(0), float("-inf"))
         dump_score[ci] = score
         m_old = m.clone()
@@ -87,7 +91,7 @@ def _simulate_chunks(case, cfg):
         pv = p.to(torch.bfloat16).to(torch.float32) @ k_tile
         o = o * alpha.unsqueeze(1) + pv
         dump_o[ci], dump_m[ci], dump_s[ci], dump_pv[ci] = o, m, s, pv
-    return dump_o, dump_m, dump_s, dump_pv, dump_mprev, dump_score
+    return dump_o, dump_m, dump_s, dump_pv, dump_mprev, dump_score, dump_idxf
 
 
 def main():
@@ -104,7 +108,7 @@ def main():
         return None if t is None else t.npu().contiguous()
 
     with torch.device("npu"):
-        _, k_o, k_m, k_s, k_pv, k_mprev, k_score = sparse_attn_sharedkv(
+        _, k_o, k_m, k_s, k_pv, k_mprev, k_score, k_idxf = sparse_attn_sharedkv(
             dev(case["q"]),
             ori_kv=dev(case["ori_pa"]),
             cmp_kv=dev(case["cmp_pa"]),
@@ -132,8 +136,9 @@ def main():
     k_pv = k_pv.float().cpu()
     k_mprev = k_mprev.float().cpu()
     k_score = k_score.float().cpu()
+    k_idxf = k_idxf.float().cpu()
 
-    r_o, r_m, r_s, r_pv, r_mprev, r_score = _simulate_chunks(case, cfg)
+    r_o, r_m, r_s, r_pv, r_mprev, r_score, r_idxf = _simulate_chunks(case, cfg)
     ni_total = k_o.shape[0]
 
     # head 0 is bit-exact in Probe A; the rest are its worst bad heads.
@@ -180,6 +185,19 @@ def main():
             f"    h{h:2d}: score amax kernel={k_amax:9.3f} ref={r_amax:9.3f}  "
             f"mask-mismatch={mask_mm:2d}  score-bad={score_bad:2d}/{ks.numel()}"
         )
+
+    print("\n  --- chunk 2 (cmp0) idx_float: kernel vs reference ---")
+    ki = k_idxf[2]
+    ri = r_idxf[2]
+    d = (ki - ri).abs()
+    print(
+        f"    idx_float mismatch={int((d > 0.5).sum())}/{ki.numel()}  "
+        f"max|diff|={d.max().item():.3f}"
+    )
+    print(f"    kernel min={ki.min().item():+.1f} max={ki.max().item():+.1f}")
+    print(f"    ref    min={ri.min().item():+.1f} max={ri.max().item():+.1f}")
+    print(f"    kernel[:8]={[round(x, 1) for x in ki[:8].tolist()]}")
+    print(f"    ref   [:8]={[round(x, 1) for x in ri[:8].tolist()]}")
 
 
 if __name__ == "__main__":

@@ -137,7 +137,7 @@ def build_sparse_attn_sharedkv(
         "acc_o_half": 88 * KB,  # aliases acc_o_ub (disjoint phases)
     }
 
-    @tilelang.jit(out_idx=[7, 12, 13, 14, 15, 16, 17], workspace_idx=[8, 9, 10, 11])
+    @tilelang.jit(out_idx=[7, 12, 13, 14, 15, 16, 17, 18], workspace_idx=[8, 9, 10, 11])
     def _make():
         @T.prim_func
         def main(
@@ -159,6 +159,7 @@ def build_sparse_attn_sharedkv(
             dbg_pv: T.Tensor([NI_total, n_heads, D], accum_dtype),  # type: ignore[valid-type]
             dbg_mprev: T.Tensor([NI_total, n_heads], accum_dtype),  # type: ignore[valid-type]
             dbg_score: T.Tensor([NI_total, n_heads, BI], accum_dtype),  # type: ignore[valid-type]
+            dbg_idxf: T.Tensor([NI_total, BI], accum_dtype),  # type: ignore[valid-type]
         ):
             with T.Kernel(core_num, is_npu=True) as (cid, vid):
                 # ---- L1 / L0 (cube). ----
@@ -559,6 +560,9 @@ def build_sparse_attn_sharedkv(
                                             vid * v_block : vid * v_block + v_block,
                                         ],
                                     )
+                                    # DEBUG: dump idx_float (the cmp/ori
+                                    # indices that feed the mask compares).
+                                    T.copy(idx_float, dbg_idxf[chunk, :])
                                     T.barrier_all()
                                     T.set_cross_flag("V", _FLAG_ITER_DONE)
 
