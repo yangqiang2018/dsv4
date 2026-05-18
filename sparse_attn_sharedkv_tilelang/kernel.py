@@ -115,14 +115,18 @@ def build_sparse_attn_sharedkv(
     KB = 1024
     l1_addr = {"q_l1": 0, "kv_l1": 64 * KB, "p_l1": 128 * KB}
     l0c_addr = {"acc_s_l0c": 0, "acc_o_l0c": 0}  # disjoint phases ⇒ alias
+    # m_i / m_i_prev / sumexp are deliberately placed in an isolated
+    # high-UB region, far from idx_int and from each other. The cmp pass
+    # fills idx_int with a GM->UB DMA (the ori pass uses createvecindex,
+    # never a DMA); per-chunk dumps showed that DMA corrupting the
+    # online-softmax scalars that used to sit in idx_int's 768-byte
+    # neighbourhood -- this was the chunk-2 (first cmp chunk) divergence.
+    # m_i keeps a 2 KB pad after it as headroom for the reduce_max write.
     ub_addr = {
         "acc_o": 0,
         "acc_s_ub": 64 * KB,
         "acc_s_ub_": 72 * KB,
         "acc_s_half": 80 * KB,
-        "m_i": 84 * KB,
-        "m_i_prev": 84 * KB + 128,
-        "sumexp": 84 * KB + 256,
         "sumexp_i_ub": 84 * KB + 384,
         "sinks_ub": 84 * KB + 512,
         "idx_int": 84 * KB + 768,
@@ -132,6 +136,9 @@ def build_sparse_attn_sharedkv(
         "mask_ub_2": 84 * KB + 2336,
         "acc_o_ub": 88 * KB,
         "acc_o_half": 88 * KB,  # aliases acc_o_ub (disjoint phases)
+        "m_i": 152 * KB,
+        "m_i_prev": 152 * KB + 2048,
+        "sumexp": 152 * KB + 2048 + 128,
     }
 
     @tilelang.jit(out_idx=[7, 12, 13, 14, 15], workspace_idx=[8, 9, 10, 11])
