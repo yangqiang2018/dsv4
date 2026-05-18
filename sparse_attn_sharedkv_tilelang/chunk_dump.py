@@ -65,6 +65,7 @@ def _simulate_chunks(case, cfg):
     dump_m = torch.zeros(ni_total, n_heads)
     dump_s = torch.zeros(ni_total, n_heads)
     dump_pv = torch.zeros(ni_total, n_heads, D)
+    dump_mprev = torch.zeros(ni_total, n_heads)
     for ci in range(ni_total):
         if ci < ni_ori:
             g0 = ori_left + ci * BI
@@ -76,6 +77,7 @@ def _simulate_chunks(case, cfg):
             valid = (idx >= 0) & (idx < threshold)
         score = ((q @ k_tile.T) * scale).masked_fill(~valid.unsqueeze(0), float("-inf"))
         m_old = m.clone()
+        dump_mprev[ci] = m_old
         m = torch.maximum(m, score.amax(dim=1))
         alpha = torch.exp(m_old - m)
         p = torch.exp(score - m.unsqueeze(1))
@@ -83,7 +85,7 @@ def _simulate_chunks(case, cfg):
         pv = p.to(torch.bfloat16).to(torch.float32) @ k_tile
         o = o * alpha.unsqueeze(1) + pv
         dump_o[ci], dump_m[ci], dump_s[ci], dump_pv[ci] = o, m, s, pv
-    return dump_o, dump_m, dump_s, dump_pv
+    return dump_o, dump_m, dump_s, dump_pv, dump_mprev
 
 
 def main():
@@ -100,7 +102,7 @@ def main():
         return None if t is None else t.npu().contiguous()
 
     with torch.device("npu"):
-        _, k_o, k_m, k_s, k_pv = sparse_attn_sharedkv(
+        _, k_o, k_m, k_s, k_pv, k_mprev = sparse_attn_sharedkv(
             dev(case["q"]),
             ori_kv=dev(case["ori_pa"]),
             cmp_kv=dev(case["cmp_pa"]),
@@ -126,8 +128,9 @@ def main():
     k_m = k_m.float().cpu()
     k_s = k_s.float().cpu()
     k_pv = k_pv.float().cpu()
+    k_mprev = k_mprev.float().cpu()
 
-    r_o, r_m, r_s, r_pv = _simulate_chunks(case, cfg)
+    r_o, r_m, r_s, r_pv, r_mprev = _simulate_chunks(case, cfg)
     ni_total = k_o.shape[0]
 
     # head 0 is bit-exact in Probe A; the rest are its worst bad heads.
@@ -152,9 +155,9 @@ def main():
         pvd = (k_pv[2, h] - r_pv[2, h]).abs().max().item()
         od = (k_o[2, h] - r_o[2, h]).abs().max().item()
         print(
-            f"    h{h:2d}: m kernel={k_m[2, h]:9.3f} ref={r_m[2, h]:9.3f}  |  "
-            f"s kernel={k_s[2, h]:13.3f} ref={r_s[2, h]:13.3f}  |  "
-            f"pv|d|={pvd:9.3f}  acc_o|d|={od:9.3f}"
+            f"    h{h:2d}: mprev kernel={k_mprev[2, h]:9.3f} "
+            f"ref={r_mprev[2, h]:9.3f}  ->  m kernel={k_m[2, h]:9.3f} "
+            f"ref={r_m[2, h]:9.3f}  |  pv|d|={pvd:8.3f}  acc_o|d|={od:8.3f}"
         )
 
 

@@ -137,7 +137,7 @@ def build_sparse_attn_sharedkv(
         "acc_o_half": 88 * KB,  # aliases acc_o_ub (disjoint phases)
     }
 
-    @tilelang.jit(out_idx=[7, 12, 13, 14, 15], workspace_idx=[8, 9, 10, 11])
+    @tilelang.jit(out_idx=[7, 12, 13, 14, 15, 16], workspace_idx=[8, 9, 10, 11])
     def _make():
         @T.prim_func
         def main(
@@ -157,6 +157,7 @@ def build_sparse_attn_sharedkv(
             dbg_m: T.Tensor([NI_total, n_heads], accum_dtype),  # type: ignore[valid-type]
             dbg_s: T.Tensor([NI_total, n_heads], accum_dtype),  # type: ignore[valid-type]
             dbg_pv: T.Tensor([NI_total, n_heads, D], accum_dtype),  # type: ignore[valid-type]
+            dbg_mprev: T.Tensor([NI_total, n_heads], accum_dtype),  # type: ignore[valid-type]
         ):
             with T.Kernel(core_num, is_npu=True) as (cid, vid):
                 # ---- L1 / L0 (cube). ----
@@ -429,6 +430,19 @@ def build_sparse_attn_sharedkv(
                                     # dst-last form matches the verified
                                     # example_online_softmax.py.
                                     T.tile.max(m_i, m_i_prev, m_i)
+                                    T.barrier_all()
+                                    # DEBUG: dump m_i_prev right after
+                                    # tile.max -- still the copy(m_i) value
+                                    # (the running max entering this chunk).
+                                    # If this != the CPU reference the bug
+                                    # is upstream of tile.max (copy m_i).
+                                    T.copy(
+                                        m_i_prev,
+                                        dbg_mprev[
+                                            chunk,
+                                            vid * v_block : vid * v_block + v_block,
+                                        ],
+                                    )
                                     T.barrier_all()
                                     T.tile.sub(m_i_prev, m_i_prev, m_i)
                                     T.barrier_all()
