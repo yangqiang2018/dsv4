@@ -39,8 +39,9 @@ index the kernel actually fetched, so a mismatch names the exact
 Run on the NPU host:  python3 gather_probe.py
 """
 
-from __future__ import annotations
-
+# NOTE: deliberately no `from __future__ import annotations` here. PEP 563
+# turns the @T.prim_func parameter annotations into strings, and the
+# TileLang TIR parser then rejects them ("expected Object but got str").
 import torch
 
 import tilelang
