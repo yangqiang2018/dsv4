@@ -301,7 +301,9 @@ def build_sparse_attn_sharedkv(
                                         for bi_i in range(BI // 2):
                                             lane = bi_i + vid * (BI // 2)
                                             g_idx = chunk_start + lane
+                                            T.barrier_all()
                                             if g_idx <= ori_right:
+                                                T.barrier_all()
                                                 T.copy(
                                                     ori_KV[b_i, g_idx, 0, :],
                                                     kv_ub,
@@ -350,7 +352,9 @@ def build_sparse_attn_sharedkv(
                                         for bi_i in range(BI // 2):
                                             lane = bi_i + vid * (BI // 2)
                                             raw = idx_int[lane]
+                                            T.barrier_all()
                                             if raw >= 0:
+                                                T.barrier_all()
                                                 T.copy(
                                                     cmp_KV[b_i, raw, 0, :],
                                                     kv_ub,
