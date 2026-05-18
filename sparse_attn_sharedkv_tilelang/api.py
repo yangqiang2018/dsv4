@@ -360,7 +360,7 @@ def sparse_attn_sharedkv(
     sinks_dev = sinks.to(torch.float32).to(q.device)
 
     # ---- Run kernel. Workspaces are auto-allocated via workspace_idx. ----
-    out_bsnd, dbg_acc_o, dbg_m, dbg_s, dbg_pv, dbg_mprev = func(
+    out_bsnd, dbg_acc_o, dbg_m, dbg_s, dbg_pv, dbg_mprev, dbg_score = func(
         q_bsnd.contiguous(),
         ori_kv_logical.contiguous(),
         cmp_kv_logical.contiguous(),
@@ -375,8 +375,24 @@ def sparse_attn_sharedkv(
         cu = cu_seqlens_q.to(torch.int32).cpu()
         out_tnd = _bsnd_to_tnd_out(out_bsnd, cu)
         if return_chunk_dump:
-            return out_tnd, dbg_acc_o, dbg_m, dbg_s, dbg_pv, dbg_mprev
+            return (
+                out_tnd,
+                dbg_acc_o,
+                dbg_m,
+                dbg_s,
+                dbg_pv,
+                dbg_mprev,
+                dbg_score,
+            )
         return out_tnd
     if return_chunk_dump:
-        return out_bsnd, dbg_acc_o, dbg_m, dbg_s, dbg_pv, dbg_mprev
+        return (
+            out_bsnd,
+            dbg_acc_o,
+            dbg_m,
+            dbg_s,
+            dbg_pv,
+            dbg_mprev,
+            dbg_score,
+        )
     return out_bsnd

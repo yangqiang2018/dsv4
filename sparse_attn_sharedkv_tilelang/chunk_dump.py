@@ -66,6 +66,7 @@ def _simulate_chunks(case, cfg):
     dump_s = torch.zeros(ni_total, n_heads)
     dump_pv = torch.zeros(ni_total, n_heads, D)
     dump_mprev = torch.zeros(ni_total, n_heads)
+    dump_score = torch.zeros(ni_total, n_heads, BI)
     for ci in range(ni_total):
         if ci < ni_ori:
             g0 = ori_left + ci * BI
@@ -76,6 +77,7 @@ def _simulate_chunks(case, cfg):
             k_tile = cmp_k[idx]
             valid = (idx >= 0) & (idx < threshold)
         score = ((q @ k_tile.T) * scale).masked_fill(~valid.unsqueeze(0), float("-inf"))
+        dump_score[ci] = score
         m_old = m.clone()
         dump_mprev[ci] = m_old
         m = torch.maximum(m, score.amax(dim=1))
@@ -85,7 +87,7 @@ def _simulate_chunks(case, cfg):
         pv = p.to(torch.bfloat16).to(torch.float32) @ k_tile
         o = o * alpha.unsqueeze(1) + pv
         dump_o[ci], dump_m[ci], dump_s[ci], dump_pv[ci] = o, m, s, pv
-    return dump_o, dump_m, dump_s, dump_pv, dump_mprev
+    return dump_o, dump_m, dump_s, dump_pv, dump_mprev, dump_score
 
 
 def main():
@@ -102,7 +104,7 @@ def main():
         return None if t is None else t.npu().contiguous()
 
     with torch.device("npu"):
-        _, k_o, k_m, k_s, k_pv, k_mprev = sparse_attn_sharedkv(
+        _, k_o, k_m, k_s, k_pv, k_mprev, k_score = sparse_attn_sharedkv(
             dev(case["q"]),
             ori_kv=dev(case["ori_pa"]),
             cmp_kv=dev(case["cmp_pa"]),
@@ -129,8 +131,9 @@ def main():
     k_s = k_s.float().cpu()
     k_pv = k_pv.float().cpu()
     k_mprev = k_mprev.float().cpu()
+    k_score = k_score.float().cpu()
 
-    r_o, r_m, r_s, r_pv, r_mprev = _simulate_chunks(case, cfg)
+    r_o, r_m, r_s, r_pv, r_mprev, r_score = _simulate_chunks(case, cfg)
     ni_total = k_o.shape[0]
 
     # head 0 is bit-exact in Probe A; the rest are its worst bad heads.
@@ -158,6 +161,24 @@ def main():
             f"    h{h:2d}: mprev kernel={k_mprev[2, h]:9.3f} "
             f"ref={r_mprev[2, h]:9.3f}  ->  m kernel={k_m[2, h]:9.3f} "
             f"ref={r_m[2, h]:9.3f}  |  pv|d|={pvd:8.3f}  acc_o|d|={od:8.3f}"
+        )
+
+    print("\n  --- chunk 2 (cmp0) score analysis (reduce_max input) ---")
+    print("  (mask-mismatch: kernel -inf where ref finite, or vice versa;")
+    print("   score-bad: both lanes finite but |kernel-ref| > 0.5)")
+    for h in watch:
+        ks = k_score[2, h]
+        rs = r_score[2, h]
+        kfin = ks[torch.isfinite(ks)]
+        rfin = rs[torch.isfinite(rs)]
+        mask_mm = int((~torch.isfinite(ks) != ~torch.isfinite(rs)).sum())
+        both = torch.isfinite(ks) & torch.isfinite(rs)
+        score_bad = int(((ks - rs).abs()[both] > 0.5).sum())
+        k_amax = kfin.max().item() if kfin.numel() else float("nan")
+        r_amax = rfin.max().item() if rfin.numel() else float("nan")
+        print(
+            f"    h{h:2d}: score amax kernel={k_amax:9.3f} ref={r_amax:9.3f}  "
+            f"mask-mismatch={mask_mm:2d}  score-bad={score_bad:2d}/{ks.numel()}"
         )
 
 
