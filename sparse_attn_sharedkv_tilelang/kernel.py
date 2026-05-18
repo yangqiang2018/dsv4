@@ -137,6 +137,7 @@ def build_sparse_attn_sharedkv(
         "kv_ub": 84 * KB + 1280,
         "mask_ub": 84 * KB + 2304,
         "mask_ub_2": 84 * KB + 2336,
+        "idx_int_cmp": 84 * KB + 2368,
         "acc_o_ub": 88 * KB,
         "acc_o_half": 88 * KB,  # aliases acc_o_ub (disjoint phases)
     }
@@ -186,6 +187,11 @@ def build_sparse_attn_sharedkv(
                 acc_s_ub_ = T.alloc_ub([v_block, BI], accum_dtype)
                 acc_s_half = T.alloc_ub([v_block, BI], dtype)
                 idx_int = T.alloc_ub([BI], indices_dtype)
+                # Separate cmp-pass index buffer: T.tile.createvecindex
+                # writes idx_int in the ori branch, and sharing that
+                # buffer makes the cmp branch's GM->UB index DMA silently
+                # no-op (idx_int keeps the last ori createvecindex value).
+                idx_int_cmp = T.alloc_ub([BI], indices_dtype)
                 idx_float = T.alloc_ub([BI], accum_dtype)
                 kv_ub = T.alloc_ub([D], dtype)
                 mask_ub = T.alloc_ub([BI // 8], "uint8")
@@ -208,6 +214,7 @@ def build_sparse_attn_sharedkv(
                         sumexp_i_ub: ub_addr["sumexp_i_ub"],
                         sinks_ub: ub_addr["sinks_ub"],
                         idx_int: ub_addr["idx_int"],
+                        idx_int_cmp: ub_addr["idx_int_cmp"],
                         idx_float: ub_addr["idx_float"],
                         kv_ub: ub_addr["kv_ub"],
                         mask_ub: ub_addr["mask_ub"],
@@ -338,9 +345,9 @@ def build_sparse_attn_sharedkv(
                                                 0,
                                                 chunk * BI : chunk * BI + BI,
                                             ],
-                                            idx_int,
+                                            idx_int_cmp,
                                         )
-                                        T.copy(idx_int, idx_float)
+                                        T.copy(idx_int_cmp, idx_float)
                                         T.barrier_all()
                                         # mask = (idx >= 0) AND (idx < thr)
                                         T.tile.compare(
@@ -372,7 +379,7 @@ def build_sparse_attn_sharedkv(
                                             # current SCFA test cases -- the
                                             # generator never pads with -1).
                                             T.copy(
-                                                cmp_KV[b_i, idx_int[lane], 0, :],
+                                                cmp_KV[b_i, idx_int_cmp[lane], 0, :],
                                                 kv_ub,
                                             )
                                             T.barrier_all()
