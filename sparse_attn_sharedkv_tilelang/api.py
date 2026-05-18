@@ -51,6 +51,10 @@ def _torch_to_tilelang_dtype(t: torch.dtype) -> str:
 
 def _get_kernel(
     *,
+    batch: int,
+    max_seq: int,
+    ori_table_len: int,
+    cmp_table_len: int,
     n_heads: int,
     n_kv_heads: int,
     head_dim: int,
@@ -66,6 +70,10 @@ def _get_kernel(
     core_num: int,
 ):
     key = (
+        batch,
+        max_seq,
+        ori_table_len,
+        cmp_table_len,
         n_heads,
         n_kv_heads,
         head_dim,
@@ -83,6 +91,10 @@ def _get_kernel(
     func = _KERNEL_CACHE.get(key)
     if func is None:
         func = build_sparse_attn_sharedkv(
+            batch=batch,
+            max_seq=max_seq,
+            ori_table_len=ori_table_len,
+            cmp_table_len=cmp_table_len,
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
@@ -300,8 +312,15 @@ def sparse_attn_sharedkv(
     if cmp_block_table is None:
         cmp_block_table = torch.zeros((B, 1), dtype=torch.int32, device=q.device)
 
+    ori_table_len = int(ori_block_table.shape[1])
+    cmp_table_len = int(cmp_block_table.shape[1])
+
     # ---- JIT-compile kernel for these compile-time params. ----
     func = _get_kernel(
+        batch=int(B),
+        max_seq=int(S_max),
+        ori_table_len=ori_table_len,
+        cmp_table_len=cmp_table_len,
         n_heads=N1,
         n_kv_heads=N2,
         head_dim=D,

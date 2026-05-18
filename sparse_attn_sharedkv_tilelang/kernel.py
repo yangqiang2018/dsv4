@@ -43,6 +43,10 @@ def _check_dtypes(dtype: str) -> None:
 
 def build_sparse_attn_sharedkv(
     *,
+    batch: int,
+    max_seq: int,
+    ori_table_len: int,
+    cmp_table_len: int,
     n_heads: int = 64,
     n_kv_heads: int = 1,
     head_dim: int = 512,
@@ -91,11 +95,11 @@ def build_sparse_attn_sharedkv(
     v_block = H_per_block // 2  # 32 -- each AIV handles half the heads
     ub_len = max(32 // 4, v_block)  # 32-byte UB alignment for fp32 scalars
 
-    # Symbolic runtime dims.
-    batch = T.symbolic("batch")
-    max_seq = T.symbolic("max_seq")
-    ori_table_len = T.symbolic("ori_table_len")
-    cmp_table_len = T.symbolic("cmp_table_len")
+    # Runtime dims are passed as compile-time constants (the kernel is
+    # JIT-specialised per shape). Avoids TileLang symbolic-var resolution,
+    # which mis-resolved 'batch' for the TND-padded inputs.
+    assert batch > 0 and max_seq > 0
+    assert ori_table_len > 0 and cmp_table_len > 0
 
     q_shape = [batch, max_seq, n_heads, D]
     out_shape = [batch, max_seq, n_heads, D]
