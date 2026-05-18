@@ -211,6 +211,60 @@ def main():
     _diff("kernel C vs golden C", out_c, ref_c)
     _diff("kernel C vs golden A", out_c, ref_a)
 
+    # ---- Probe K: cmp_kv = constant 1.0. ----
+    # Every cmp token is identical, so a wrong gather is undetectable;
+    # this probe exercises gemm/softmax with NONZERO cmp values.
+    # K passes -> bug is gathering wrong *distinct* token values.
+    # K fails  -> bug is gemm/softmax with nonzero cmp data.
+    print("\n-- Probe K: cmp_kv = constant 1.0 (real random indices) --")
+    common_k = dict(common)
+    common_k["cmp_kv"] = dev(torch.ones_like(case["cmp_pa"]))
+    with torch.device("npu"):
+        out_k = sparse_attn_sharedkv(
+            dev(case["q"]),
+            cmp_sparse_indices=dev(case["cmp_idx"]),
+            **common_k,
+        )
+        torch.npu.synchronize()
+    out_k = out_k.cpu()
+    cmp_seqs_k = int(case["seqused_kv"].max()) // cfg["cmp_ratio"]
+    ref_k_bnsd = G.sparse_attn_sharedkv_golden_bnsd(
+        G.tnd_to_bnsd_q(case["q"], case["cu_seqlens_q"]),
+        G.unpack_paged_kv(
+            case["ori_pa"], case["ori_bt"], int(case["seqused_kv"].max())
+        ),
+        case["sinks"],
+        act_q_lens=(case["cu_seqlens_q"][1:] - case["cu_seqlens_q"][:-1]).tolist(),
+        act_kv_lens=case["seqused_kv"].tolist(),
+        softmax_scale=cfg["softmax_scale"],
+        cmp_k_bnsd=torch.ones((1, 1, cmp_seqs_k, cfg["D"]), dtype=dtype),
+        cmp_sparse_indices=case["cmp_idx"].unsqueeze(0),
+        cmp_ratio=cfg["cmp_ratio"],
+        ori_win_left=cfg["ori_win_left"],
+        ori_win_right=cfg["ori_win_right"],
+    )
+    ref_k = G.bnsd_to_tnd_out(ref_k_bnsd, case["cu_seqlens_q"])
+    _diff("kernel K vs golden K", out_k, ref_k)
+
+    # ---- Raw value dump for the worst head. ----
+    print("\n-- head 31 raw dump (dims 252-268), Probe A --")
+    print(
+        "  kernel head31:",
+        [round(x, 2) for x in out_a[0, 31, 252:268].float().tolist()],
+    )
+    print(
+        "  golden head31:",
+        [round(x, 2) for x in ref_a[0, 31, 252:268].float().tolist()],
+    )
+    print(
+        "  kernel head 0:",
+        [round(x, 2) for x in out_a[0, 0, 252:268].float().tolist()],
+    )
+    print(
+        "  golden head 0:",
+        [round(x, 2) for x in ref_a[0, 0, 252:268].float().tolist()],
+    )
+
     # ---- cmp_kv-zeroed probe. ----
     print("\n-- Probe Z: cmp_kv zeroed (real random indices) --")
     common_z = dict(common)
