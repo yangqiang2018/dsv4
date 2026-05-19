@@ -53,8 +53,12 @@ def _get_kernel(
     *,
     batch: int,
     max_seq: int,
-    max_ori_s: int,
-    max_cmp_s: int,
+    ori_block_num: int,
+    ori_block_size: int,
+    ori_table_len: int,
+    cmp_block_num: int,
+    cmp_block_size: int,
+    cmp_table_len: int,
     n_heads: int,
     n_kv_heads: int,
     head_dim: int,
@@ -68,8 +72,12 @@ def _get_kernel(
     key = (
         batch,
         max_seq,
-        max_ori_s,
-        max_cmp_s,
+        ori_block_num,
+        ori_block_size,
+        ori_table_len,
+        cmp_block_num,
+        cmp_block_size,
+        cmp_table_len,
         n_heads,
         n_kv_heads,
         head_dim,
@@ -85,8 +93,12 @@ def _get_kernel(
         func = build_sparse_attn_sharedkv(
             batch=batch,
             max_seq=max_seq,
-            max_ori_s=max_ori_s,
-            max_cmp_s=max_cmp_s,
+            ori_block_num=ori_block_num,
+            ori_block_size=ori_block_size,
+            ori_table_len=ori_table_len,
+            cmp_block_num=cmp_block_num,
+            cmp_block_size=cmp_block_size,
+            cmp_table_len=cmp_table_len,
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
             head_dim=head_dim,
@@ -99,35 +111,6 @@ def _get_kernel(
         )
         _KERNEL_CACHE[key] = func
     return func
-
-
-def _unpage_kv(
-    paged_kv: torch.Tensor,  # [block_num, block_size, N2, D]
-    block_table: torch.Tensor,  # [B, table_len] int32, -1 ⇒ unused
-    max_logical_len: int,
-) -> torch.Tensor:
-    """Resolve a paged KV cache into a logical ``[B, max_logical_len, N2, D]``.
-
-    PageAttention block-table resolution is done here on the host so the
-    TileLang kernel only needs a single-level indirect gather. (A
-    two-level paged gather with a non-trivial block table mis-resolves
-    on Ascend; see kernel.py.)
-    """
-    block_num, block_size, N2, D = paged_kv.shape
-    bt = block_table.cpu()
-    B, table_len = bt.shape
-    out = paged_kv.new_zeros((B, max_logical_len, N2, D))
-    for b in range(B):
-        for blk in range(table_len):
-            phys = int(bt[b, blk])
-            if phys < 0:
-                continue
-            s0 = blk * block_size
-            if s0 >= max_logical_len:
-                break
-            s1 = min(s0 + block_size, max_logical_len)
-            out[b, s0:s1, :, :] = paged_kv[phys, : s1 - s0, :, :]
-    return out
 
 
 def _tnd_to_bsnd_q(
@@ -332,32 +315,37 @@ def sparse_attn_sharedkv(
             f"only N1=64, N2=1, D=512 supported (got N1={N1}, N2={N2}, D={D})"
         )
 
-    # ---- Un-page the KV caches into a logical [B, S, N2, D] layout. ----
+    # ---- Paged KV goes straight to the kernel. ----
+    # The kernel resolves the block table on the AI Core (vector),
+    # mirroring the Ascend C `DataCopyPA` path -- no host-side un-paging.
     cmp_ratio_eff = cmp_ratio if cmp_ratio is not None else 4
-    max_ori_s = int(seqused_kv.max().item())
-    max_cmp_s = max(1, max_ori_s // cmp_ratio_eff)
 
-    ori_kv_logical = _unpage_kv(
-        ori_kv.to(q.device), ori_block_table.to(torch.int32), max_ori_s
-    )
+    ori_kv_dev = ori_kv.to(q.device)
+    ori_bt_dev = ori_block_table.to(torch.int32).to(q.device)
+    ori_block_num, ori_block_size = ori_kv_dev.shape[0], ori_kv_dev.shape[1]
+    ori_table_len = ori_bt_dev.shape[1]
+
     if cmp_kv is not None:
-        cmp_kv_logical = _unpage_kv(
-            cmp_kv.to(q.device),
-            cmp_block_table.to(torch.int32),
-            max_cmp_s,
-        )
+        cmp_kv_dev = cmp_kv.to(q.device)
+        cmp_bt_dev = cmp_block_table.to(torch.int32).to(q.device)
     else:
-        # Dummy logical cmp KV so the kernel signature is well-typed.
-        cmp_kv_logical = torch.zeros(
-            (B, max_cmp_s, N2, D), dtype=dtype, device=q.device
-        )
+        # SWA: no cmp pass (NI_cmp == 0). A 1-block dummy paged cache
+        # and block table keep the kernel signature well-typed.
+        cmp_kv_dev = torch.zeros((1, 1, N2, D), dtype=dtype, device=q.device)
+        cmp_bt_dev = torch.zeros((B, 1), dtype=torch.int32, device=q.device)
+    cmp_block_num, cmp_block_size = cmp_kv_dev.shape[0], cmp_kv_dev.shape[1]
+    cmp_table_len = cmp_bt_dev.shape[1]
 
     # ---- JIT-compile kernel for these compile-time params. ----
     func = _get_kernel(
         batch=int(B),
         max_seq=int(S_max),
-        max_ori_s=max_ori_s,
-        max_cmp_s=max_cmp_s,
+        ori_block_num=int(ori_block_num),
+        ori_block_size=int(ori_block_size),
+        ori_table_len=int(ori_table_len),
+        cmp_block_num=int(cmp_block_num),
+        cmp_block_size=int(cmp_block_size),
+        cmp_table_len=int(cmp_table_len),
         n_heads=N1,
         n_kv_heads=N2,
         head_dim=D,
@@ -375,8 +363,10 @@ def sparse_attn_sharedkv(
     # ---- Run kernel. Workspaces are auto-allocated via workspace_idx. ----
     out_bsnd = func(
         q_bsnd.contiguous(),
-        ori_kv_logical.contiguous(),
-        cmp_kv_logical.contiguous(),
+        ori_kv_dev.contiguous(),
+        ori_bt_dev.contiguous(),
+        cmp_kv_dev.contiguous(),
+        cmp_bt_dev.contiguous(),
         cmp_indices_dev.contiguous(),
         act_q_lens.contiguous(),
         seqused_kv_dev.contiguous(),

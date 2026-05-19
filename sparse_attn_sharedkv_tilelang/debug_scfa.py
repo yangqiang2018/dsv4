@@ -103,10 +103,10 @@ def _head_match(name, kernel, golden):
 def _indexed_cmp_paged(cmp_pa, cmp_bt, block_size):
     """Paged cmp_kv whose *logical* token i carries the constant value i.
 
-    Inverts the block table so that ``_unpage_kv`` (and the golden's
-    ``unpack_paged_kv``) resolve logical token i to a [D] vector of all
-    ``i``. bf16 rounds indices >256 to the nearest representable value;
-    that is fine for spotting a mis-gather.
+    Inverts the block table so that the kernel's on-device paged gather
+    (and the golden's ``unpack_paged_kv``) resolve logical token i to a
+    [D] vector of all ``i``. bf16 rounds indices >256 to the nearest
+    representable value; that is fine for spotting a mis-gather.
     """
     pa = torch.zeros(cmp_pa.shape, dtype=torch.float32)
     _, bsz, _, _ = cmp_pa.shape

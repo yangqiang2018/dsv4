@@ -18,12 +18,13 @@ This uses the default (non-pto) Ascend C lowering path: explicit
 ``example_sparse_flash_attn_mask_pa.py`` example. The whole kernel body
 is flat (no helper calls inside the ``@T.prim_func``).
 
-The kernel takes **logical** (un-paged) KV: ``ori_KV`` /  ``cmp_KV`` are
-``[batch, max_s, n_kv_heads, D]``. PageAttention block-table resolution
-is done host-side in :mod:`api` -- the kernel only does a single-level
-indirect gather ``KV[b, idx, 0, :]``, matching the verified
-``example_sparse_flash_attn_gqa_pto`` pattern (a two-level indirect
-paged gather with a non-trivial block table mis-resolves on Ascend).
+The kernel takes **paged** KV: ``ori_KV`` / ``cmp_KV`` are
+``[block_num, block_size, n_kv_heads, D]`` with companion
+``ori_block_table`` / ``cmp_block_table``. PageAttention block-table
+resolution runs on the AI Core (vector): each lane maps a logical
+token id to ``(physical_block, row)`` and DMAs the ``[D]`` KV row,
+mirroring the Ascend C ``DataCopyPA`` path and the verified
+``example_sparse_flash_attn_mask_pa`` gather.
 
 The kernel takes a padded BSND layout for ``Q`` / ``Output``; :mod:`api`
 converts TND inputs to BSND before invocation.
@@ -62,8 +63,12 @@ def build_sparse_attn_sharedkv(
     *,
     batch: int,
     max_seq: int,
-    max_ori_s: int,
-    max_cmp_s: int,
+    ori_block_num: int,
+    ori_block_size: int,
+    ori_table_len: int,
+    cmp_block_num: int,
+    cmp_block_size: int,
+    cmp_table_len: int,
     n_heads: int = 64,
     n_kv_heads: int = 1,
     head_dim: int = 512,
@@ -78,9 +83,9 @@ def build_sparse_attn_sharedkv(
     """Build a JIT-compiled TileLang kernel for SparseAttnSharedKV.
 
     Arguments are all compile-time constants. Call the returned kernel
-    object with the runtime tensors (BSND-padded Q + logical KV + sinks).
-    :mod:`api` provides a high-level wrapper that converts layouts,
-    un-pages the KV and synthesises the cmp scenario inputs.
+    object with the runtime tensors (BSND-padded Q + paged KV + block
+    tables + sinks). :mod:`api` provides a high-level wrapper that
+    converts layouts and synthesises the cmp scenario inputs.
     """
     _check_dtypes(dtype)
     assert n_heads == 64, "API constraint: n_heads must be 64"
@@ -90,7 +95,8 @@ def build_sparse_attn_sharedkv(
     assert topk_cmp >= 0
     assert topk_cmp % block_I == 0, "topk_cmp must be a multiple of block_I"
     assert batch > 0 and max_seq > 0
-    assert max_ori_s > 0 and max_cmp_s > 0
+    assert ori_block_num > 0 and ori_block_size > 0 and ori_table_len > 0
+    assert cmp_block_num > 0 and cmp_block_size > 0 and cmp_table_len > 0
 
     gqa_group = n_heads // n_kv_heads  # 64
     BI = block_I  # 64
@@ -110,8 +116,10 @@ def build_sparse_attn_sharedkv(
 
     q_shape = [batch, max_seq, n_heads, D]
     out_shape = [batch, max_seq, n_heads, D]
-    ori_kv_shape = [batch, max_ori_s, n_kv_heads, D]
-    cmp_kv_shape = [batch, max_cmp_s, n_kv_heads, D]
+    ori_kv_shape = [ori_block_num, ori_block_size, n_kv_heads, D]
+    cmp_kv_shape = [cmp_block_num, cmp_block_size, n_kv_heads, D]
+    ori_bt_shape = [batch, ori_table_len]
+    cmp_bt_shape = [batch, cmp_table_len]
     # cmp_indices is front-padded host-side by NI_ori*BI dummy slots so
     # the cmp chunks address it with a plain `chunk*BI` slice start
     # (cmp chunk indices run NI_ori..NI_total-1). The padded slots also
@@ -141,13 +149,15 @@ def build_sparse_attn_sharedkv(
         "acc_o_half": 88 * KB,  # aliases acc_o_ub (disjoint phases)
     }
 
-    @tilelang.jit(out_idx=[7], workspace_idx=[8, 9, 10, 11])
+    @tilelang.jit(out_idx=[9], workspace_idx=[10, 11, 12, 13])
     def _make():
         @T.prim_func
         def main(
             Q: T.Tensor(q_shape, dtype),  # type: ignore[valid-type]
             ori_KV: T.Tensor(ori_kv_shape, dtype),  # type: ignore[valid-type]
+            ori_block_table: T.Tensor(ori_bt_shape, indices_dtype),  # type: ignore[valid-type]
             cmp_KV: T.Tensor(cmp_kv_shape, dtype),  # type: ignore[valid-type]
+            cmp_block_table: T.Tensor(cmp_bt_shape, indices_dtype),  # type: ignore[valid-type]
             cmp_indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore[valid-type]
             actual_q_len: T.Tensor([batch], indices_dtype),  # type: ignore[valid-type]
             actual_kv_len: T.Tensor([batch], indices_dtype),  # type: ignore[valid-type]
@@ -310,9 +320,17 @@ def build_sparse_attn_sharedkv(
                                             g_idx = chunk_start + lane
                                             T.barrier_all()
                                             if g_idx <= ori_right:
+                                                # Resolve the paged block
+                                                # table on the vector core:
+                                                # logical token g_idx ->
+                                                # (physical block, row).
+                                                ori_blk = ori_block_table[
+                                                    b_i, g_idx // ori_block_size
+                                                ]
+                                                ori_row = g_idx % ori_block_size
                                                 T.barrier_all()
                                                 T.copy(
-                                                    ori_KV[b_i, g_idx, 0, :],
+                                                    ori_KV[ori_blk, ori_row, 0, :],
                                                     kv_ub,
                                                 )
                                             else:
@@ -364,17 +382,23 @@ def build_sparse_attn_sharedkv(
                                         T.barrier_all()
                                         for bi_i in range(BI // 2):
                                             lane = bi_i + vid * (BI // 2)
-                                            # Inline the UB-loaded index into
-                                            # the T.copy, matching the verified
-                                            # example_sparse_flash_attn_gqa_pto
-                                            # gather. NOTE: assumes every cmp
-                                            # index is >= 0 (true for all
-                                            # current SCFA test cases -- the
-                                            # generator never pads with -1).
-                                            T.copy(
-                                                cmp_KV[b_i, idx_int[lane], 0, :],
-                                                kv_ub,
-                                            )
+                                            cmp_idx = idx_int[lane]
+                                            T.barrier_all()
+                                            if cmp_idx >= 0:
+                                                # Paged gather: resolve
+                                                # cmp_block_table on the vector
+                                                # core, then DMA the [D] row.
+                                                cmp_blk = cmp_block_table[
+                                                    b_i, cmp_idx // cmp_block_size
+                                                ]
+                                                cmp_row = cmp_idx % cmp_block_size
+                                                T.barrier_all()
+                                                T.copy(
+                                                    cmp_KV[cmp_blk, cmp_row, 0, :],
+                                                    kv_ub,
+                                                )
+                                            else:
+                                                T.tile.fill(kv_ub, 0.0)
                                             T.barrier_all()
                                             T.copy(
                                                 kv_ub,

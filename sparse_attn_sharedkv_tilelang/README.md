@@ -89,12 +89,13 @@ Matching the original Ascend C kernel:
   per-lane token ids with `T.tile.createvecindex`; the cmp pass DMAs
   them from `cmp_indices`. Both feed `T.tile.compare` →
   `T.tile.select(... -∞)`.
-* **KV gather**: PageAttention block-table resolution runs host-side in
-  `api` (`_unpage_kv`), so the kernel receives logical
-  `[B, max_s, N2, D]` KV and does a single-level indirect gather
-  `KV[b, idx, 0, :]` through the AIV — each lane DMAs one `[D]` row into
-  the per-chunk workspace, the cube then loads it as contiguous KV. Two
-  AIVs split the 64 lanes in half.
+* **KV gather**: the kernel receives **paged** KV
+  `[block_num, block_size, N2, D]` plus `ori_block_table` /
+  `cmp_block_table`, and resolves the block table on the AIV — each lane
+  maps a logical token id to `(physical_block, row)` and DMAs one `[D]`
+  row into the per-chunk workspace; the cube then loads it as contiguous
+  KV. Two AIVs split the 64 lanes in half. This mirrors the Ascend C
+  `DataCopyPA` path (no host-side un-paging).
 * **Cube ↔ vector** is split explicitly into `T.Scope("C")` /
   `T.Scope("V")` blocks with manual `T.set_cross_flag` /
   `T.wait_cross_flag` handshakes per chunk, on the default (non-pto)
