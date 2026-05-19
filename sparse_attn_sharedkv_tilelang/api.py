@@ -66,6 +66,7 @@ def _get_kernel(
     head_dim: int,
     topk_cmp: int,
     cmp_ratio: int,
+    scenario: int,
     ori_win_left: int,
     softmax_scale: float,
     dtype: str,
@@ -86,6 +87,7 @@ def _get_kernel(
         head_dim,
         topk_cmp,
         cmp_ratio,
+        scenario,
         ori_win_left,
         round(softmax_scale, 8),
         dtype,
@@ -108,6 +110,7 @@ def _get_kernel(
             head_dim=head_dim,
             topk_cmp=topk_cmp,
             cmp_ratio=cmp_ratio,
+            scenario=scenario,
             ori_win_left=ori_win_left,
             softmax_scale=softmax_scale,
             dtype=dtype,
@@ -115,25 +118,6 @@ def _get_kernel(
         )
         _KERNEL_CACHE[key] = func
     return func
-
-
-def _synthesize_dense_cmp_indices(
-    *,
-    total_tokens: int,
-    N2: int,
-    K: int,
-) -> torch.Tensor:
-    """Make a dense ``arange``-based cmp_sparse_indices for the CFA scenario.
-
-    Every token row is ``[0, 1, ..., K-1]``; the causal threshold is
-    enforced by the mask in the kernel.
-    """
-    return (
-        torch.arange(K, dtype=torch.int32)
-        .view(1, 1, K)
-        .expand(total_tokens, N2, K)
-        .contiguous()
-    )
 
 
 def sparse_attn_sharedkv(
@@ -234,17 +218,16 @@ def sparse_attn_sharedkv(
     elif scenario == 2:
         N2 = cmp_kv.shape[2]
         # CFA attends to ALL compressed tokens up to the per-row causal
-        # threshold (NOT a fixed top-K). The dense synthesized indices
-        # must therefore span the largest possible threshold, i.e.
-        # floor(max(seqused_kv) / cmp_ratio). topk_cmp is meaningless for
-        # CFA and is intentionally ignored here.
+        # threshold (NOT a fixed top-K). K must span the largest possible
+        # threshold, floor(max(seqused_kv) / cmp_ratio); topk_cmp is
+        # meaningless for CFA and is intentionally ignored. The kernel
+        # generates the dense [0, K) indices on-device, so cmp_indices
+        # is an unused placeholder here.
         max_cmp = int(seqused_kv.max().item()) // cmp_ratio
         K = max(64, ((max_cmp + 63) // 64) * 64)
-        cmp_indices_dev = _synthesize_dense_cmp_indices(
-            total_tokens=total_tokens,
-            N2=N2,
-            K=K,
-        ).to(q.device)
+        cmp_indices_dev = torch.zeros(
+            (total_tokens, N2, K), dtype=torch.int32, device=q.device
+        )
     else:
         N2 = ori_kv.shape[2]
         K = 0
@@ -308,6 +291,7 @@ def sparse_attn_sharedkv(
         head_dim=D,
         topk_cmp=K,
         cmp_ratio=cmp_ratio_eff,
+        scenario=scenario,
         ori_win_left=ori_win_left,
         softmax_scale=float(softmax_scale),
         dtype=tl_dtype,

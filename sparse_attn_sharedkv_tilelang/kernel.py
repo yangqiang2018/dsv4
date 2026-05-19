@@ -8,7 +8,8 @@ top-K sparse pass over ``cmp_kv`` under one online-softmax state that is
 seeded from per-q-head sinks. The same kernel covers all three scenarios:
 
 * Scenario 1 (SWA only): ``topk_cmp == 0`` skips the cmp pass.
-* Scenario 2 (CFA): caller synthesizes a causal ``cmp_sparse_indices``.
+* Scenario 2 (CFA): the kernel generates the dense compressed-token
+  indices on-device; ``cmp_indices`` is an unused placeholder.
 * Scenario 3 (SCFA): full sparse compressed attention.
 
 This uses the default (non-pto) Ascend C lowering path: explicit
@@ -78,6 +79,7 @@ def build_sparse_attn_sharedkv(
     head_dim: int = 512,
     topk_cmp: int = 512,
     cmp_ratio: int = 4,
+    scenario: int = 3,
     ori_win_left: int = 127,
     softmax_scale: float = 0.04419417,
     dtype: str = "bfloat16",
@@ -99,6 +101,7 @@ def build_sparse_attn_sharedkv(
     assert ori_win_left == 127, "API constraint: ori_win_left must be 127"
     assert topk_cmp >= 0
     assert topk_cmp % block_I == 0, "topk_cmp must be a multiple of block_I"
+    assert scenario in (1, 2, 3), "scenario must be 1 (SWA), 2 (CFA) or 3 (SCFA)"
     assert batch > 0 and max_seq > 0 and total_tokens > 0
     assert ori_block_num > 0 and ori_block_size > 0 and ori_table_len > 0
     assert cmp_block_num > 0 and cmp_block_size > 0 and cmp_table_len > 0
@@ -114,6 +117,10 @@ def build_sparse_attn_sharedkv(
     NI_ori = (ori_window_max + BI - 1) // BI  # 2
     NI_cmp = topk_cmp // BI  # 8 for topk=512
     NI_total = NI_ori + NI_cmp
+    # CFA: the cmp indices are the dense range [0, topk_cmp); the kernel
+    # generates them per chunk with createvecindex instead of reading a
+    # host-synthesized cmp_indices array (mirrors the Ascend C CFA path).
+    is_cfa = scenario == 2
 
     H_per_block = gqa_group  # 64
     v_block = H_per_block // 2  # 32 -- each AIV handles half the heads
@@ -353,21 +360,32 @@ def build_sparse_attn_sharedkv(
                                             )
                                             T.barrier_all()
                                     else:
-                                        T.copy(
-                                            cmp_indices[
-                                                t_i,
-                                                0,
-                                                chunk * BI : chunk * BI + BI,
-                                            ],
-                                            idx_int,
-                                        )
-                                        # The cmp index load is an async
-                                        # GM->UB DMA. Wait for it before
-                                        # idx_int is read below, else the
-                                        # UB->UB copy lands the previous
-                                        # cmp chunk's DMA result in
-                                        # idx_float (off-by-one chunk).
-                                        T.barrier_all()
+                                        if is_cfa:
+                                            # CFA: this chunk's compressed
+                                            # token ids are the dense range
+                                            # [(chunk-NI_ori)*BI, +BI).
+                                            # Generate them on the vector
+                                            # core -- no host index array.
+                                            T.tile.createvecindex(
+                                                idx_int,
+                                                (chunk - NI_ori) * BI,
+                                            )
+                                        else:
+                                            T.copy(
+                                                cmp_indices[
+                                                    t_i,
+                                                    0,
+                                                    chunk * BI : chunk * BI + BI,
+                                                ],
+                                                idx_int,
+                                            )
+                                            # The cmp index load is an async
+                                            # GM->UB DMA. Wait for it before
+                                            # idx_int is read below, else the
+                                            # UB->UB copy lands the previous
+                                            # cmp chunk's DMA result in
+                                            # idx_float (off-by-one chunk).
+                                            T.barrier_all()
                                         T.copy(idx_int, idx_float)
                                         T.barrier_all()
                                         # mask = (idx >= 0) AND (idx < thr)

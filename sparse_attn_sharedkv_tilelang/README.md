@@ -87,8 +87,9 @@ Matching the original Ascend C kernel:
   KV token with V row of zeros.
 * **Causal masks** are built on the vector side. The ori pass derives
   per-lane token ids with `T.tile.createvecindex`; the cmp pass DMAs
-  them from `cmp_indices`. Both feed `T.tile.compare` →
-  `T.tile.select(... -∞)`.
+  them from `cmp_indices` (SCFA) or, for CFA, generates the dense
+  `[0, K)` range with `createvecindex` as well. Both feed
+  `T.tile.compare` → `T.tile.select(... -∞)`.
 * **KV gather**: the kernel receives **paged** KV
   `[block_num, block_size, N2, D]` plus `ori_block_table` /
   `cmp_block_table`, and resolves the block table on the AIV — each lane
