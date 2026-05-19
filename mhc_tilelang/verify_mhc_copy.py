@@ -48,7 +48,6 @@ import torch
 tilelang.disable_cache()
 tilelang.cache.clear_cache()
 
-DTYPE = "float32"
 VEC_NUM = 2  # vector sub-cores per AI Core on Atlas A3
 
 
@@ -62,15 +61,19 @@ def build_copy_flat(num_blocks: int, blk: int):
     segment is a single 32B-aligned burst, so the sub-32B mhc_mult
     inner dimension never appears as a DMA row stride.
     """
+    # dtype must be a builder-local, not a module global: the @T.prim_func
+    # argument parser only resolves closure variables in T.Tensor
+    # annotations -- a global string trips "expected Object but got str".
+    dtype = "float"  # tilelang spelling of float32
     half = blk // VEC_NUM
 
     @T.prim_func
     def main(
-        x: T.Tensor([num_blocks, blk], DTYPE),
-        y: T.Tensor([num_blocks, blk], DTYPE),
+        x: T.Tensor([num_blocks, blk], dtype),
+        y: T.Tensor([num_blocks, blk], dtype),
     ):
         with T.Kernel(num_blocks, is_npu=True) as (cid, vid):
-            buf = T.alloc_ub([1, half], DTYPE)
+            buf = T.alloc_ub([1, half], dtype)
             with T.Scope("V"):
                 T.copy(x[cid, vid * half], buf)
                 T.barrier_all()  # drain MTE2 before MTE3 reads buf
@@ -87,16 +90,17 @@ def build_copy_naive_2d(num_tokens: int, mhc_mult: int, token_block_size: int):
     mhc_mult == 4 the inner row is 16B < 32B; kept only as a
     hardware-truth contrast for build_copy_flat.
     """
+    dtype = "float"  # builder-local; see build_copy_flat
     num_blocks = num_tokens // token_block_size
     rows_per_vid = token_block_size // VEC_NUM
 
     @T.prim_func
     def main(
-        x: T.Tensor([num_tokens, mhc_mult], DTYPE),
-        y: T.Tensor([num_tokens, mhc_mult], DTYPE),
+        x: T.Tensor([num_tokens, mhc_mult], dtype),
+        y: T.Tensor([num_tokens, mhc_mult], dtype),
     ):
         with T.Kernel(num_blocks, is_npu=True) as (cid, vid):
-            ub = T.alloc_ub([rows_per_vid, mhc_mult], DTYPE)
+            ub = T.alloc_ub([rows_per_vid, mhc_mult], dtype)
             with T.Scope("V"):
                 row_base = cid * token_block_size + vid * rows_per_vid
                 T.copy(x[row_base, 0], ub)
