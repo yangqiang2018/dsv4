@@ -201,6 +201,32 @@ SCENARIOS = {
         ori_mask_mode=4,
         cmp_mask_mode=3,
     ),
+    # B>1 TND: two batches of unequal length exercise a non-zero
+    # per-batch q_prefix token offset on the native-TND path, which the
+    # B=1 TND cases above (q_prefix always [0]) do not cover.
+    "scfa_tnd_multibatch": dict(
+        scenario=3,
+        layout_q="TND",
+        B=2,
+        S1=32,
+        T1=48,
+        N1=64,
+        N2=1,
+        D=512,
+        K=64,
+        block_num1=48,
+        block_num2=16,
+        block_size1=128,
+        block_size2=128,
+        cu_seqlens_q=[0, 16, 48],
+        seqused_kv=[2048, 3072],
+        softmax_scale=0.04419417,
+        cmp_ratio=4,
+        ori_win_left=127,
+        ori_win_right=0,
+        ori_mask_mode=4,
+        cmp_mask_mode=3,
+    ),
 }
 
 SMALL_CASES = [
@@ -210,6 +236,7 @@ SMALL_CASES = [
     "swa_prefill_small",
     "cfa_decode",
     "scfa_bsnd_small",
+    "scfa_tnd_multibatch",
 ]
 
 
