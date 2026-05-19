@@ -6,111 +6,68 @@ TileKernels MHC operator to Ascend before writing the full kernel:
     GPU kernel:  tile_kernels/mhc/head_compute_mix_kernel.py
     GPU test:    tests/mhc/test_head_compute_mix.py
 
-The GPU forward kernel walks ``input_mix`` of shape
-``(num_tokens, mhc_mult)`` in tiles of ``token_block_size`` tokens, so
-each block needs a ``[token_block_size, mhc_mult]`` float32 tile in UB.
-The GPU test only ever uses ``mhc_mult == 4``.
+The GPU forward kernel walks input_mix of shape (num_tokens, mhc_mult)
+in tiles of token_block_size tokens; each block needs a
+[token_block_size, mhc_mult] float32 tile in UB. The GPU test only ever
+uses mhc_mult == 4.
 
-On Ascend that tile has a ``mhc_mult * 4 = 16``-byte inner row, below
-the 32-byte UB / MTE alignment floor: a 2D ``[token_block_size, 4]`` UB
-buffer cannot be walked row-by-row by the vector unit (16B row stride
--> ADDR_MISALIGN) and a strided ``[token_block_size, 4]`` DMA has a
-non-32B-aligned row stride.
+On Ascend a [token_block_size, 4] tile has a 4*4 = 16-byte inner row,
+below the 32-byte UB / MTE alignment floor. The fix: token_block_size
+*consecutive* tokens form a contiguous token_block_size * mhc_mult
+float32 span -- 128 float32 = 512 B for the (32, 4) tile, an exact 32B
+multiple. input_mix is reshaped to a 2D [M, N] tensor with
+N = token_block_size * mhc_mult (an aligned flat row) and
+M = num_tokens // token_block_size, then round-tripped GM->UB->GM and
+bit-compared against the input.
 
-Fix: ``token_block_size`` *consecutive* tokens are a contiguous
-``token_block_size * mhc_mult`` float32 span -- 128 float32 = 512 B for
-the (32, 4) tile, an exact 32B multiple. Reshape ``input_mix`` to
-``[num_blocks, token_block_size * mhc_mult]`` and DMA one flat row per
-core: a single aligned burst, no sub-32B row anywhere.
-
-Two kernels are round-tripped GM->UB->GM and bit-compared to the input:
-
-    build_copy_flat      recommended flat-row copy; must be bit-exact.
-    build_copy_naive_2d  naive [token_block_size, mhc_mult] copy with
-                         16-byte rows -- run only under --naive so a
-                         hardware trap cannot mask the flat result.
+The kernel is a copy-only clone of examples/reduce/example_reduce_min.py
+(a verified Ascend example): identical @tilelang.jit / T.Kernel /
+T.Scope / T.copy structure, with the reduction replaced by a copy-back.
 
 Run on the NPU host:
     python3 verify_mhc_copy.py
-    python3 verify_mhc_copy.py --naive
 """
-
-from __future__ import annotations
 
 import argparse
 
 import tilelang
-import tilelang.language as T
+from tilelang import language as T
 import torch
 
-# Dev-time: never serve a stale JIT artefact compiled from an older
-# kernel body -- the cache key does not track every body edit.
 tilelang.disable_cache()
 tilelang.cache.clear_cache()
 
-VEC_NUM = 2  # vector sub-cores per AI Core on Atlas A3
 
+@tilelang.jit(out_idx=[1])
+def copy_kernel(M, N, block_M, dtype="float"):
+    """GM->UB->GM round-trip of an [M, N] float tensor.
 
-@tilelang.jit(out_idx=[-1])
-def build_copy_flat(num_blocks: int, blk: int):
-    """Recommended copy: one contiguous ``blk``-element row per core.
-
-    ``blk`` (= token_block_size * mhc_mult) float32 are split evenly
-    over the VEC_NUM vector sub-cores; each sub-core DMAs its
-    ``blk // VEC_NUM`` segment GM->UB and straight back UB->GM. Every
-    segment is a single 32B-aligned burst, so the sub-32B mhc_mult
-    inner dimension never appears as a DMA row stride.
+    A copy-only clone of example_reduce_min.py: the M rows are tiled
+    block_M per core and split over VEC_NUM=2 vector sub-cores; each
+    sub-core DMAs its sub_block_M rows into UB and straight back out.
+    With N a multiple of 8, every row is a 32B-aligned burst.
     """
-    # dtype must be a builder-local, not a module global: the @T.prim_func
-    # argument parser only resolves closure variables in T.Tensor
-    # annotations -- a global string trips "expected Object but got str".
-    dtype = "float"  # tilelang spelling of float32
-    half = blk // VEC_NUM
+    m_num = M // block_M
+    VEC_NUM = 2
+    sub_block_M = block_M // VEC_NUM
 
     @T.prim_func
     def main(
-        x: T.Tensor([num_blocks, blk], dtype),
-        y: T.Tensor([num_blocks, blk], dtype),
+        A: T.Tensor([M, N], dtype),
+        B: T.Tensor([M, N], dtype),
     ):
-        with T.Kernel(num_blocks, is_npu=True) as (cid, vid):
-            buf = T.alloc_ub([1, half], dtype)
+        with T.Kernel(m_num, is_npu=True) as (cid, vid):
+            a_ub = T.alloc_ub((sub_block_M, N), dtype)
+            row_base = cid * block_M + vid * sub_block_M
             with T.Scope("V"):
-                T.copy(x[cid, vid * half], buf)
-                T.barrier_all()  # drain MTE2 before MTE3 reads buf
-                T.copy(buf, y[cid, vid * half])
-
-    return main
-
-
-@tilelang.jit(out_idx=[-1])
-def build_copy_naive_2d(num_tokens: int, mhc_mult: int, token_block_size: int):
-    """Naive copy: a 2D ``[rows, mhc_mult]`` UB tile with 16-byte rows.
-
-    This is what a literal port of the GPU tiling would write. With
-    mhc_mult == 4 the inner row is 16B < 32B; kept only as a
-    hardware-truth contrast for build_copy_flat.
-    """
-    dtype = "float"  # builder-local; see build_copy_flat
-    num_blocks = num_tokens // token_block_size
-    rows_per_vid = token_block_size // VEC_NUM
-
-    @T.prim_func
-    def main(
-        x: T.Tensor([num_tokens, mhc_mult], dtype),
-        y: T.Tensor([num_tokens, mhc_mult], dtype),
-    ):
-        with T.Kernel(num_blocks, is_npu=True) as (cid, vid):
-            ub = T.alloc_ub([rows_per_vid, mhc_mult], dtype)
-            with T.Scope("V"):
-                row_base = cid * token_block_size + vid * rows_per_vid
-                T.copy(x[row_base, 0], ub)
+                T.copy(A[row_base : row_base + sub_block_M, :], a_ub)
                 T.barrier_all()
-                T.copy(ub, y[row_base, 0])
+                T.copy(a_ub, B[row_base : row_base + sub_block_M, :])
 
     return main
 
 
-def _check(name: str, got: torch.Tensor, ref: torch.Tensor, mhc_mult: int) -> bool:
+def _check(name, got, ref, mhc_mult):
     """Bit-exact compare of a pure copy; print one diagnostic line."""
     got = got.cpu().float()
     ref = ref.cpu().float()
@@ -132,8 +89,8 @@ def _check(name: str, got: torch.Tensor, ref: torch.Tensor, mhc_mult: int) -> bo
     return exact
 
 
-def _make_inputs(num_tokens: int, mhc_mult: int, seed: int):
-    """A monotone ramp (catches chunk-shift / lane-substitution) + randn."""
+def _make_inputs(num_tokens, mhc_mult, seed):
+    """A monotone ramp (catches chunk-shift / lane substitution) + randn."""
     torch.manual_seed(seed)
     ramp = torch.arange(num_tokens * mhc_mult, dtype=torch.float32).reshape(
         num_tokens, mhc_mult
@@ -142,57 +99,42 @@ def _make_inputs(num_tokens: int, mhc_mult: int, seed: int):
     return (("ramp", ramp), ("randn", rand))
 
 
-def _run_flat(num_tokens: int, mhc_mult: int, token_block_size: int, seed: int) -> bool:
+def _run(num_tokens, mhc_mult, token_block_size, seed):
     assert num_tokens % token_block_size == 0, (
         f"num_tokens ({num_tokens}) must be divisible by "
         f"token_block_size ({token_block_size})"
     )
-    blk = token_block_size * mhc_mult
-    assert blk % (VEC_NUM * 8) == 0, (
-        f"token_block_size*mhc_mult ({blk}) must be a multiple of "
-        f"{VEC_NUM * 8} so each vector core's float32 segment is 32B-aligned"
-    )
-    num_blocks = num_tokens // token_block_size
-    kernel = build_copy_flat(num_blocks, blk)
+    n = token_block_size * mhc_mult  # one aligned flat row
+    m = num_tokens // token_block_size  # number of flat rows
+    assert n % 8 == 0, f"flat row of {n} float32 must be 32B-aligned"
+    assert m >= 2 and m % 2 == 0, f"flat-row count {m} must be even and >= 2"
+
+    # block_M: even, divides m, kept small so m_num stays modest.
+    block_m = 2
+    for cand in (32, 16, 8, 4):
+        if cand <= m and m % cand == 0:
+            block_m = cand
+            break
+
+    kernel = copy_kernel(m, n, block_m)
 
     ok = True
     for name, src in _make_inputs(num_tokens, mhc_mult, seed):
-        x = src.reshape(num_blocks, blk).npu().contiguous()
-        y = kernel(x)
+        a = src.reshape(m, n).npu().contiguous()
+        b = kernel(a)
         torch.npu.synchronize()
-        got = y.reshape(num_tokens, mhc_mult)
-        ok &= _check(f"flat {name}", got, src, mhc_mult)
+        got = b.reshape(num_tokens, mhc_mult)
+        ok &= _check(name, got, src, mhc_mult)
     return ok
 
 
-def _run_naive(
-    num_tokens: int, mhc_mult: int, token_block_size: int, seed: int
-) -> bool:
-    assert num_tokens % token_block_size == 0
-    assert token_block_size % VEC_NUM == 0
-    kernel = build_copy_naive_2d(num_tokens, mhc_mult, token_block_size)
-
-    ok = True
-    for name, src in _make_inputs(num_tokens, mhc_mult, seed):
-        x = src.npu().contiguous()
-        y = kernel(x)
-        torch.npu.synchronize()
-        ok &= _check(f"naive-2d {name}", y, src, mhc_mult)
-    return ok
-
-
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(
         description="Verify the MHC input_mix GM->UB tile copy on Ascend NPU.",
     )
     parser.add_argument("--mhc-mult", type=int, default=4)
     parser.add_argument("--token-block-size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--naive",
-        action="store_true",
-        help="also run the unaligned [block, mhc_mult] 2D copy",
-    )
     args = parser.parse_args()
 
     if not hasattr(torch, "npu"):
@@ -208,40 +150,23 @@ def main() -> None:
         f"=== MHC input_mix GM->UB tile copy "
         f"(mhc_mult={mm}, token_block_size={tbs}) ==="
     )
-    print(f"    [token_block_size, mhc_mult] inner row = {mm}*4 = {mm * 4}B")
-    flat_bytes = tbs * mm * 4
+    flat = tbs * mm
     print(
-        f"    flat per-core span = {tbs * mm}*4 = {flat_bytes}B "
-        f"(32B-aligned: {flat_bytes % 32 == 0})"
+        f"    flat row = token_block_size*mhc_mult = {flat} float32 "
+        f"= {flat * 4}B (32B-aligned: {flat * 4 % 32 == 0})"
     )
 
-    print("\n-- recommended: flat contiguous-row copy --")
     all_ok = True
     for nt in shapes:
         print(f" num_tokens={nt}:")
-        all_ok &= _run_flat(nt, mm, tbs, args.seed)
-
-    if args.naive:
-        print("\n-- contrast: naive 2D [block, mhc_mult] copy (16B rows) --")
-        print("   an ADDR_MISALIGN trap aborts the process; a mis-lowered")
-        print("   DMA shows up as FAIL lines -- either confirms the flat fix.")
-        for nt in shapes:
-            print(f" num_tokens={nt}:")
-            try:
-                _run_naive(nt, mm, tbs, args.seed)
-            except Exception as exc:
-                print(
-                    f"  [ERROR] naive-2d num_tokens={nt}: {type(exc).__name__}: {exc}"
-                )
-    else:
-        print("\n(run with --naive to also test the unaligned 2D copy)")
+        all_ok &= _run(nt, mm, tbs, args.seed)
 
     print()
     if all_ok:
         print(
             "RESULT: flat-row GM->UB->GM copy is bit-exact for every shape. "
-            "Use the [num_blocks, token_block_size*mhc_mult] reshape for the "
-            "MHC input_mix tile load."
+            "Reshape input_mix to [num_blocks, token_block_size*mhc_mult] "
+            "for the MHC tile load."
         )
     else:
         print("RESULT: flat-row copy MISMATCH -- see the FAIL line(s) above.")
