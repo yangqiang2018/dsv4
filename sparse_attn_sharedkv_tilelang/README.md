@@ -154,7 +154,10 @@ pytest -q test_sparse_attn_sharedkv.py::test_golden_math_matches_single_shot_sof
 # Full NPU end-to-end (requires Ascend NPU + tilelang-ascend + torch_npu).
 pytest -q test_sparse_attn_sharedkv.py
 pytest -q test_sparse_attn_sharedkv.py -k scfa_decode
+
+# Also run the large-S1 cases (S1=8192; the CPU golden takes minutes).
+pytest -q test_sparse_attn_sharedkv.py --runslow
 ```
 
 NPU cases skip automatically (`requires_npu` mark) when `torch_npu` is
-absent.
+absent. Large-S1 (`slow`) cases are skipped unless `--runslow` is given.

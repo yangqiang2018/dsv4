@@ -11,9 +11,9 @@ Run on an Ascend NPU host with TileLang-Ascend installed::
     pytest -q test_sparse_attn_sharedkv.py -k "swa_decode"
 
 The CPU golden is the long pole; cases with ``S1`` in the thousands take
-minutes to compute the reference. The :data:`SMALL_CASES` list below
-restricts the default run to fast cases; opt in to the larger cases with
-``-m slow``.
+minutes to compute the reference. The :data:`SMALL_CASES` list runs by
+default; the large :data:`LARGE_CASES` are marked ``slow`` and skipped
+unless ``--runslow`` is passed.
 """
 
 from __future__ import annotations
@@ -275,6 +275,31 @@ SCENARIOS = {
         ori_mask_mode=4,
         cmp_mask_mode=3,
     ),
+    # Large-S1 prefill (mirrors the Ascend C scfa_prefill case). The CPU
+    # golden takes minutes at this size, so it is gated behind --runslow.
+    "scfa_prefill": dict(
+        scenario=3,
+        layout_q="TND",
+        B=1,
+        S1=8192,
+        T1=8192,
+        N1=64,
+        N2=1,
+        D=512,
+        K=512,
+        block_num1=65,
+        block_num2=17,
+        block_size1=128,
+        block_size2=128,
+        cu_seqlens_q=[0, 8192],
+        seqused_kv=[8192],
+        softmax_scale=0.04419417,
+        cmp_ratio=4,
+        ori_win_left=127,
+        ori_win_right=0,
+        ori_mask_mode=4,
+        cmp_mask_mode=3,
+    ),
 }
 
 SMALL_CASES = [
@@ -287,6 +312,11 @@ SMALL_CASES = [
     "cfa_decode_r128",
     "scfa_bsnd_small",
     "scfa_tnd_multibatch",
+]
+
+# Large-S1 cases: marked `slow`, skipped unless `--runslow` (see conftest.py).
+LARGE_CASES = [
+    "scfa_prefill",
 ]
 
 
@@ -441,7 +471,10 @@ def _build_case(cfg: dict, dtype: torch.dtype, seed: int = 42):
 
 
 @requires_npu
-@pytest.mark.parametrize("case_name", SMALL_CASES)
+@pytest.mark.parametrize(
+    "case_name",
+    SMALL_CASES + [pytest.param(c, marks=pytest.mark.slow) for c in LARGE_CASES],
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_sparse_attn_sharedkv(case_name, dtype):
     # Imported lazily so the CPU-only math test below can run on hosts
