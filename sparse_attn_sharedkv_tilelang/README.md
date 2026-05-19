@@ -138,10 +138,11 @@ matching the tolerance used by the original test suite.
   kernel signature well-typed. The JIT cache key distinguishes scenarios.
 * `cmp_ratio` is treated as a compile-time integer divisor. Only the
   documented `{4, 128}` values are exercised.
-* For the TND layout, the kernel internally pads to BSND `[B, S_max,
-  N1, D]`. Batches with short sequences do useless work on padded
-  slots; on-device cost stays proportional to ``T_total`` only when
-  ``S_max ≈ T_total / B``.
+* TND inputs are consumed natively: the kernel addresses `Q` /
+  `Output` / `cmp_indices` by a flat token id `q_prefix[b] + s` (no
+  host-side TND→BSND padding). The persistent dispatch still walks a
+  `batch * max_seq` grid and skips padded `(b, s)` slots, so on-device
+  cost stays proportional to ``T_total`` only when ``S_max ≈ T_total / B``.
 
 ## Running tests
 

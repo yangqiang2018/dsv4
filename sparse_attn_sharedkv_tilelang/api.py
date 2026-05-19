@@ -1,9 +1,10 @@
 """High-level Python entry point for the TileLang SparseAttnSharedKV op.
 
 Handles the three scenarios from the original Ascend C operator and the
-TND/BSND layout dispatch. The kernel itself only sees a padded BSND
-layout and a single combined ori-window + sparse-cmp code path; this
-module converts to/from TND and synthesises dummy inputs for the
+TND/BSND layout dispatch. The kernel works on flat ``[total_tokens,
+...]`` tensors plus a per-batch ``q_prefix`` offset, so TND inputs pass
+through natively and BSND inputs are a free reshape -- no host-side
+layout conversion. This module only synthesises dummy inputs for the
 SWA-only and CFA scenarios so the same kernel can serve all three.
 
 Usage::
@@ -31,7 +32,7 @@ Usage::
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 
@@ -53,6 +54,7 @@ def _get_kernel(
     *,
     batch: int,
     max_seq: int,
+    total_tokens: int,
     ori_block_num: int,
     ori_block_size: int,
     ori_table_len: int,
@@ -72,6 +74,7 @@ def _get_kernel(
     key = (
         batch,
         max_seq,
+        total_tokens,
         ori_block_num,
         ori_block_size,
         ori_table_len,
@@ -93,6 +96,7 @@ def _get_kernel(
         func = build_sparse_attn_sharedkv(
             batch=batch,
             max_seq=max_seq,
+            total_tokens=total_tokens,
             ori_block_num=ori_block_num,
             ori_block_size=ori_block_size,
             ori_table_len=ori_table_len,
@@ -113,76 +117,23 @@ def _get_kernel(
     return func
 
 
-def _tnd_to_bsnd_q(
-    q_tnd: torch.Tensor, cu_seqlens_q: torch.Tensor
-) -> Tuple[torch.Tensor, int]:
-    T1, N1, D = q_tnd.shape
-    seq_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
-    B = len(seq_lens)
-    S_max = max(seq_lens) if seq_lens else 0
-    out = q_tnd.new_zeros((B, S_max, N1, D))
-    for b in range(B):
-        start = int(cu_seqlens_q[b].item())
-        end = int(cu_seqlens_q[b + 1].item())
-        L = end - start
-        out[b, :L, :, :] = q_tnd[start:end, :, :]
-    return out, S_max
-
-
-def _bsnd_to_tnd_out(
-    out_bsnd: torch.Tensor, cu_seqlens_q: torch.Tensor
-) -> torch.Tensor:
-    B, S_max, N1, D = out_bsnd.shape
-    seq_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
-    T1 = sum(seq_lens)
-    out = out_bsnd.new_zeros((T1, N1, D))
-    for b in range(B):
-        start = int(cu_seqlens_q[b].item())
-        end = int(cu_seqlens_q[b + 1].item())
-        L = end - start
-        out[start:end, :, :] = out_bsnd[b, :L, :, :]
-    return out
-
-
-def _tnd_to_bsnd_indices(
-    idx_tnd: torch.Tensor,  # [T1, N2, K]
-    cu_seqlens_q: torch.Tensor,
-    S_max: int,
-) -> torch.Tensor:
-    T1, N2, K = idx_tnd.shape
-    seq_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
-    B = len(seq_lens)
-    out = torch.full((B, S_max, N2, K), -1, dtype=idx_tnd.dtype, device=idx_tnd.device)
-    for b in range(B):
-        start = int(cu_seqlens_q[b].item())
-        end = int(cu_seqlens_q[b + 1].item())
-        L = end - start
-        out[b, :L, :, :] = idx_tnd[start:end, :, :]
-    return out
-
-
 def _synthesize_dense_cmp_indices(
     *,
-    B: int,
-    S_max: int,
+    total_tokens: int,
     N2: int,
     K: int,
-    seqused_kv: torch.Tensor,
-    act_q_lens: torch.Tensor,
-    cmp_ratio: int,
 ) -> torch.Tensor:
     """Make a dense ``arange``-based cmp_sparse_indices for the CFA scenario.
 
-    Each (b, s) row contains ``[0, 1, ..., K-1]`` truncated/padded so the
-    causal threshold is respected by the mask in the kernel.
+    Every token row is ``[0, 1, ..., K-1]``; the causal threshold is
+    enforced by the mask in the kernel.
     """
-    idx = (
+    return (
         torch.arange(K, dtype=torch.int32)
-        .view(1, 1, 1, K)
-        .expand(B, S_max, N2, K)
+        .view(1, 1, K)
+        .expand(total_tokens, N2, K)
         .contiguous()
     )
-    return idx
 
 
 def sparse_attn_sharedkv(
@@ -232,24 +183,30 @@ def sparse_attn_sharedkv(
     else:
         scenario = 3  # SCFA
 
-    # ---- Normalize Q / indices into BSND. ----
+    # ---- Normalize Q / indices into a flat [total_tokens, ...] view. ----
+    # The kernel addresses Q / Output / cmp_indices by a flat token id
+    # `q_prefix[b] + s`. TND inputs are passed through natively; BSND
+    # inputs are reshaped (a free view of the same contiguous memory).
     if layout_q == "TND":
         assert cu_seqlens_q is not None, "cu_seqlens_q is required for TND"
         cu = cu_seqlens_q.to(torch.int32).cpu()
-        q_bsnd, S_max = _tnd_to_bsnd_q(q, cu)
         B = cu.numel() - 1
         seq_lens = (cu[1:] - cu[:-1]).tolist()
+        S_max = max(seq_lens) if seq_lens else 0
+        T1, N1, D = q.shape
+        total_tokens = T1
+        q_flat = q
+        q_prefix = cu[:-1].to(q.device)
         act_q_lens = torch.tensor(seq_lens, dtype=torch.int32, device=q.device)
-        N1, D = q.shape[1], q.shape[2]
         if scenario == 3:
-            cmp_sparse_indices_bsnd = _tnd_to_bsnd_indices(
-                cmp_sparse_indices.to(torch.int32), cu, S_max
-            ).to(q.device)
+            cmp_indices_flat = cmp_sparse_indices.to(torch.int32).to(q.device)
         else:
-            cmp_sparse_indices_bsnd = None
+            cmp_indices_flat = None
     else:  # BSND
-        q_bsnd = q
         B, S_max, N1, D = q.shape
+        total_tokens = B * S_max
+        q_flat = q.reshape(total_tokens, N1, D)
+        q_prefix = torch.arange(B, dtype=torch.int32, device=q.device) * S_max
         seq_lens = [S_max] * B
         act_q_lens = torch.full((B,), S_max, dtype=torch.int32, device=q.device)
         if cu_seqlens_q is not None:
@@ -257,20 +214,23 @@ def sparse_attn_sharedkv(
             seq_lens = (cu[1:] - cu[:-1]).tolist()
             act_q_lens = torch.tensor(seq_lens, dtype=torch.int32, device=q.device)
         if scenario == 3:
-            cmp_sparse_indices_bsnd = cmp_sparse_indices.to(torch.int32)
+            ci = cmp_sparse_indices.to(torch.int32)
+            cmp_indices_flat = ci.reshape(total_tokens, ci.shape[2], ci.shape[3]).to(
+                q.device
+            )
         else:
-            cmp_sparse_indices_bsnd = None
+            cmp_indices_flat = None
 
     seqused_kv_dev = seqused_kv.to(torch.int32).to(q.device)
 
     # ---- Resolve topk / scenario-specific tensors. ----
     if scenario == 3:
-        N2 = cmp_sparse_indices_bsnd.shape[2]
-        K = topk_cmp if topk_cmp is not None else cmp_sparse_indices_bsnd.shape[3]
-        assert K == cmp_sparse_indices_bsnd.shape[3], (
+        N2 = cmp_indices_flat.shape[1]
+        K = topk_cmp if topk_cmp is not None else cmp_indices_flat.shape[2]
+        assert K == cmp_indices_flat.shape[2], (
             "topk_cmp does not match cmp_sparse_indices last dim"
         )
-        cmp_indices_dev = cmp_sparse_indices_bsnd.to(q.device)
+        cmp_indices_dev = cmp_indices_flat
     elif scenario == 2:
         N2 = cmp_kv.shape[2]
         # CFA attends to ALL compressed tokens up to the per-row causal
@@ -281,13 +241,9 @@ def sparse_attn_sharedkv(
         max_cmp = int(seqused_kv.max().item()) // cmp_ratio
         K = max(64, ((max_cmp + 63) // 64) * 64)
         cmp_indices_dev = _synthesize_dense_cmp_indices(
-            B=B,
-            S_max=S_max,
+            total_tokens=total_tokens,
             N2=N2,
             K=K,
-            seqused_kv=seqused_kv,
-            act_q_lens=act_q_lens,
-            cmp_ratio=cmp_ratio,
         ).to(q.device)
     else:
         N2 = ori_kv.shape[2]
@@ -303,10 +259,10 @@ def sparse_attn_sharedkv(
     _bi = 64
     _pad_cols = ((ori_win_left + 1 + _bi - 1) // _bi) * _bi
     _front = torch.full(
-        (B, S_max, N2, _pad_cols), -1, dtype=torch.int32, device=q.device
+        (total_tokens, N2, _pad_cols), -1, dtype=torch.int32, device=q.device
     )
     if cmp_indices_dev is not None:
-        cmp_indices_dev = torch.cat([_front, cmp_indices_dev.to(torch.int32)], dim=3)
+        cmp_indices_dev = torch.cat([_front, cmp_indices_dev.to(torch.int32)], dim=2)
     else:
         cmp_indices_dev = _front
 
@@ -340,6 +296,7 @@ def sparse_attn_sharedkv(
     func = _get_kernel(
         batch=int(B),
         max_seq=int(S_max),
+        total_tokens=int(total_tokens),
         ori_block_num=int(ori_block_num),
         ori_block_size=int(ori_block_size),
         ori_table_len=int(ori_table_len),
@@ -361,20 +318,20 @@ def sparse_attn_sharedkv(
     sinks_dev = sinks.to(torch.float32).to(q.device)
 
     # ---- Run kernel. Workspaces are auto-allocated via workspace_idx. ----
-    out_bsnd = func(
-        q_bsnd.contiguous(),
+    out_flat = func(
+        q_flat.contiguous(),
         ori_kv_dev.contiguous(),
         ori_bt_dev.contiguous(),
         cmp_kv_dev.contiguous(),
         cmp_bt_dev.contiguous(),
         cmp_indices_dev.contiguous(),
+        q_prefix.contiguous(),
         act_q_lens.contiguous(),
         seqused_kv_dev.contiguous(),
         sinks_dev.contiguous(),
     )
 
-    # ---- Convert layout back. ----
+    # ---- Restore the caller's layout. ----
     if layout_q == "TND":
-        cu = cu_seqlens_q.to(torch.int32).cpu()
-        return _bsnd_to_tnd_out(out_bsnd, cu)
-    return out_bsnd
+        return out_flat  # already [T1, N1, D]
+    return out_flat.reshape(B, S_max, N1, D)

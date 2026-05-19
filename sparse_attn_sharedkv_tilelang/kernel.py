@@ -26,8 +26,11 @@ token id to ``(physical_block, row)`` and DMAs the ``[D]`` KV row,
 mirroring the Ascend C ``DataCopyPA`` path and the verified
 ``example_sparse_flash_attn_mask_pa`` gather.
 
-The kernel takes a padded BSND layout for ``Q`` / ``Output``; :mod:`api`
-converts TND inputs to BSND before invocation.
+``Q`` / ``Output`` / ``cmp_indices`` are flat ``[total_tokens, ...]``
+tensors. Each ``(batch, seq)`` work item is mapped to a token id via a
+per-batch ``q_prefix`` offset, so native TND inputs need no host-side
+padding: TND passes ``q_prefix[b] = cu_seqlens_q[b]``, BSND passes
+``q_prefix[b] = b * max_seq`` over a reshaped ``[B*max_seq, ...]`` view.
 """
 
 import tilelang
@@ -63,6 +66,7 @@ def build_sparse_attn_sharedkv(
     *,
     batch: int,
     max_seq: int,
+    total_tokens: int,
     ori_block_num: int,
     ori_block_size: int,
     ori_table_len: int,
@@ -83,9 +87,10 @@ def build_sparse_attn_sharedkv(
     """Build a JIT-compiled TileLang kernel for SparseAttnSharedKV.
 
     Arguments are all compile-time constants. Call the returned kernel
-    object with the runtime tensors (BSND-padded Q + paged KV + block
-    tables + sinks). :mod:`api` provides a high-level wrapper that
-    converts layouts and synthesises the cmp scenario inputs.
+    object with the runtime tensors (flat ``[total_tokens, ...]`` Q +
+    ``q_prefix`` + paged KV + block tables + sinks). :mod:`api` provides
+    a high-level wrapper that maps layouts and synthesises the cmp
+    scenario inputs.
     """
     _check_dtypes(dtype)
     assert n_heads == 64, "API constraint: n_heads must be 64"
@@ -94,7 +99,7 @@ def build_sparse_attn_sharedkv(
     assert ori_win_left == 127, "API constraint: ori_win_left must be 127"
     assert topk_cmp >= 0
     assert topk_cmp % block_I == 0, "topk_cmp must be a multiple of block_I"
-    assert batch > 0 and max_seq > 0
+    assert batch > 0 and max_seq > 0 and total_tokens > 0
     assert ori_block_num > 0 and ori_block_size > 0 and ori_table_len > 0
     assert cmp_block_num > 0 and cmp_block_size > 0 and cmp_table_len > 0
 
@@ -114,8 +119,8 @@ def build_sparse_attn_sharedkv(
     v_block = H_per_block // 2  # 32 -- each AIV handles half the heads
     ub_len = max(32 // 4, v_block)  # 32-byte UB alignment for fp32 scalars
 
-    q_shape = [batch, max_seq, n_heads, D]
-    out_shape = [batch, max_seq, n_heads, D]
+    q_shape = [total_tokens, n_heads, D]
+    out_shape = [total_tokens, n_heads, D]
     ori_kv_shape = [ori_block_num, ori_block_size, n_kv_heads, D]
     cmp_kv_shape = [cmp_block_num, cmp_block_size, n_kv_heads, D]
     ori_bt_shape = [batch, ori_table_len]
@@ -124,7 +129,7 @@ def build_sparse_attn_sharedkv(
     # the cmp chunks address it with a plain `chunk*BI` slice start
     # (cmp chunk indices run NI_ori..NI_total-1). The padded slots also
     # double as the dummy cmp_indices for the SWA scenario (no cmp pass).
-    indices_shape = [batch, max_seq, n_kv_heads, NI_total * BI]
+    indices_shape = [total_tokens, n_kv_heads, NI_total * BI]
 
     # ---- Manual address maps (bytes). ----
     KB = 1024
@@ -149,7 +154,7 @@ def build_sparse_attn_sharedkv(
         "acc_o_half": 88 * KB,  # aliases acc_o_ub (disjoint phases)
     }
 
-    @tilelang.jit(out_idx=[9], workspace_idx=[10, 11, 12, 13])
+    @tilelang.jit(out_idx=[10], workspace_idx=[11, 12, 13, 14])
     def _make():
         @T.prim_func
         def main(
@@ -159,6 +164,7 @@ def build_sparse_attn_sharedkv(
             cmp_KV: T.Tensor(cmp_kv_shape, dtype),  # type: ignore[valid-type]
             cmp_block_table: T.Tensor(cmp_bt_shape, indices_dtype),  # type: ignore[valid-type]
             cmp_indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore[valid-type]
+            q_prefix: T.Tensor([batch], indices_dtype),  # type: ignore[valid-type]
             actual_q_len: T.Tensor([batch], indices_dtype),  # type: ignore[valid-type]
             actual_kv_len: T.Tensor([batch], indices_dtype),  # type: ignore[valid-type]
             Sinks: T.Tensor([n_heads], accum_dtype),  # type: ignore[valid-type]
@@ -229,6 +235,11 @@ def build_sparse_attn_sharedkv(
                         act_q = actual_q_len[b_i]
                         act_kv = actual_kv_len[b_i]
                         if s_i < act_q:
+                            # Flat token id of this (batch, seq) work
+                            # item. q_prefix carries the per-batch token
+                            # offset: cu_seqlens_q[b] for native TND,
+                            # b * max_seq for a reshaped BSND view.
+                            t_i = q_prefix[b_i] + s_i
                             # Causal s-position in the kv sequence.
                             s_global = act_kv - act_q + s_i
                             ori_right = s_global
@@ -241,7 +252,7 @@ def build_sparse_attn_sharedkv(
 
                             # ================= CUBE =================
                             with T.Scope("C"):
-                                T.copy(Q[b_i, s_i, 0:n_heads, 0:D], q_l1)
+                                T.copy(Q[t_i, 0:n_heads, 0:D], q_l1)
                                 T.barrier_all()
                                 for _ in T.serial(NI_total):
                                     T.wait_cross_flag(_FLAG_KV_READY)
@@ -344,8 +355,7 @@ def build_sparse_attn_sharedkv(
                                     else:
                                         T.copy(
                                             cmp_indices[
-                                                b_i,
-                                                s_i,
+                                                t_i,
                                                 0,
                                                 chunk * BI : chunk * BI + BI,
                                             ],
@@ -543,8 +553,7 @@ def build_sparse_attn_sharedkv(
                                 T.copy(
                                     acc_o_half,
                                     Output[
-                                        b_i,
-                                        s_i,
+                                        t_i,
                                         vid * v_block : vid * v_block + v_block,
                                         :,
                                     ],
