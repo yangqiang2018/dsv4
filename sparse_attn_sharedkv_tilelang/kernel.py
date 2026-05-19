@@ -132,11 +132,10 @@ def build_sparse_attn_sharedkv(
     cmp_kv_shape = [cmp_block_num, cmp_block_size, n_kv_heads, D]
     ori_bt_shape = [batch, ori_table_len]
     cmp_bt_shape = [batch, cmp_table_len]
-    # cmp_indices is front-padded host-side by NI_ori*BI dummy slots so
-    # the cmp chunks address it with a plain `chunk*BI` slice start
-    # (cmp chunk indices run NI_ori..NI_total-1). The padded slots also
-    # double as the dummy cmp_indices for the SWA scenario (no cmp pass).
-    indices_shape = [total_tokens, n_kv_heads, NI_total * BI]
+    # cmp_indices holds only the real cmp top-K indices; cmp chunk `chunk`
+    # (chunk in NI_ori..NI_total-1) addresses it at `(chunk - NI_ori) * BI`.
+    # SWA has no cmp pass, so its dummy is a single BI-wide slot.
+    indices_shape = [total_tokens, n_kv_heads, max(NI_cmp, 1) * BI]
 
     # ---- Manual address maps (bytes). ----
     KB = 1024
@@ -371,11 +370,12 @@ def build_sparse_attn_sharedkv(
                                                 (chunk - NI_ori) * BI,
                                             )
                                         else:
+                                            cmp_off = (chunk - NI_ori) * BI
                                             T.copy(
                                                 cmp_indices[
                                                     t_i,
                                                     0,
-                                                    chunk * BI : chunk * BI + BI,
+                                                    cmp_off : cmp_off + BI,
                                                 ],
                                                 idx_int,
                                             )
