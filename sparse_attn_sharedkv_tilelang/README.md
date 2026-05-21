@@ -113,8 +113,12 @@ golden's chunked online softmax matches the closed-form
 `softmax([scores, sink]) @ V` reference to `atol=2e-4` for an fp32 case
 with a small sparse index set.
 
-NPU end-to-end cases assert `rtol=2e-2, atol=2e-2` against the golden,
-matching the tolerance used by the original test suite.
+NPU end-to-end cases use the Ascend C reference suite's check criterion
+(`_check_result` in `test_sparse_attn_sharedkv.py`, mirroring
+`result_compare_method.check_result`): at least 99.5% of output elements
+pass `np.isclose` with dtype-specific tolerance (bf16: `rtol=0.0078125,
+atol=0.0001`; fp16: `rtol=0.005, atol=0.000025`), AND the worst
+normalized relative error among failing elements stays below 10.
 
 ## Performance notes (deferred work)
 

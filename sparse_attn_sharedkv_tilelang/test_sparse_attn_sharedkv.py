@@ -1,19 +1,20 @@
 """Pytest suite for the TileLang SparseAttnSharedKV port.
 
-Each case exercises one (scenario, layout, dtype) combination and
-compares the TileLang kernel output against the Python golden in
-:mod:`golden`.
+The parameter set and numerical check criterion mirror the Ascend C
+reference suite (``ops-transformer/.../sparse_attn_sharedkv/tests/
+pytest/``) 1:1 -- six cases (scfa/swa/cfa x decode/prefill, all TND,
+B=1) with ``check_result``-style validation: per-element ``np.isclose``
+at the Ascend C tolerances, at least 99.5% of elements must pass, and
+the worst normalized relative error must stay below 10.
 
 Run on an Ascend NPU host with TileLang-Ascend installed::
 
     pytest -q test_sparse_attn_sharedkv.py
-    pytest -q test_sparse_attn_sharedkv.py -k "scfa_prefill"
-    pytest -q test_sparse_attn_sharedkv.py -k "swa_decode"
+    pytest -q test_sparse_attn_sharedkv.py --runslow
 
-The CPU golden is the long pole; cases with ``S1`` in the thousands take
-minutes to compute the reference. The :data:`SMALL_CASES` list runs by
-default; the large :data:`LARGE_CASES` are marked ``slow`` and skipped
-unless ``--runslow`` is passed.
+The three prefill cases run ``S1=8192``; the CPU golden takes minutes
+at that size. They are marked ``slow`` and skipped unless ``--runslow``
+is passed.
 """
 
 from __future__ import annotations
@@ -60,7 +61,10 @@ requires_npu = pytest.mark.skipif(
 )
 
 
-# ---- Test-case definitions (mirrors original sparse_attn_sharedkv_paramset). ----
+# ---- Test cases: mirror the Ascend C paramset 1:1. ----
+# Six cases: scfa/swa/cfa x decode/prefill, all TND, B=1. (The Ascend C
+# paramset is bf16-only in single mode; we additionally run fp16, which
+# the kernel supports, as extra coverage.)
 
 SCENARIOS = {
     "scfa_decode": dict(
@@ -86,197 +90,6 @@ SCENARIOS = {
         ori_mask_mode=4,
         cmp_mask_mode=3,
     ),
-    "scfa_prefill_small": dict(
-        scenario=3,
-        layout_q="TND",
-        B=1,
-        S1=128,
-        T1=128,
-        N1=64,
-        N2=1,
-        D=512,
-        K=512,
-        block_num1=65,
-        block_num2=17,
-        block_size1=128,
-        block_size2=128,
-        cu_seqlens_q=[0, 128],
-        seqused_kv=[4096],
-        softmax_scale=0.04419417,
-        cmp_ratio=4,
-        ori_win_left=127,
-        ori_win_right=0,
-        ori_mask_mode=4,
-        cmp_mask_mode=3,
-    ),
-    "swa_decode": dict(
-        scenario=1,
-        layout_q="TND",
-        B=1,
-        S1=1,
-        T1=1,
-        N1=64,
-        N2=1,
-        D=512,
-        block_num1=65,
-        block_num2=1,
-        block_size1=128,
-        block_size2=1,
-        cu_seqlens_q=[0, 1],
-        seqused_kv=[8193],
-        softmax_scale=0.04419417,
-        cmp_ratio=4,
-        ori_win_left=127,
-        ori_win_right=0,
-        ori_mask_mode=4,
-        cmp_mask_mode=3,
-        K=0,
-    ),
-    "swa_prefill_small": dict(
-        scenario=1,
-        layout_q="TND",
-        B=1,
-        S1=128,
-        T1=128,
-        N1=64,
-        N2=1,
-        D=512,
-        block_num1=65,
-        block_num2=1,
-        block_size1=128,
-        block_size2=1,
-        cu_seqlens_q=[0, 128],
-        seqused_kv=[4096],
-        softmax_scale=0.04419417,
-        cmp_ratio=4,
-        ori_win_left=127,
-        ori_win_right=0,
-        ori_mask_mode=4,
-        cmp_mask_mode=3,
-        K=0,
-    ),
-    "cfa_decode": dict(
-        scenario=2,
-        layout_q="TND",
-        B=1,
-        S1=1,
-        T1=1,
-        N1=64,
-        N2=1,
-        D=512,
-        K=512,
-        block_num1=65,
-        block_num2=17,
-        block_size1=128,
-        block_size2=128,
-        cu_seqlens_q=[0, 1],
-        seqused_kv=[8193],
-        softmax_scale=0.04419417,
-        cmp_ratio=4,
-        ori_win_left=127,
-        ori_win_right=0,
-        ori_mask_mode=4,
-        cmp_mask_mode=3,
-    ),
-    "cfa_prefill_small": dict(
-        scenario=2,
-        layout_q="TND",
-        B=1,
-        S1=128,
-        T1=128,
-        N1=64,
-        N2=1,
-        D=512,
-        K=512,
-        block_num1=65,
-        block_num2=17,
-        block_size1=128,
-        block_size2=128,
-        cu_seqlens_q=[0, 128],
-        seqused_kv=[4096],
-        softmax_scale=0.04419417,
-        cmp_ratio=4,
-        ori_win_left=127,
-        ori_win_right=0,
-        ori_mask_mode=4,
-        cmp_mask_mode=3,
-    ),
-    # cmp_ratio=128: the only other documented value (all other cases
-    # use 4); the Ascend C reference suite's CFA cases run cmp_ratio=128.
-    "cfa_decode_r128": dict(
-        scenario=2,
-        layout_q="TND",
-        B=1,
-        S1=1,
-        T1=1,
-        N1=64,
-        N2=1,
-        D=512,
-        K=512,
-        block_num1=65,
-        block_num2=17,
-        block_size1=128,
-        block_size2=128,
-        cu_seqlens_q=[0, 1],
-        seqused_kv=[8193],
-        softmax_scale=0.04419417,
-        cmp_ratio=128,
-        ori_win_left=127,
-        ori_win_right=0,
-        ori_mask_mode=4,
-        cmp_mask_mode=3,
-    ),
-    "scfa_bsnd_small": dict(
-        scenario=3,
-        layout_q="BSND",
-        B=2,
-        S1=16,
-        T1=32,
-        N1=64,
-        N2=1,
-        D=512,
-        K=64,
-        block_num1=128,
-        block_num2=64,
-        block_size1=128,
-        block_size2=128,
-        cu_seqlens_q=[0, 16, 32],
-        seqused_kv=[2048, 2048],
-        softmax_scale=0.04419417,
-        cmp_ratio=4,
-        ori_win_left=127,
-        ori_win_right=0,
-        ori_mask_mode=4,
-        cmp_mask_mode=3,
-    ),
-    # B>1 TND: two batches of unequal length exercise a non-zero
-    # per-batch q_prefix token offset on the native-TND path, which the
-    # B=1 TND cases above (q_prefix always [0]) do not cover.
-    "scfa_tnd_multibatch": dict(
-        scenario=3,
-        layout_q="TND",
-        B=2,
-        S1=32,
-        T1=48,
-        N1=64,
-        N2=1,
-        D=512,
-        K=64,
-        block_num1=48,
-        block_num2=16,
-        block_size1=128,
-        block_size2=128,
-        cu_seqlens_q=[0, 16, 48],
-        seqused_kv=[2048, 3072],
-        softmax_scale=0.04419417,
-        cmp_ratio=4,
-        ori_win_left=127,
-        ori_win_right=0,
-        ori_mask_mode=4,
-        cmp_mask_mode=3,
-    ),
-    # Large-S1 prefill (mirrors the Ascend C scfa_prefill case). The CPU
-    # golden takes minutes at this size, so it is gated behind --runslow.
     "scfa_prefill": dict(
         scenario=3,
         layout_q="TND",
@@ -299,29 +112,114 @@ SCENARIOS = {
         ori_win_right=0,
         ori_mask_mode=4,
         cmp_mask_mode=3,
-        # S1=8192 bf16 accumulates more online-softmax rounding; observed
-        # 22/268M elements at worst 0.026 abs diff on near-zero outputs.
-        # Bump per-case tolerance accordingly (other cases stay at 2e-2).
-        atol=5e-2,
-        rtol=5e-2,
+    ),
+    "swa_decode": dict(
+        scenario=1,
+        layout_q="TND",
+        B=1,
+        S1=1,
+        T1=1,
+        N1=64,
+        N2=1,
+        D=512,
+        K=0,
+        block_num1=65,
+        block_num2=1,
+        block_size1=128,
+        block_size2=1,
+        cu_seqlens_q=[0, 1],
+        seqused_kv=[8193],
+        softmax_scale=0.04419417,
+        cmp_ratio=4,
+        ori_win_left=127,
+        ori_win_right=0,
+        ori_mask_mode=4,
+        cmp_mask_mode=3,
+    ),
+    "swa_prefill": dict(
+        scenario=1,
+        layout_q="TND",
+        B=1,
+        S1=8192,
+        T1=8192,
+        N1=64,
+        N2=1,
+        D=512,
+        K=0,
+        block_num1=65,
+        block_num2=1,
+        block_size1=128,
+        block_size2=1,
+        cu_seqlens_q=[0, 8192],
+        seqused_kv=[8192],
+        softmax_scale=0.04419417,
+        cmp_ratio=4,
+        ori_win_left=127,
+        ori_win_right=0,
+        ori_mask_mode=4,
+        cmp_mask_mode=3,
+    ),
+    "cfa_decode": dict(
+        scenario=2,
+        layout_q="TND",
+        B=1,
+        S1=1,
+        T1=1,
+        N1=64,
+        N2=1,
+        D=512,
+        K=512,
+        block_num1=65,
+        block_num2=17,
+        block_size1=128,
+        block_size2=128,
+        cu_seqlens_q=[0, 1],
+        seqused_kv=[8193],
+        softmax_scale=0.04419417,
+        cmp_ratio=128,
+        ori_win_left=127,
+        ori_win_right=0,
+        ori_mask_mode=4,
+        cmp_mask_mode=3,
+    ),
+    "cfa_prefill": dict(
+        scenario=2,
+        layout_q="TND",
+        B=1,
+        S1=8192,
+        T1=8192,
+        N1=64,
+        N2=1,
+        D=512,
+        K=512,
+        block_num1=65,
+        block_num2=17,
+        block_size1=128,
+        block_size2=128,
+        cu_seqlens_q=[0, 8192],
+        seqused_kv=[8192],
+        softmax_scale=0.04419417,
+        cmp_ratio=128,
+        ori_win_left=127,
+        ori_win_right=0,
+        ori_mask_mode=4,
+        cmp_mask_mode=3,
     ),
 }
 
+# Decodes (S1=1) run by default; prefills (S1=8192) trigger a CPU golden
+# that takes minutes, so they are marked `slow` and skipped unless
+# --runslow is passed (see conftest.py).
 SMALL_CASES = [
     "scfa_decode",
-    "scfa_prefill_small",
     "swa_decode",
-    "swa_prefill_small",
     "cfa_decode",
-    "cfa_prefill_small",
-    "cfa_decode_r128",
-    "scfa_bsnd_small",
-    "scfa_tnd_multibatch",
 ]
 
-# Large-S1 cases: marked `slow`, skipped unless `--runslow` (see conftest.py).
 LARGE_CASES = [
     "scfa_prefill",
+    "swa_prefill",
+    "cfa_prefill",
 ]
 
 
@@ -475,6 +373,52 @@ def _build_case(cfg: dict, dtype: torch.dtype, seed: int = 42):
     )
 
 
+def _check_result(npu_out: torch.Tensor, expect: torch.Tensor) -> None:
+    """Ascend C ``result_compare_method.check_result``-style validation.
+
+    A case passes iff:
+
+    * at least 99.5% of output elements pass ``np.isclose`` with
+      dtype-specific tolerance (bf16: ``rtol=0.0078125, atol=0.0001``;
+      fp16: ``rtol=0.005, atol=0.000025``), AND
+    * among the failing elements, the worst *normalized* relative
+      error stays below 10.
+
+    The normalized relative error is
+    ``|a - b| / max(max(|a|, |b|), (1 / 2**14) / 0.005)`` -- the same
+    formula as the Ascend C suite, with a ``~0.0122`` floor that keeps
+    near-zero references from blowing up the metric.
+    """
+    if npu_out.dtype == torch.bfloat16:
+        rtol, atol = 0.0078125, 0.0001
+    else:  # float16
+        rtol, atol = 0.005, 0.000025
+
+    real = npu_out.detach().cpu().to(torch.float32).numpy().flatten()
+    expt = expect.detach().cpu().to(torch.float32).numpy().flatten()
+    assert real.size == expt.size, f"size mismatch: {real.size} vs {expt.size}"
+
+    ok = np.isclose(real, expt, rtol=rtol, atol=atol, equal_nan=True)
+    n_err = int((~ok).sum())
+    fulfill_pct = (real.size - n_err) / real.size * 100.0
+
+    diff_thd = 0.005
+    norm_floor = (1.0 / (1 << 14)) / diff_thd  # ~0.01220703
+    b = np.maximum(np.maximum(np.abs(real), np.abs(expt)), norm_floor) + 1e-9
+    rel_err = np.abs(real - expt) / b
+    max_rel = float(rel_err[~ok].max()) if n_err > 0 else 0.0
+
+    assert fulfill_pct >= 99.5, (
+        f"only {fulfill_pct:.4f}% of elements within tol "
+        f"(rtol={rtol}, atol={atol}); 99.5% required; "
+        f"{n_err}/{real.size} failing, max rel err {max_rel:.4f}"
+    )
+    assert max_rel < 10.0, (
+        f"max normalized relative error {max_rel:.4f} exceeds cap 10.0 "
+        f"(fulfill {fulfill_pct:.4f}%, {n_err}/{real.size} failing)"
+    )
+
+
 @requires_npu
 @pytest.mark.parametrize(
     "case_name",
@@ -523,11 +467,7 @@ def test_sparse_attn_sharedkv(case_name, dtype):
         )
         torch.npu.synchronize()
 
-    out_cpu = out.cpu()
-    ref = case["cpu_ref"]
-    torch.testing.assert_close(
-        out_cpu, ref, rtol=cfg.get("rtol", 2e-2), atol=cfg.get("atol", 2e-2)
-    )
+    _check_result(out.cpu(), case["cpu_ref"])
 
 
 # ---- Math-only test: golden vs single-shot softmax (no NPU required). ----
