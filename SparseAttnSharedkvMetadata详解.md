@@ -1038,12 +1038,39 @@ padding 出来的 0 不该参与计算 (会污染 softmax 概率)。本算子需
 - S2 方向 tail 取决于 S2 mod 512: 样本 0、2 切出 "满块 + 尾块" 混合, 样本 1、3 只有一个不到 512 的尾块
 - 如果某个样本 S1=0 或 S2=0 (空样本), 这一步会输出 0 块, 后面调度直接跳过
 
-代码里这一步在 `CalcSplitInfo`：
+**这一步的运算就两个"向上取整除法" (ceil)**:
 
-```cpp
-splitInfo.s1GBaseNum[bIdx] = (s1Size * groupSize_ + (mBaseSize_-1)) / mBaseSize_;
-splitInfo.s2BaseNum[bIdx]  = (s2Size + s2BaseSize_ - 1) / s2BaseSize_;
 ```
+   M  方向块数 = ceil(S1 × G / mBaseSize) = ceil(S1 × 64 / 64) = S1
+   S2 方向块数 = ceil(S2 / s2BaseSize)    = ceil(S2 / 512)
+```
+
+各符号:
+
+| 符号 | 取值 | 含义 (在哪解释过) |
+|------|------|------------------|
+| `S1` / `S2` | 各样本的真实长度 | 从 `seqused_q` / `seqused_kv` 取 (§3.1) |
+| `G` | 64 | 每个 KV head 服务的 Q head 数 = N1/N2 (§1.4) |
+| `mBaseSize` | 64 | 基本块的 M 边 (§2.1) |
+| `s2BaseSize` | 512 | 基本块的 S2 边 (§2.1) |
+| `ceil(a/b)` | 向上取整 | 例: `ceil(1500/512) = 3`, `ceil(100/512) = 1` |
+
+**注意**: 因为 `G = mBaseSize = 64`, 上面 M 方向公式化简后 = `S1` —— 也就是
+**每个 Q token 位置对应 1 个基本块** (一个 token 位置含 G=64 个 Q heads 沿 S1 展平,
+正好填满一个 M=64 的基本块行)。
+
+> **代码对照** (想看 C++ 源码可以看, 不影响理解):
+>
+> 这两行就在 `CalcSplitInfo` 函数里, ceil 用整数除法 `(a + b - 1) / b` 实现:
+>
+> ```cpp
+> splitInfo.s1GBaseNum[bIdx] = (s1Size * groupSize_ + (mBaseSize_-1)) / mBaseSize_;
+> splitInfo.s2BaseNum[bIdx]  = (s2Size + s2BaseSize_ - 1) / s2BaseSize_;
+> ```
+>
+> 变量对应: `s1Size = S1`, `s2Size = S2`, `groupSize_ = G = 64`,
+> `mBaseSize_ = 64`, `s2BaseSize_ = 512`, `bIdx` = 样本索引 (0 ~ B-1),
+> `splitInfo.s1GBaseNum` / `s2BaseNum` = 算出来的 M / S2 方向块数。
 
 ### 4.2 Step 2: 估算开销
 
