@@ -551,21 +551,37 @@ s2BaseSize_ = 512U;          //         对应 N_tile
 
 所以一个基本块对应**完整 attention 的整套**(矩阵乘 + softmax + 加权和), 不只是 `Q @ K^T`。
 
-##### K 和 V 在 S2 方向用同一个颗粒
+##### K 和 V 实际上是同一份数据 (这就是 "SharedKV" 的来历)
 
-K 的 shape = `[S2, D]`, V 的 shape = `[S2, D]` —— **完全一样**。按 S2 每 512 切一刀时同步切:
+注意算子名 **Sparse Attn _SharedKV_ Metadata** 里的 "SharedKV" —— **K 和 V 共享同一份 tensor**:
+
+- 下游算子输入里**没有 V**, 只有 `ori_kv` 和 `cmp_kv`, 同时充当 K 和 V
+- README 公式明确写: $\tilde{K}=\tilde{V}$
+- 这对应 DeepSeek **MLA (Multi-head Latent Attention)** 架构: KV 压缩成同一个 latent 向量
+  (`kv_lora_rank=512`, 也就是 D=512 的由来)
 
 ```
-   K 矩阵 [S2, D]:         V 矩阵 [S2, D]:
-   ┌────────────┐         ┌────────────┐
-   │ K_block 0  │  ←─→    │ V_block 0  │   ← 同一段 S2 token
-   ├────────────┤         ├────────────┤
-   │ K_block 1  │  ←─→    │ V_block 1  │
-   └────────────┘         └────────────┘
-   按 S2 每 512 一刀, K 和 V 同步切
+   latent KV 矩阵 [S2, D=512]:    ← 一份 tensor, 双重身份
+   ┌──────────────────┐
+   │ block 0           │    算 Q @ K^T 时 → 当 K 用
+   ├──────────────────┤    算 prob @ V 时 → 当 V 用
+   │ block 1           │
+   ├──────────────────┤
+   │ ...               │
+   └──────────────────┘
+   按 S2 每 512 一刀
 ```
 
-**一个基本块 ≡ 一段 K + 一段 V + 完整 attention 计算**。V 不需要单独被 metadata 分配。
+**一个基本块 ≡ 一段 latent KV + 完整 attention 计算**。
+
+##### 额外收益：cube 算 prob @ V 时不需要再次搬运 V
+
+因为 V 物理上就是 K, **从 HBM 搬一份 latent 就服务了两次矩阵乘** (`Q @ K^T` 和 `prob @ V`)。
+
+- 传统 attention: K 搬一遍 + V 搬一遍 = `2 × D × S2_total`
+- SharedKV (MLA): latent 搬一遍 = `D × S2_total`
+
+这是 MLA 架构带来的 **2 倍带宽节省**, 也部分解释了为什么 cost 公式里的 6 和 10 这么"温和" — V 的访存基本被 K 的访存覆盖了。
 
 ##### cube 和 vector 协作是硬件绑定, metadata 不管
 
