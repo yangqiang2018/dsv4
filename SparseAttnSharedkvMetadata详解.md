@@ -946,17 +946,32 @@ padding 出来的 0 不该参与计算 (会污染 softmax 概率)。本算子需
 ```
    faMetadata[核 i] = {
      [0] CORE_ENABLE          ← 1=要干活, 0=休息
-     [1] BN2_START            ← 从哪个 (batch, head) 起
-     [2] M_START              ← 从哪个 S1G 行起
-     [3] S2_START             ← 从该行的哪个块起
-     [4] BN2_END              ← 干到哪个 (batch, head) 止
-     [5] M_END                ← 干到哪个 S1G 行止
-     [6] S2_END               ← 干到该行的哪个块止
-     [7] FIRST_FD_WORKSPACE   ← 跨核归约时，结果存哪个槽位
+     [1] BN2_START            ← 从哪个 (batch, kv_head) 起
+     [2] M_START              ←   在这个 (batch, kv_head) 下, 从哪个 S1G 行起
+     [3] S2_START             ←     在这个 S1G 行下, 从哪个 S2 块起
+     [4] BN2_END              ← 干到哪个 (batch, kv_head) 止
+     [5] M_END                ←   干到哪个 S1G 行止
+     [6] S2_END               ←     干到该行的哪个块止
+     [7] FIRST_FD_WORKSPACE   ← 跨核归约时, 结果存哪个槽位
    }
 ```
 
-这就是工头给每个工人发的「任务卡」。
+这就是工头给每个工人发的「任务卡」, 用三层嵌套维度 `BN2 → S1G → S2` 定位任务起止。
+
+> **关于 BN2 和 S1G 里的 "head"**: 这两个 head 不是同一个东西!
+>
+> - **BN2** 里的 "N2" = **KV head 数** (K/V 的头数)
+> - **S1G** 里的 "G" = **N1 / N2** = 每个 KV head 服务的 **Q head 数**
+>
+> 关系: 一个 KV head 给 N1/N2 = G 个 Q heads 共享 K/V。S1G 把这 G 个 Q heads
+> 沿 S1 维度展平 (详见 §1.4), 所以 S1G 维度**已经包含 Q heads**。BN2 维度只是
+> "哪个样本 × 哪个 KV head"。
+>
+> 本算子硬约束 **N2=1**, 所以:
+> - `BN2_START / END` 实际就是 **batch 起止编号** (head 那一维只有 1 种)
+> - G = N1/1 = 64, S1G = S1 × 64
+>
+> 字段叫 BN2 而不是 batch, 是按通用语义命名 — 让 N2 > 1 时可以直接用。
 
 ---
 
