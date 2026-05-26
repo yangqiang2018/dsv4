@@ -486,6 +486,74 @@ s2BaseSize_ = 512U;          //         对应 N_tile
 
 **"吞吐"指的不是单一项**（搬运或算力），而是上面四个约束都不至于成为瓶颈时的综合最优。
 
+#### 第四步：一个基本块到底算了什么？—— 不止 Q @ K^T
+
+到这里我们一直拿 `Q @ K^T` 举例, 但**一个基本块的"工作"远不止这一步**。
+完整 attention 三步在 FlashAttention 算法下是**融合执行**的:
+
+```
+   for each S2 block (= 一个基本块的 S2 范围):
+       partial_score = Q @ K_block^T              ← cube 算 (产出 [64,512] score tile)
+       partial_prob  = exp(partial_score - max)    ← vector 算 softmax
+       partial_O    += partial_prob @ V_block      ← cube 算 (产出 [64,D] 输出贡献)
+       online 更新 m, l
+```
+
+所以一个基本块对应**完整 attention 的整套**(矩阵乘 + softmax + 加权和), 不只是 `Q @ K^T`。
+
+##### K 和 V 在 S2 方向用同一个颗粒
+
+K 的 shape = `[S2, D]`, V 的 shape = `[S2, D]` —— **完全一样**。按 S2 每 512 切一刀时同步切:
+
+```
+   K 矩阵 [S2, D]:         V 矩阵 [S2, D]:
+   ┌────────────┐         ┌────────────┐
+   │ K_block 0  │  ←─→    │ V_block 0  │   ← 同一段 S2 token
+   ├────────────┤         ├────────────┤
+   │ K_block 1  │  ←─→    │ V_block 1  │
+   └────────────┘         └────────────┘
+   按 S2 每 512 一刀, K 和 V 同步切
+```
+
+**一个基本块 ≡ 一段 K + 一段 V + 完整 attention 计算**。V 不需要单独被 metadata 分配。
+
+##### cube 和 vector 协作是硬件绑定, metadata 不管
+
+昇腾架构 **AIC : AIV = 1 : 2 比例固定**, 每个 AIC 自动配两个 AIV:
+
+```
+   AIC 0 ─┬─ AIV 0  ┐
+          └─ AIV 1  ┴── 这一组协作完成一个基本块的全部计算
+
+   AIC 1 ─┬─ AIV 2  ┐
+          └─ AIV 3  ┴── 另一组
+```
+
+AIC 算完 `Q @ K^T` 把 score tile 通过共享 UB 传给配对的 AIV, AIV 算 softmax 再传回。
+**这种协作完全由硬件流水线自动完成, metadata 不介入**。
+
+##### metadata 只显式分配两件事
+
+```
+   FA 段 (AIC): 哪个 AIC 算哪些基本块 (配对的 AIV 自动跟着干)
+   FD 段 (AIV): 跨核归约 — 当一行被多个 AIC 瓜分时, 各 AIC 算出部分 (O', m, l)
+                写到 workspace, 这时需要"别的" AIV 来 rescale 合并 (详见 §2.2)
+```
+
+FD 段才是"额外的" AIV 任务, 因为它要合并跨核结果。
+基本块**内部**的 cube-vector 协作是硬件流水线, 不需要 metadata 分配。
+
+##### cost 公式也覆盖了完整 attention
+
+cost 公式 `6 × ⌈M/16⌉ + 10 × ⌈S2/64⌉` 中, 6 和 10 是 profile 实测拟合的,
+**已经包含 cube 算 Q@K^T + vector 算 softmax + cube 算 prob@V 的总耗时**, 不只是 Q@K^T 这一项。
+
+而且两次矩阵乘的计算量近似相等:
+- `Q @ K^T`: 计算量 ≈ M × S2 × D
+- `prob @ V`: 计算量 ≈ M × S2 × D
+
+所以用 M 和 S2 这两个维度就能涵盖整个基本块的成本估算。
+
 ### 2.2 切完之后怎么合并？—— online softmax
 
 > 这一节解释一个非常容易被忽略的细节：**S2 方向切了 512 后，几个块的结果不是简单地逐元素加**。
