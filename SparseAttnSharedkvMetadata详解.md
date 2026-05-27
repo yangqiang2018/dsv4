@@ -1213,6 +1213,58 @@ padding 出来的 0 不该参与计算 (会污染 softmax 概率)。本算子需
 
 `RecordFDInfo` 会记录所有这种「跨核行」，存进 `fdRes` 结构。
 
+#### 串联视角: AssignByBlock 是 FlashDecode 的"源头"
+
+把整条 FD 链路从头到尾串起来:
+
+```
+   ┌─ metadata 算子 (调度阶段) ───────────────────────────────────┐
+   │                                                             │
+   │  ① AssignByBlock:                                           │
+   │     "同一个 s1G 行 (1 个 Q 位置 × 64 头) 的 S2 块切给多核"     │
+   │                       ↓                                     │
+   │  ② curKvSplitPart > 1 (该行被切了几份 KV)                    │
+   │                       ↓                                     │
+   │  ③ RecordFDInfo: 把这个"跨核行"记下来                         │
+   │                       ↓                                     │
+   │  ④ SplitFD: 给 AIV 分配归约任务 (写进 fdMetadata)             │
+   └─────────────────────────────────────────────────────────────┘
+                              │ metadata 流向下游
+                              ▼
+   ┌─ 下游 sparse_attn_sharedkv (执行阶段) ───────────────────────┐
+   │                                                             │
+   │  ⑤ AIC (cube) 按 faMetadata 算自己那段:                      │
+   │     跨核行的 AIC 只算部分 (O', m, l), 写 workspace           │
+   │     (Bmm2FDDataCopyOut)                                     │
+   │                       ↓                                     │
+   │  ⑥ AIV (vector) 按 fdMetadata 做跨核归约:                    │
+   │     online softmax rescale (见 §2.2 推导)                   │
+   │     把多个核的 (O', m, l) 合并成最终 O                        │
+   │                                                             │
+   │   ⑤+⑥ 这一整套就是 **FlashDecode 路径**                      │
+   └─────────────────────────────────────────────────────────────┘
+```
+
+四个概念的关系:
+
+| 概念 | 角色 |
+|------|------|
+| **AssignByBlock** | metadata 的**调度策略**之一 (按 S2 块切核) |
+| **跨核行** | AssignByBlock 切完后的**结果状态** ("一行被多核共享") |
+| **SplitFD** | metadata 给 AIV 分配**归约任务**的步骤 |
+| **FlashDecode** | 下游算子里 KV 切核 + 跨核归约的**执行路径** |
+
+也就是说 metadata 阶段的 `AssignByBlock + SplitFD` ≈ **FlashDecode 的"准备工作"**;
+真正的执行在下游算子里 (Bmm2FDDataCopyOut + AIV 归约)。
+
+**为什么这个机制叫 "FlashDecode"** —— 它主要为 LLM **decode 阶段** (每次只生成 1 个新 token)
+设计: 那时 Q 短 (1 个 token)、batch 小、但 K cache 长, 光靠 batch/head/S1 维度并行远远填不满多核。
+**把单条 K 序列切给多核并行算 + online softmax 跨核归约 → 把 decode 提速**, 所以叫 "Flash Decode"。
+
+**本算子 (DSV4 推理 prefill 场景) 不需要 FlashDecode**: S1G × batch × head 维度合起来够分核了,
+所以 metadata 用 `supportFd=false` 关闭这条路径 (详见 §5.4)。
+下游算子仍保留 FlashDecode 实现, 备未来需要 (TND layout / 长上下文 decode 等场景) 时启用。
+
 ### 4.4 Step 4: FD 阶段调度
 
 > 前置概念：FD 做的「归约」**不是逐元素加**，而是 Flash Attention 的
