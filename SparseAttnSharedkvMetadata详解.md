@@ -1551,8 +1551,28 @@ FD 段同理。这一步纯粹是格式转换，没有算法逻辑。
 
    s1GCost          = winS1GCost + cmpS1GCost = 44 + 34 = 78   ← 这一行的总成本
    s1GBlock         = 1 + 1 = 2                                  ← 这一行的总块数 (1 Win + 1 Cmp)
-   s1GLastBlockCost = cmpS1GLastBlockCost = CmpCost(64, 11) = 34 ← 最后一块的成本 (调度容差用)
+   s1GLastBlockCost = cmpS1GLastBlockCost = CmpCost(64, 11) = 34 ← 最后一块的成本 (跟上面 CmpCost 同公式)
+                                                                  注: 本例只有 1 个 Cmp 块, 所以"最后一块" = "唯一那一块",
+                                                                  数值刚好与 cmpS1GCost 相同
 ```
+
+> **`s1GLastBlockCost` 是给调度用的容差量** (不是新的成本概念):
+>
+> 调度时不会严格卡 `costLimit`, 会**允许超出量不超过"最后一块成本的一半"**, 防止
+> "差一点点就装下了, 结果硬塞给下一个核"。所以每行都要单独记录"最后一块成本"
+> 给后面 `IsWithinTolerance` 用:
+>
+> ```cpp
+> IsWithinTolerance(coreCache.costLimit,
+>                   s1GLastBlockCost / FA_TOLERANCE_RATIO,  ← 容差 = 最后块成本/2
+>                   coreCache.cost + 待分配负载)
+> ```
+>
+> "最后一块"的判定: 因为 Cmp 块排在 Win 块后面 (统一编号, 见 ② 注解), 只要这一行有 Cmp 块,
+> 最后一块就是最后一个 Cmp 块; 没 Cmp 块就是最后一个 Win 块。
+>
+> 本例的"最后一块" = 唯一那个 Cmp 块, 所以 `s1GLastBlockCost = cmpS1GLastBlockCost = CmpCost(64,11) = 34`,
+> 巧合等于 cmpS1GCost。如果 Cmp 有多块, 它只算最后那一块 (通常是个尾块), 跟 cmpS1GCost 总和不同。
 
 > **关于 M=64 / S2=128 / S2=11 这几个数从哪来 (容易混淆!)**
 >
