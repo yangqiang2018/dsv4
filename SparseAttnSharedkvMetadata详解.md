@@ -1288,33 +1288,84 @@ FD 段同理。这一步纯粹是格式转换，没有算法逻辑。
 
 #### 行 0 (样本 0 的第一行) 完整展开
 
-`CalcS1GCache(s1GIdx=0, batch=0)`:
+`CalcS1GCache(s1GIdx=0, batch=0)` 分 3 步:
+
+**① `CalcS2TokenRange` — 算出这一行 Q 能看 K 的 token 范围**
+
+回顾 §1.2 的 BAND mask 几何 (right-down 对齐 + sliding window):
 
 ```
-   ① CalcS2TokenRange (这一行 Q 能看 K 的 token 范围, BAND 模式):
-      s1FirstToken = s1LastToken = 0
-      preTokenLeftUp  = S1 - S2 + winLeft = 4 - 1500 + 127 = -1369
-      nextTokenLeftUp = S2 - S1 + winRight = 1500 - 4 + 0 = 1496
-      s2FirstToken = 0 - (-1369) = 1369
-      s2LastToken  = 0 + 1496   = 1496
-      clip 到 [0, 1499]: [1369, 1496]   ← 128 个 K token
+   K 长度 = S2 = 1500:
+   ┌──────────────────────────────────────────────┐
+   │ K[0]                                  K[1499] │
+   └──────────────────────────────────────────────┘
 
-   ② CalcBlockRangeAndTailSize:
-      Win 部分: winS2Start = 0, winS2End = (1496-1369)/512 + 1 = 1
-               winS2TailSize = (1496-1369+1) % 512 = 128
-               → 1 个 win 块 (尾块, S2=128)
-      Cmp 部分: cmpS2LastTokenSize = (1496+1) / 128 = 11
-               actCmpS2LastTokenSize = min(11, 512) = 11    ← SCFA
-               cmpS2Start = 1, cmpS2End = 1 + (11-1)/512 + 1 = 2
-               cmpS2TailSize = 11 % 512 = 11
-               → 1 个 cmp 块 (尾块, S2=11)
+   Q 长度 = S1 = 4, 右下对齐 (最后 1 个 Q 对齐到最后 1 个 K):
+                                         ┌───┬───┬───┬───┐
+                                         │Q0 │Q1 │Q2 │Q3 │
+                                         └───┴───┴───┴───┘
+   每个 Q 在 K 上的"对齐点":           1496 1497 1498 1499
 
-   ③ CalcCostTable + Calc{Win,Cmp}S1GCache:
-      winS1GCost = WinCost(M=64, S2=128) = 6·ceil(64/16) + 10·ceil(128/64) = 24 + 20 = 44
-      cmpS1GCost = CmpCost(M=64, S2=11)  = 6·ceil(64/16) + 10·ceil(11/64)  = 24 + 10 = 34
-      s1GCost      = 44 + 34 = 78           ← 这一行的总成本
-      s1GBlock     = 1 + 1 = 2               ← 这一行的总块数
-      s1GLastBlockCost = cmpS1GLastBlockCost = CmpCost(64, 11) = 34
+   每个 Q[i] 沿 BAND mask 往左看 winLeft=127 个 (窗口宽 128):
+   Q[0] 看 K[1369, 1496]   ← 行 0 要算的范围 (s1GIdx=0 对应 Q[0])
+   Q[1] 看 K[1370, 1497]
+   ...
+```
+
+代码每个变量的几何意义:
+
+```
+   s1FirstToken = s1LastToken = 0
+   ↑ s1G 行 0 含 64 个 S1G 索引 [0..63], 都来自同 1 个 Q token 位置 (= 0)
+     所以这一行只涉及 1 个 Q 位置: first = last = 0
+
+   preTokenLeftUp  = S1 - S2 + winLeft  = 4 - 1500 + 127 = -1369
+   ↑ "左边界相对 Q 位置 i 的偏移": 左边界 = K[i - preTokenLeftUp] = K[i + 1369]
+     负值是因为 K 比 Q 长很多, 窗口左边界跑到 K 中间靠右 (不在 K[0])
+
+   nextTokenLeftUp = S2 - S1 + winRight = 1500 - 4 + 0   = 1496
+   ↑ "右边界相对 Q 位置 i 的偏移": 右边界 = K[i + nextTokenLeftUp] = K[i + 1496]
+     就是 Q[i] 在 K 上的"右下对齐点"
+
+   s2FirstToken = s1FirstToken - preTokenLeftUp = 0 - (-1369) = 1369   ← 左边界
+   s2LastToken  = s1LastToken  + nextTokenLeftUp = 0 + 1496   = 1496   ← 右边界
+
+   clip 到 [0, S2-1] = [0, 1499]: [1369, 1496] 已在范围内, 不变
+                                              ────────────
+                                              128 个 K token (= 窗口宽度)
+```
+
+**② `CalcBlockRangeAndTailSize` — 把 K 范围按 512 切成基本块**
+
+(Win 和 Cmp 独立按 S2 方向每 512 一刀切, 详见 §1.2 变化源 ③)
+
+```
+   Win 部分 (基于刚算的 K 范围 [1369, 1496], 共 128 个 token):
+     winS2Start    = 0      (基本块在这一行内的相对索引, 从 0 起)
+     winS2End      = (1496 - 1369) / 512 + 1 = 1
+     winS2TailSize = (1496 - 1369 + 1) % 512 = 128
+     → 1 个 win 块 (尾块, S2=128, 因为 128 < 512)
+
+   Cmp 部分 (Cmp 长度 ≈ K 末尾位置 / cmpRatio, 详见 §1.2 变化源 ②):
+     cmpS2LastTokenSize    = (1496 + 1) / 128 = 11    (历史压缩成 11 个 token)
+     actCmpS2LastTokenSize = min(11, cmpTopK=512) = 11    (SCFA 取小)
+     cmpS2Start    = winS2End = 1
+     cmpS2End      = 1 + (11 - 1) / 512 + 1 = 2
+     cmpS2TailSize = 11 % 512 = 11
+     → 1 个 cmp 块 (尾块, S2=11)
+```
+
+**③ `CalcCostTable` + `CalcWinS1GCache` / `CalcCmpS1GCache` — 算这一行的总成本**
+
+(成本公式 `cost = 6·⌈M/16⌉ + 10·⌈S2/64⌉` 详见 §4.2)
+
+```
+   winS1GCost = WinCost(M=64, S2=128) = 6·⌈64/16⌉ + 10·⌈128/64⌉ = 6·4 + 10·2 = 44
+   cmpS1GCost = CmpCost(M=64, S2=11)  = 6·⌈64/16⌉ + 10·⌈11/64⌉  = 6·4 + 10·1 = 34
+
+   s1GCost          = winS1GCost + cmpS1GCost = 44 + 34 = 78   ← 这一行的总成本
+   s1GBlock         = 1 + 1 = 2                                  ← 这一行的总块数 (1 Win + 1 Cmp)
+   s1GLastBlockCost = cmpS1GLastBlockCost = CmpCost(64, 11) = 34 ← 最后一块的成本 (调度容差用)
 ```
 
 #### 其他行同理（同 mask 模式下成本几乎一样）
