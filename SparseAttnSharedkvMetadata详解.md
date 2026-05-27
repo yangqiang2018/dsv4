@@ -1491,11 +1491,55 @@ FD 段同理。这一步纯粹是格式转换，没有算法逻辑。
    Cmp 部分 (Cmp 长度 ≈ K 末尾位置 / cmpRatio, 详见 §1.2 变化源 ②):
      cmpS2LastTokenSize    = (1496 + 1) / 128 = 11    (历史压缩成 11 个 token)
      actCmpS2LastTokenSize = min(11, cmpTopK=512) = 11    (SCFA 取小)
-     cmpS2Start    = winS2End = 1
+     cmpS2Start    = winS2End = 1                       (← 见下方"为什么 cmpS2Start = winS2End")
      cmpS2End      = 1 + (11 - 1) / 512 + 1 = 2
      cmpS2TailSize = 11 % 512 = 11
      → 1 个 cmp 块 (尾块, S2=11)
 ```
+
+> **为什么 `cmpS2Start = winS2End` ?** —— Win 块和 Cmp 块在一个 s1G 行内是**统一编号**的,
+> Cmp 块紧接 Win 块往后排, 不重新从 0 开始:
+>
+> ```
+>    一个 s1G 行的全部基本块布局 (本例行 0):
+>
+>    相对索引:    0          1          (2)
+>               ┌────────┬────────┐
+>               │  Win 0 │  Cmp 0 │
+>               └────────┴────────┘
+>               ↑        ↑        ↑
+>        winS2Start    cmpS2Start  cmpS2End
+>          = 0       = winS2End    = 2
+>                       = 1
+> ```
+>
+> 这样设计的好处: 调度时只用**一条连续的 s2 索引轴** `[0, s2End)` 推进, 不用
+> 给每个块标"Win 还是 Cmp"。代码靠 `cmpS2Start` 当**分界线**判断:
+>
+> ```cpp
+> if (curS2Idx < cmpS2Start) {
+>     // 索引 < 分界线 → 这是 Win 块, 用 winS1GNormalBlockCost
+> } else {
+>     // 索引 >= 分界线 → 这是 Cmp 块, 用 cmpS1GNormalBlockCost
+> }
+> ```
+>
+> 所以 `cmpS2Start = winS2End` 既保持"连续编号", 又自然形成 Win/Cmp 的分界点。
+>
+> 复杂一点的情况 (Win 跨 2 颗粒 + Cmp 1 颗粒):
+>
+> ```
+>    相对索引:    0          1          2          (3)
+>               ┌────────┬────────┬────────┐
+>               │ Win 0  │ Win 1  │ Cmp 0  │
+>               └────────┴────────┴────────┘
+>               ↑                ↑        ↑
+>        winS2Start=0     cmpS2Start=2   cmpS2End=3
+>                          (= winS2End=2)
+> ```
+>
+> 不过本算子里 Win 范围最多 128 个 token < 512, 所以 **Win 几乎总是只占 1 个 S2 颗粒**,
+> `winS2End` 通常 = 1, `cmpS2Start` 通常也 = 1。
 
 **③ `CalcCostTable` + `CalcWinS1GCache` / `CalcCmpS1GCache` — 算这一行的总成本**
 
