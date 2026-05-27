@@ -1330,20 +1330,37 @@ FD 段同理。这一步纯粹是格式转换，没有算法逻辑。
      (64 个头的 mask 一样, 所以按 token 位置算就行)
 
    preTokenLeftUp  = S1 - S2 + winLeft  = 4 - 1500 + 127 = -1369
-   ↑ "左边界相对 Q 位置 i 的偏移": 左边界 = K[i - preTokenLeftUp] = K[i + 1369]
-     负值是因为 K 比 Q 长很多, 窗口左边界跑到 K 中间靠右 (不在 K[0])
+   ↑ "**左边界偏移**" (在 left-up 基准下换算后的值, 详见下方"关于 LeftUp 命名"):
+     对 Q 位置 i, 左边界 = K[i - preTokenLeftUp] = K[i + 1369]
+     负值是因为 K 比 Q 长很多, 让左边界跑到 K 中间靠右 (不在 K[0])
 
    nextTokenLeftUp = S2 - S1 + winRight = 1500 - 4 + 0   = 1496
-   ↑ "右边界相对 Q 位置 i 的偏移": 右边界 = K[i + nextTokenLeftUp] = K[i + 1496]
-     就是 Q[i] 在 K 上的"右下对齐点"
+   ↑ "**右边界偏移**" (同样在 left-up 基准下):
+     对 Q 位置 i, 右边界 = K[i + nextTokenLeftUp] = K[i + 1496]
+     这个偏移让所有 Q 整体平移, 最后一个 Q (i=3) 刚好对到 K[1499] (右下对齐)
 
-   s2FirstToken = s1FirstToken - preTokenLeftUp = 0 - (-1369) = 1369   ← 左边界
-   s2LastToken  = s1LastToken  + nextTokenLeftUp = 0 + 1496   = 1496   ← 右边界
+   s2FirstToken = s1FirstToken - preTokenLeftUp = 0 - (-1369) = 1369   ← 真正的左边界(绝对 K 位置)
+   s2LastToken  = s1LastToken  + nextTokenLeftUp = 0 + 1496   = 1496   ← 真正的右边界(绝对 K 位置)
 
    clip 到 [0, S2-1] = [0, 1499]: [1369, 1496] 已在范围内, 不变
                                               ────────────
                                               128 个 K token (= 窗口宽度)
 ```
+
+> **关于 `LeftUp` 命名**: 后缀里的 "LeftUp" 不是"左上角"或"左方向", 是指
+> **"left-up 对齐基准"** —— attention 最自然的默认对齐 (Q[0] 对应 K[0],
+> 对角线在左上角)。代码想让一套公式 `s2Token = s1Token ± LeftUp 偏移` 通用所有 mask,
+> 所以每种 mask 都先把偏移**换算到 left-up 基准**, 再统一套公式:
+>
+> | Mask 模式 | preTokenLeftUp | nextTokenLeftUp |
+> |-----------|----------------|------------------|
+> | LEFT_UP_CAUSAL | `preToken` | `nextToken` |
+> | RIGHT_DOWN_CAUSAL | `preToken` | `S2 - S1` |
+> | BAND | `S1 - S2 + winLeft` | `S2 - S1 + winRight` |
+>
+> 所以这两个变量**不是 K 上的绝对位置, 是偏移量**, 真正的边界要靠 `s2FirstToken /
+> s2LastToken = s1Token ± LeftUp 偏移` 才得到。命名上 "preTokenLeftUp" 容易让人
+> 误以为是"前面 token 的左上位置"什么的, 习惯就好。
 
 **② `CalcBlockRangeAndTailSize` — 把 K 范围按 512 切成基本块**
 
