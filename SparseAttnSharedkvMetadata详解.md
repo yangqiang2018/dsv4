@@ -1687,8 +1687,9 @@ FD 段同理。这一步纯粹是格式转换，没有算法逻辑。
 > 就**无视容差强制塞一块**, 避免核空转"。
 >
 > 本例核 0 经过 AssignByRow 已经分到 4 块 (block=4), 触发条件 `block==0` 不满足,
-> 直接跳过。况且本算子 `supportFd=false` (见 §5.4), **ForceAssign 在本算子里永远不会执行** —
-> 写在文档里只是为了严格还原算法逻辑链。
+> 直接跳过。况且本算子 `supportFd=false` (见 §5.4), `ForceAssign` **在 metadata
+> 算子内部永远不会执行** — 写在文档里只是为了严格还原算法逻辑链。
+> (注: 这只是 metadata 算子内部的事, 不代表下游 FD 路径不存在; 详见 §5.4 注解。)
 
 #### 核 1
 
@@ -1726,9 +1727,22 @@ FD 段同理。这一步纯粹是格式转换，没有算法逻辑。
 
 ### 5.4 Step 4 — `SplitFD` FD 阶段调度
 
-本算子 `supportFd = false` (代码里 `bool supportFd = false;` 是初始值, 未被修改),
+本算子 `supportFd = false` (代码里 `bool supportFd = false;` 是初始值, 全代码无任何赋值修改),
 所以 **`AssignByBlock` / `ForceAssign` 都不会执行, 三个核之间没有"跨核行"**,
-`numOfFdHead = 0`, `SplitFD` 直接返回, FD 段全部 disabled。
+`numOfFdHead = 0`, `SplitFD` 直接返回, **metadata 不产生任何 FD 任务**, FD 段全部 disabled。
+
+> **注意区分两件事**:
+>
+> - **metadata 算子**: `supportFd=false`, 不产生 FD 任务 — 这是事实, 永远成立
+> - **下游 `sparse_attn_sharedkv` 算子**: **实际有完整的 FD 实现** (`FLASH_DECODE`
+>   模板参数 + `Bmm2FDDataCopyOut` 函数 + `tndIsS2SplitCore` 运行时分支)
+>
+> 但因为 metadata 不产生 FD 任务, 下游的 FD 路径**运行时不会被触发** (被 `if constexpr
+> (FLASH_DECODE)` 或 `if (tndIsS2SplitCore)` 守护掉)。两边配套 — metadata 不产生
+> → 下游 FD 不激活, 形成 "**FD 实现存在但当前 deactivated**" 的状态, 不是"下游也没 FD"。
+>
+> 下游保留 FD 实现的可能原因: 为未来 metadata 升级 (开启 supportFd) 预留, 或者为
+> TND 等其他 layout 路径准备。
 
 ### 5.5 Step 5 — `GenMetaData` 写出
 
