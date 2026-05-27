@@ -1830,6 +1830,18 @@ FD 段同理。这一步纯粹是格式转换，没有算法逻辑。
 
 (`aicCoreNum > usedCoreNum` 时其余核 CORE_ENABLE=0; 这里 aicCoreNum=usedCoreNum=3, 都启用)
 
+> **关于 S2_START / S2_END 列全是 0**: 这不是漏算或 bug, 是 `supportFd=false` 的**预期结果**。
+>
+> 这两个字段是为 FlashDecode (跨核行) 场景准备的: 当一行被多核瓜分时, 某个核会"干到这一行的
+> 第 X 块停"(`S2_END = X`), 下一个核"从第 X 块继续"(`S2_START = X`)。
+>
+> 而本算子 `supportFd=false`, `AssignByBlock` 不执行, **`curS2Idx` 永远停在某一行的起点 (=0)**:
+> - 任何核的 END 都是"完整干完某行" → `S2_END = 0`
+> - 下一核 START 接续 → `S2_START = 0`
+>
+> 字段本身在 GenMetaData 里被无条件写, 只是非 FD 场景下值是 0, 下游读到 0 等价于
+> "干完整行, 不切到行的中间"。这一列全 0 是 supportFd=false 下的稳态。
+
 AIV 段所有 48 个核 (实际 6 个) 都是 `CORE_ENABLE=0`, 因为没有 FD 任务。
 
 ### 5.6 下游的执行解读
