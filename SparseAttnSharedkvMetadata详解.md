@@ -1257,52 +1257,188 @@ FD 段同理。这一步纯粹是格式转换，没有算法逻辑。
 
 ## 5. 完整示例：把所有概念串起来
 
-> **注**: 这一节用一个**独立的、更小的例子** (B=2, 不是 §3.1 / §4.1 用的 B=4),
-> 目的是让端到端的三级分配过程便于跟踪。数字不需要跟前面对应。
+> **注**: 这一节用一个**独立的、更小的例子** (B=2, AIC=3) 严格走一遍 5 个 step 的真实计算,
+> 数字按代码里的公式一步步算出来, 不做简化。不跟 §3.1 / §4.1 对应。
 
-假设：
-- B = 2（一批 2 个样本）
-- N1 = 64, N2 = 1（所以 G = 64）
-- 样本 0: S1 = 100, S2 = 1000
-- 样本 1: S1 = 50,  S2 = 600
-
-**Step 1 切块**：
+### 5.0 Setup
 
 ```
-   样本 0:  S1G = 100×64 = 6400
-             M  方向 = 6400 / 64 = 100 块
-             S2 方向 = ceil(1000 / 512) = 2 块  (tail = 488)
+   B = 2, N1 = 64, N2 = 1, G = N1/N2 = 64, D = 512
+   aicCoreNum = 3, aivCoreNum = 6   ← 假设, 算子默认是 24/48
+   mBaseSize = 64, s2BaseSize = 512
+   mask 模式: BAND, winLeft = 127, winRight = 0
+   cmpRatio = 128, cmpTopK = 512   (SCFA 场景)
 
-   样本 1:  S1G = 50×64 = 3200
-             M  方向 = 50 块
-             S2 方向 = ceil(600 / 512) = 2 块   (tail = 88)
+   样本 0:  S1 = 4, S2 = 1500
+   样本 1:  S1 = 2, S2 = 500
 ```
 
-**Step 2 估开销**（简化，假设每行约 5 个 Win 块 + 1 个 Cmp 块 = 6 块）：
+### 5.1 Step 1 — `CalcSplitInfo` 切基本块数
+
+直接套 §4.1 的公式 `ceil(S1×G / 64)` 和 `ceil(S2 / 512)`:
+
+| 样本 | S1 | S2 | s1GBaseNum<br>(M 方向块数) | s2BaseNum<br>(S2 方向块数) | s1GTailSize | s2TailSize |
+|------|----|----|---------------------------|---------------------------|-------------|------------|
+| 0 | 4 | 1500 | ceil(4×64/64) = **4** | ceil(1500/512) = **3** | 0 | 476 |
+| 1 | 2 | 500  | ceil(2×64/64) = **2** | ceil(500/512)  = **1** | 0 | 500 |
+
+`s1GTailSize` 都是 0, 因为 `S1×64` 永远是 64 的整倍。
+
+### 5.2 Step 2 — `CalcCostInfo` 算每行成本
+
+#### 行 0 (样本 0 的第一行) 完整展开
+
+`CalcS1GCache(s1GIdx=0, batch=0)`:
 
 ```
-   样本 0:  100 行 × 6 块/行 ≈ 600 个块 ≈ 4800 单位开销
-   样本 1:   50 行 × 6 块/行 ≈ 300 个块 ≈ 2400 单位开销
+   ① CalcS2TokenRange (这一行 Q 能看 K 的 token 范围, BAND 模式):
+      s1FirstToken = s1LastToken = 0
+      preTokenLeftUp  = S1 - S2 + winLeft = 4 - 1500 + 127 = -1369
+      nextTokenLeftUp = S2 - S1 + winRight = 1500 - 4 + 0 = 1496
+      s2FirstToken = 0 - (-1369) = 1369
+      s2LastToken  = 0 + 1496   = 1496
+      clip 到 [0, 1499]: [1369, 1496]   ← 128 个 K token
 
-   totalCost ≈ 7200
-   每核理想开销 ≈ 7200 / 24 ≈ 300
+   ② CalcBlockRangeAndTailSize:
+      Win 部分: winS2Start = 0, winS2End = (1496-1369)/512 + 1 = 1
+               winS2TailSize = (1496-1369+1) % 512 = 128
+               → 1 个 win 块 (尾块, S2=128)
+      Cmp 部分: cmpS2LastTokenSize = (1496+1) / 128 = 11
+               actCmpS2LastTokenSize = min(11, 512) = 11    ← SCFA
+               cmpS2Start = 1, cmpS2End = 1 + (11-1)/512 + 1 = 2
+               cmpS2TailSize = 11 % 512 = 11
+               → 1 个 cmp 块 (尾块, S2=11)
+
+   ③ CalcCostTable + Calc{Win,Cmp}S1GCache:
+      winS1GCost = WinCost(M=64, S2=128) = 6·ceil(64/16) + 10·ceil(128/64) = 24 + 20 = 44
+      cmpS1GCost = CmpCost(M=64, S2=11)  = 6·ceil(64/16) + 10·ceil(11/64)  = 24 + 10 = 34
+      s1GCost      = 44 + 34 = 78           ← 这一行的总成本
+      s1GBlock     = 1 + 1 = 2               ← 这一行的总块数
+      s1GLastBlockCost = cmpS1GLastBlockCost = CmpCost(64, 11) = 34
 ```
 
-**Step 3 分配**（示意，不严格还原算法）：
+#### 其他行同理（同 mask 模式下成本几乎一样）
+
+| 行 | 范围 | Win 块 | Cmp 块 | s1GCost | s1GBlock |
+|----|------|--------|--------|---------|----------|
+| 样本 0 行 0 | [1369, 1496] | 1 (tail 128) | 1 (tail 11) | 78 | 2 |
+| 样本 0 行 1 | [1370, 1497] | 1 (tail 128) | 1 (tail 11) | 78 | 2 |
+| 样本 0 行 2 | [1371, 1498] | 1 (tail 128) | 1 (tail 11) | 78 | 2 |
+| 样本 0 行 3 | [1372, 1499] | 1 (tail 128) | 1 (tail 11) | 78 | 2 |
+| 样本 1 行 0 | [371, 498]   | 1 (tail 128) | 1 (tail 3)  | 78 | 2 |
+| 样本 1 行 1 | [372, 499]   | 1 (tail 128) | 1 (tail 3)  | 78 | 2 |
+
+(Cmp 尾块大小不同, 但 `ceil(3/64) = ceil(11/64) = 1`, 成本恰好相同)
+
+汇总:
 
 ```
-   核 0:  样本 0 的行 0-1   (≈ 12 块, 300 单位)  ← 第二级 AssignByRow
-   核 1:  样本 0 的行 2-3
-   核 2:  样本 0 的行 4-5
-   ...
-   核 16: 样本 0 的行 32-33
-   核 17: 样本 1 的行 0-5    ← 切到 样本 1
-   ...
+   bN2CostOfEachBatch[0] = 4 × 78 = 312     bN2BlockOfEachBatch[0] = 8
+   bN2CostOfEachBatch[1] = 2 × 78 = 156     bN2BlockOfEachBatch[1] = 4
+
+   totalCost      = 312 + 156 = 468
+   totalBlockNum  = 8 + 4 = 12
+   maxS1GCost     = 78
+   bN2LastBlockCostOfEachBatch = [34, 34]    ← 每 batch 最后一行最后一块的 cost
 ```
 
-**Step 4 FD**：如果某行被两核共享，记录归约任务。
+### 5.3 Step 3 — `CalcSplitPlan` 三级分配
 
-**Step 5 写出**：metadata 表里 24 个 AIC 核各自有起止位置。
+`avgCost = 468 / 3 = 156`, `supportFd=false` 所以 `costLimit = max(avgCost, maxS1GCost) = 156`,
+容差 `tol = bN2LastBlockCost / 2 = 34 / 2 = 17` (`IsWithinTolerance` 用)。
+
+#### 核 0
+
+```
+   入口: curBIdx=0, curS1GIdx=0, bN2Cost=312
+   AssignByBatch:
+     IsWithinTolerance(156, 17, 0 + 312)?  → 156+17=173 ≥ 312? 否
+     → 整 batch 装不下, 不动
+
+   AssignByRow:
+     行 0 (cost=78): IsWithinTolerance(156, 17, 0+78)?  173 ≥ 78? ✓
+                    → 累加: cost=78, block=2, 推进 curS1GIdx=1
+     行 1 (cost=78): IsWithinTolerance(156, 17, 78+78)? 173 ≥ 156? ✓
+                    → 累加: cost=156, block=4, 推进 curS1GIdx=2
+     行 2 (cost=78): IsWithinTolerance(156, 17, 156+78)? 173 ≥ 234? 否
+                    → 停止
+
+   AssignByBlock: supportFd=false, 跳过
+   ForceAssign:    block>0, 跳过
+
+   核 0 结果: (BN2_END, M_END, S2_END) = (0, 2, 0)
+             核 0 干 [samples 0 的 行 0, 行 1], 成本 156
+```
+
+#### 核 1
+
+```
+   入口: curBIdx=0, curS1GIdx=2, bN2Cost=312-156=156
+   unassignedCost=468-156=312, avgCost=312/2=156, costLimit=156
+
+   AssignByRow (继续从行 2 算):
+     行 2 (cost=78): IsWithinTolerance(156, 17, 0+78)?  173 ≥ 78? ✓ → cost=78, 推进到行 3
+     行 3 (cost=78): IsWithinTolerance(156, 17, 78+78)? 173 ≥ 156? ✓ → cost=156, 推进
+       推进时 curS1GIdx=4 = s1GBaseNum[0], 进入 UpdateCursor:
+         curS1GIdx=0, curBN2Idx=1, 切到 batch 1, bN2Cost=156, bN2Block=4
+     batch 1 行 0 (cost=78): IsWithinTolerance(156, 17, 156+78)? 173 ≥ 234? 否 → 停止
+
+   核 1 结果: (BN2_END, M_END, S2_END) = (1, 0, 0)
+             核 1 干 [samples 0 的 行 2, 行 3], 成本 156
+```
+
+#### 核 2
+
+```
+   入口: curBIdx=1, curS1GIdx=0, bN2Cost=156
+   unassignedCost=156, avgCost=156, costLimit=156
+
+   AssignByBatch:
+     IsWithinTolerance(156, 17, 0+156)? 173 ≥ 156? ✓
+     → 累加: cost=156, block=4, curBN2Idx=2 = batchSize×kvHeadNum
+     → 进入 to-the-end 分支, isFinished=true, return
+
+   核 2 结果: (BN2_END, M_END, S2_END) = (2, 0, 0)
+             核 2 干 [samples 1 的 行 0, 行 1], 成本 156
+```
+
+汇总: `usedCoreNum = 3`, `maxCost = 156`, 每核成本完全相等 (理想均衡)。
+
+### 5.4 Step 4 — `SplitFD` FD 阶段调度
+
+本算子 `supportFd = false` (代码里 `bool supportFd = false;` 是初始值, 未被修改),
+所以 **`AssignByBlock` / `ForceAssign` 都不会执行, 三个核之间没有"跨核行"**,
+`numOfFdHead = 0`, `SplitFD` 直接返回, FD 段全部 disabled。
+
+### 5.5 Step 5 — `GenMetaData` 写出
+
+`splitRes` 内容: `bN2End=[0,1,2]`, `gS1End=[2,0,0]`, `s2End=[0,0,0]`, `usedCoreNum=3`。
+
+按 §3.2 的字段格式 (核 i 的 START = 核 i-1 的 END):
+
+| 核 | CORE_ENABLE | BN2_START | M_START | S2_START | BN2_END | M_END | S2_END |
+|----|-------------|-----------|---------|----------|---------|-------|--------|
+| 0  | 1           | 0         | 0       | 0        | 0       | 2     | 0      |
+| 1  | 1           | 0         | 2       | 0        | 1       | 0     | 0      |
+| 2  | 1           | 1         | 0       | 0        | 2       | 0     | 0      |
+
+(`aicCoreNum > usedCoreNum` 时其余核 CORE_ENABLE=0; 这里 aicCoreNum=usedCoreNum=3, 都启用)
+
+AIV 段所有 48 个核 (实际 6 个) 都是 `CORE_ENABLE=0`, 因为没有 FD 任务。
+
+### 5.6 下游的执行解读
+
+下游 `SparseAttnSharedkv` 拿到这张表后, 每个 AIC 核读自己那行:
+
+```
+   核 0: 算 batch=0 的 s1G 行 [0, 2) 全部块  →  2 行 × 2 块 = 4 个基本块
+   核 1: 算 batch=0 的 s1G 行 [2, ∞) (即 [2, s1GBaseNum=4) ) + ... 直到 (BN2=1, M=0, S2=0)
+        实际就是 batch=0 行 2,3 全部, 共 4 个基本块
+   核 2: 算 batch=1 的 s1G 行 [0, ∞) 直到 (BN2=2, M=0, S2=0)
+        实际就是 batch=1 行 0,1 全部, 共 4 个基本块
+```
+
+12 个基本块均匀分给 3 个核, 每核 4 块, 完美均衡。
 
 ---
 
