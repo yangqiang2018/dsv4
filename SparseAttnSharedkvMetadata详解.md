@@ -1358,7 +1358,33 @@ FD 段同理。这一步纯粹是格式转换，没有算法逻辑。
 >    Q: [q0 q1 q2 q3]
 >        ↑  ↑  ↑  ↑
 >        q0对k0, q1对k1, ...    ← Q[i] 直接对 K[i]
->    q[i] 看 K[i - preToken, i + nextToken]
+>    q[i] 看 K[i - preToken, i + nextToken]   ← 见下方"区间表示法"
+> ```
+>
+> **关于 `K[a, b]` 这种表示法**: 不是"两个独立的 K", 是"K 从第 a 个到第 b 个的一整段"
+> (类比 Excel 的 `A1:A5`)。例如 `K[3, 7]` = k3,k4,k5,k6,k7 共 5 个 token。
+> 所以 `q[i] 看 K[i-preToken, i+nextToken]` 是说: **Q 的第 i 个 token 看 K 从第
+> (i-preToken) 个到第 (i+nextToken) 个这一段连续的 K**, 总共看 `preToken + 1 + nextToken`
+> 个 K (开头/末尾会被 clip 到合法范围)。
+>
+> 具体代入: 假设 `preToken=2, nextToken=1, S2=6`:
+> ```
+>    q[0] 看 K[-2, 1] → clip → K[0, 1]    (k0,k1)
+>    q[1] 看 K[-1, 2] → clip → K[0, 2]    (k0,k1,k2)
+>    q[2] 看 K[0, 3]                       (k0,k1,k2,k3)
+>    q[3] 看 K[1, 4]                       (k1,k2,k3,k4)
+>    q[4] 看 K[2, 5]                       (k2,k3,k4,k5)
+>    q[5] 看 K[3, 6] → clip → K[3, 5]      (k3,k4,k5)
+> ```
+> 画在 Q×K 矩阵上就是一条**斜带**, "BAND" 的名字就这么来的:
+> ```
+>           K 索引 → 0  1  2  3  4  5
+>    q[0]         [ ▓  ▓  ·  ·  ·  · ]
+>    q[1]         [ ▓  ▓  ▓  ·  ·  · ]
+>    q[2]         [ ▓  ▓  ▓  ▓  ·  · ]
+>    q[3]         [ ·  ▓  ▓  ▓  ▓  · ]
+>    q[4]         [ ·  ·  ▓  ▓  ▓  ▓ ]
+>    q[5]         [ ·  ·  ·  ▓  ▓  ▓ ]
 > ```
 >
 > **(b) RIGHT_DOWN_CAUSAL: Q[末尾] 对 K[末尾]** (chunked prefill, K 比 Q 长)
