@@ -1631,8 +1631,18 @@ FD 段同理。这一步纯粹是格式转换，没有算法逻辑。
 
 ### 5.3 Step 3 — `CalcSplitPlan` 三级分配
 
-`avgCost = 468 / 3 = 156`, `supportFd=false` 所以 `costLimit = max(avgCost, maxS1GCost) = 156`,
-容差 `tol = bN2LastBlockCost / 2 = 34 / 2 = 17` (`IsWithinTolerance` 用)。
+`avgCost = 468 / 3 = 156`, `supportFd=false` 所以 `costLimit = max(avgCost, maxS1GCost) = 156`。
+
+容差**不是全局常量**, 是按"当前正在处理哪个样本"动态取的:
+
+```
+   容差 = bN2LastBlockCostOfEachBatch[curBIdx] / FA_TOLERANCE_RATIO
+        = (当前样本的最后块 cost) / 2
+```
+
+本例巧合 `bN2LastBlockCostOfEachBatch = [34, 34]` (两样本数值相同), 所以容差永远 = `34/2 = 17`,
+下面为了简洁直接写 `tol=17`。如果样本结构不同 (比如样本 1 最后块 cost=80), 调度到样本 1 时
+容差会变成 `80/2 = 40`, 跟样本 0 时不一样。
 
 #### 核 0
 
