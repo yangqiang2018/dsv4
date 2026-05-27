@@ -1347,20 +1347,55 @@ FD 段同理。这一步纯粹是格式转换，没有算法逻辑。
                                               128 个 K token (= 窗口宽度)
 ```
 
-> **关于 `LeftUp` 命名**: 后缀里的 "LeftUp" 不是"左上角"或"左方向", 是指
-> **"left-up 对齐基准"** —— attention 最自然的默认对齐 (Q[0] 对应 K[0],
-> 对角线在左上角)。代码想让一套公式 `s2Token = s1Token ± LeftUp 偏移` 通用所有 mask,
-> 所以每种 mask 都先把偏移**换算到 left-up 基准**, 再统一套公式:
+> **关于 `LeftUp` 命名 — 从"对齐方式"讲起**
 >
-> | Mask 模式 | preTokenLeftUp | nextTokenLeftUp |
-> |-----------|----------------|------------------|
-> | LEFT_UP_CAUSAL | `preToken` | `nextToken` |
-> | RIGHT_DOWN_CAUSAL | `preToken` | `S2 - S1` |
-> | BAND | `S1 - S2 + winLeft` | `S2 - S1 + winRight` |
+> Q 有 S1 个 token, K 有 S2 个, 它们怎么"对应" 决定了 Q[i] 该看 K 的哪一段。
+> 两种典型对齐方式:
 >
-> 所以这两个变量**不是 K 上的绝对位置, 是偏移量**, 真正的边界要靠 `s2FirstToken /
-> s2LastToken = s1Token ± LeftUp 偏移` 才得到。命名上 "preTokenLeftUp" 容易让人
-> 误以为是"前面 token 的左上位置"什么的, 习惯就好。
+> **(a) LEFT_UP_CAUSAL: Q[0] 对 K[0]** (S1=S2 时最自然)
+> ```
+>    K: [k0 k1 k2 k3]
+>    Q: [q0 q1 q2 q3]
+>        ↑  ↑  ↑  ↑
+>        q0对k0, q1对k1, ...    ← Q[i] 直接对 K[i]
+>    q[i] 看 K[i - preToken, i + nextToken]
+> ```
+>
+> **(b) RIGHT_DOWN_CAUSAL: Q[末尾] 对 K[末尾]** (chunked prefill, K 比 Q 长)
+> ```
+>    K: [k0 k1 k2 k3 k4 k5 k6 k7 k8 k9]
+>    Q:                   [q0 q1 q2 q3]
+>                          ↑  ↑  ↑  ↑
+>                          q0对k6, ... (整体右移 S2-S1 = 6)
+>    q[i] 看 K[i + (S2-S1) - preToken, i + (S2-S1) + nextToken]
+> ```
+>
+> `preToken` / `nextToken` 是用户传的窗口参数: "**Q 往过去/未来各看多少个 K**"。
+> 本算子里 = (winLeft=127, winRight=0)。
+>
+> **为什么 LEFT_UP_CAUSAL 叫"基准"?** —— 因为在 left-up 对齐下, Q[i] 直接对 K[i],
+> 公式最简洁 `s2 = i ± 那两个参数`, 不用任何修正。代码想用**一套通用公式**:
+>
+> ```
+>    s2FirstToken = s1FirstToken - preTokenLeftUp
+>    s2LastToken  = s1LastToken  + nextTokenLeftUp
+> ```
+>
+> 这套公式长得像 LEFT_UP_CAUSAL 的。所以其他 mask 要先把自己的偏移**折算成
+> "如果在 left-up 对齐下该是多少"**, 折算结果就叫 `preTokenLeftUp / nextTokenLeftUp`,
+> 让下游公式不变:
+>
+> | Mask 模式 | preTokenLeftUp | nextTokenLeftUp | 折算思路 |
+> |-----------|----------------|------------------|---------|
+> | LEFT_UP_CAUSAL    | `preToken` | `nextToken` | 本来就是, 不折算 |
+> | RIGHT_DOWN_CAUSAL | `preToken` | `S2 - S1` | 右边界改成对齐 K 末尾 |
+> | BAND              | `S1 - S2 + winLeft` | `S2 - S1 + winRight` | right-down 对齐 + 窗口限制 |
+>
+> 所以后缀 "**LeftUp**" 在说: **这个值已经折算到 left-up 视角了, 可以直接套通用公式**。
+> 不是"左上角"也不是"左方向", 是"left-up 对齐基准"的缩写。
+>
+> 这两个变量始终**是偏移量, 不是 K 上的绝对位置**。真正的边界要靠 `s1Token ± LeftUp`
+> 算出 `s2FirstToken / s2LastToken` 才得到。
 
 **② `CalcBlockRangeAndTailSize` — 把 K 范围按 512 切成基本块**
 
