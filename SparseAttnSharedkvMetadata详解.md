@@ -1646,11 +1646,26 @@ FD 段同理。这一步纯粹是格式转换，没有算法逻辑。
 
 #### 核 0
 
+> **先解释一下 `IsWithinTolerance(limit, tol, value)` 这个判断**:
+> 它做的事就是 `limit + tol ≥ value?` ("能装下吗?")
+> - `limit` = 这个核的成本上限 (本例 156)
+> - `tol`   = 容差 (本例 17, 允许超出)
+> - `value` = "如果把待加的负载加进来, 这个核的总成本会变多少" =
+>             `已分配 cost + 想加的 cost`
+> 
+> 返回 true 表示"还能再加", false 表示"装不下了"。
+
 ```
-   入口: curBIdx=0, curS1GIdx=0, bN2Cost=312
-   AssignByBatch:
-     IsWithinTolerance(156, 17, 0 + 312)?  → 156+17=173 ≥ 312? 否
-     → 整 batch 装不下, 不动
+   入口: curBIdx=0, curS1GIdx=0, bN2Cost=312    (样本 0 总 cost = 312)
+                                  coreCache.cost = 0  (核 0 还没分过, 已分 = 0)
+
+   AssignByBatch (问"整个样本 0 能塞给核 0 吗?"):
+     IsWithinTolerance(limit=156, tol=17, value = 0 + 312)
+                       ─────────  ──────         ─   ───
+                       costLimit  容差         已分  样本 0 总成本
+                                                (核 0 暂时是 0)
+       → 判断: 156 + 17 = 173  ≥  312 ?  否 (173 < 312)
+       → 装不下整个样本, AssignByBatch 直接退出, 不分任何东西
 
    AssignByRow:
      行 0 (cost=78): IsWithinTolerance(156, 17, 0+78)?  173 ≥ 78? ✓
