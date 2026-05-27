@@ -1676,11 +1676,19 @@ FD 段同理。这一步纯粹是格式转换，没有算法逻辑。
                     → 停止
 
    AssignByBlock: supportFd=false, 跳过
-   ForceAssign:    block>0, 跳过
+   ForceAssign:    block=4>0, 跳过  (见下方说明)
 
    核 0 结果: (BN2_END, M_END, S2_END) = (0, 2, 0)
              核 0 干 [samples 0 的 行 0, 行 1], 成本 156
 ```
+
+> **`ForceAssign` 是兜底机制**: 触发条件是 `coreCache.block == 0 && supportFd`。
+> 意思是"如果前面三级分配 (batch/行/块) 一块都没分到, 且 supportFd 开启,
+> 就**无视容差强制塞一块**, 避免核空转"。
+>
+> 本例核 0 经过 AssignByRow 已经分到 4 块 (block=4), 触发条件 `block==0` 不满足,
+> 直接跳过。况且本算子 `supportFd=false` (见 §5.4), **ForceAssign 在本算子里永远不会执行** —
+> 写在文档里只是为了严格还原算法逻辑链。
 
 #### 核 1
 
