@@ -10,13 +10,14 @@ the worst normalized relative error must stay below 10.
 The test flow also matches the Ascend C reference 1:1: each NPU case
 first calls ``sparse_attn_sharedkv_metadata`` (the companion
 load-balancing op) to produce the per-core FA / FD task table, then
-feeds it to ``sparse_attn_sharedkv``. This mirrors
-``ops-transformer/.../sparse_attn_sharedkv/tests/pytest/batch/
-sparse_attn_sharedkv_process.py`` where ``torch_npu.npu_sparse_attn_
-sharedkv_metadata`` is invoked before ``torch.ops.custom.npu_sparse_
-attn_sharedkv``. The TileLang sharedkv kernel does its own
-``T.Kernel`` dispatch and does not consume ``metadata`` for
-scheduling -- the call is preserved purely for API parity.
+feeds it to ``sparse_attn_sharedkv``. The TileLang sharedkv kernel
+consumes the metadata on-device -- each AIC core reads its
+``faMetadata[cid]`` row to learn its ``(bn2, m)`` work range and
+walks the linearised pid window for that range -- so the test flow
+is one-to-one with ``ops-transformer/.../sparse_attn_sharedkv/tests/
+pytest/batch/sparse_attn_sharedkv_process.py`` where
+``torch_npu.npu_sparse_attn_sharedkv_metadata`` is invoked before
+``torch.ops.custom.npu_sparse_attn_sharedkv``.
 
 Run on an Ascend NPU host with TileLang-Ascend installed::
 
@@ -466,12 +467,12 @@ def _call_metadata_then_sharedkv(case, cfg, sparse_attn_sharedkv_fn, metadata_fn
     has_cmp_kv = scenario >= 2
 
     # ---- Step 1: Build metadata (matches Ascend C reference call). ----
-    # The TileLang sharedkv kernel will ignore the returned tensor for
-    # scheduling, but we run the call so the test flow stays aligned
-    # with the Ascend C reference, AND the same metadata tensor is
-    # forwarded to ``sparse_attn_sharedkv``. The Python port
-    # (`metadata.sparse_attn_sharedkv_metadata`) faithfully ports the
-    # aicpu BalanceSchedule + GenMetaData implementation.
+    # The Python port (`metadata.sparse_attn_sharedkv_metadata`)
+    # faithfully ports the aicpu BalanceSchedule + GenMetaData
+    # implementation. The TileLang sharedkv kernel consumes this
+    # tensor on-device: each AIC core reads its ``faMetadata[cid]``
+    # row to drive its outer loop, matching the Ascend C scheduling
+    # contract.
     metadata_kwargs = dict(
         num_heads_q=N1,
         num_heads_kv=N2,
@@ -624,6 +625,107 @@ def test_metadata_shape_and_continuity(case_name):
         assert prev_bn2 in (cfg["B"] * cfg["N2"], 0), (
             f"last core end bn2 should be batch*kvhead or zero, got {prev_bn2}"
         )
+
+
+@pytest.mark.parametrize("case_name", list(SCENARIOS.keys()))
+def test_metadata_drives_complete_kernel_coverage(case_name):
+    """End-to-end sanity check: simulate the kernel's metadata-driven
+    outer loop on CPU and assert it visits every valid ``(b, s)`` work
+    item exactly once.
+
+    The kernel's outer loop (kernel.py) linearises each AIC core's
+    metadata window ``[bn2_start * max_seq + m_start,
+    bn2_end * max_seq + m_end)`` into a pid range and walks it with
+    the ``s_i < actual_q_len[b_i]`` guard for padding. For the
+    scheduler-produced metadata to be a *correct* schedule we need:
+
+    * every ``(b, s)`` with ``s < act_q_len[b]`` appears in exactly
+      one core's window;
+    * no two cores' windows overlap on a valid ``(b, s)`` pair;
+    * out-of-range pids (``s_i >= act_q_len[b_i]``) cause no
+      duplicated work.
+
+    Decode cases collapse to one enabled core (AssignByBatch wins).
+    Prefill cases spread across all 24 AICs with row-level
+    partitioning. Either way the union of all windows must cover the
+    full valid work set.
+    """
+    from metadata import sparse_attn_sharedkv_metadata, AIC_CORE_NUM, FA_METADATA_SIZE
+
+    cfg = SCENARIOS[case_name]
+    scenario = cfg["scenario"]
+    layout_q = cfg["layout_q"]
+    B = cfg["B"]
+    seqs = cfg["seqused_kv"]
+    max_seqlen_kv = int(max(seqs))
+    cu = cfg["cu_seqlens_q"]
+    act_q_lens = (
+        [cu[i + 1] - cu[i] for i in range(B)] if layout_q == "TND" else [cfg["S1"]] * B
+    )
+    max_seq = max(act_q_lens) if layout_q == "TND" else cfg["S1"]
+
+    kwargs = dict(
+        num_heads_q=cfg["N1"],
+        num_heads_kv=cfg["N2"],
+        head_dim=cfg["D"],
+        cu_seqlens_q=torch.tensor(cu, dtype=torch.int32) if layout_q == "TND" else None,
+        seqused_kv=torch.tensor(seqs, dtype=torch.int32),
+        batch_size=B,
+        max_seqlen_q=cfg.get("T1") if layout_q == "TND" else cfg["S1"],
+        max_seqlen_kv=max_seqlen_kv,
+        ori_mask_mode=cfg["ori_mask_mode"],
+        ori_win_left=cfg["ori_win_left"],
+        ori_win_right=cfg["ori_win_right"],
+        layout_q=layout_q,
+        layout_kv="PA_ND",
+        has_ori_kv=True,
+        has_cmp_kv=scenario >= 2,
+        aic_core_num=24,
+    )
+    if scenario >= 2:
+        kwargs["cmp_ratio"] = cfg["cmp_ratio"]
+        kwargs["cmp_mask_mode"] = cfg["cmp_mask_mode"]
+    if scenario == 3:
+        kwargs["cmp_topk"] = cfg["K"]
+
+    md = sparse_attn_sharedkv_metadata(**kwargs).numpy()
+    fa = md[: AIC_CORE_NUM * FA_METADATA_SIZE].reshape(AIC_CORE_NUM, FA_METADATA_SIZE)
+
+    # Simulate the kernel's per-core outer loop: each enabled core walks
+    # pid in [linear_start, linear_end), maps to (b, s), and processes
+    # iff s < act_q_lens[b]. We accumulate every (b, s) pair visited.
+    visited_set: set = set()
+    duplicates: list = []
+    for cid in range(24):
+        enable, bn2s, ms, _, bn2e, me, _, _ = fa[cid].tolist()
+        if not enable:
+            continue
+        linear_start = bn2s * max_seq + ms
+        linear_end = bn2e * max_seq + me
+        for pid in range(linear_start, linear_end):
+            b_i = pid // max_seq
+            s_i = pid % max_seq
+            if b_i >= B:
+                continue  # last core's bn2_end may equal B (next-batch sentinel)
+            if s_i < act_q_lens[b_i]:
+                key = (b_i, s_i)
+                if key in visited_set:
+                    duplicates.append((cid, key))
+                visited_set.add(key)
+
+    expected = {(b, s) for b in range(B) for s in range(act_q_lens[b])}
+    missing = expected - visited_set
+    extra = visited_set - expected
+
+    assert not duplicates, f"{case_name}: kernel windows overlap on {duplicates[:5]}..."
+    assert not missing, (
+        f"{case_name}: kernel misses {len(missing)} work items; first 5: "
+        f"{list(missing)[:5]}"
+    )
+    assert not extra, (
+        f"{case_name}: kernel processes {len(extra)} stray items; first 5: "
+        f"{list(extra)[:5]}"
+    )
 
 
 def test_metadata_prefill_uses_many_cores():

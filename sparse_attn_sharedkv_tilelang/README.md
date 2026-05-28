@@ -67,12 +67,26 @@ algorithm (``AssignByBatch`` → ``AssignByRow`` → ``AssignByBlock``,
 ``GenMetaData`` packing into a flat ``int32[1024]`` tensor laid out as
 ``faMetadata[36][8] || fdMetadata[72][8]``.
 
-The TileLang ``sparse_attn_sharedkv`` kernel does its own
-``T.Kernel(core_num)`` dispatch and does not consume ``metadata`` for
-scheduling -- the parameter is accepted purely for API parity so the
-test flow can be 1:1 with the Ascend C reference suite (`ops-
-transformer/.../sparse_attn_sharedkv/tests/pytest/batch/
-sparse_attn_sharedkv_process.py`).
+The TileLang ``sparse_attn_sharedkv`` kernel **consumes the metadata
+tensor on-device** to drive its outer loop, matching the Ascend C
+scheduling contract. Each AIC core reads its ``faMetadata[cid]`` row
+``(enable, bn2_start, m_start, s2_start, bn2_end, m_end, s2_end,
+first_fd_workspace_idx)`` and walks the linearised pid range
+``[bn2_start * max_seq + m_start, bn2_end * max_seq + m_end)``.
+
+Mapping the scheduler's coordinates back to this kernel:
+
+* ``bn2_idx`` ↔ ``batch_idx`` (since the API constrains ``N2 = 1``);
+* ``m_idx`` ↔ ``seq_idx`` (since ``mBaseSize = groupSize = N1 = 64``,
+  each S1G block covers one ``(batch, seq)`` position);
+* the S2 dimension is left intact for the kernel's internal
+  ``NI_total`` chunk loop because the upstream aicpu source defaults
+  ``supportFd = False`` -- so ``s2_start = s2_end = 0`` for every
+  core and the scheduler never slices S2 across cores.
+
+If a caller passes ``metadata=None``, :mod:`api` synthesises it via
+``sparse_attn_sharedkv_metadata()`` using the inputs already at hand;
+otherwise the caller-supplied tensor flows straight into the kernel.
 
 ## Quick start
 

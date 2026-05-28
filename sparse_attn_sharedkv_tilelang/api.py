@@ -37,6 +37,7 @@ from typing import Optional
 import torch
 
 from kernel import build_sparse_attn_sharedkv, DEFAULT_CORE_NUM
+from metadata import sparse_attn_sharedkv_metadata, SAS_META_SIZE
 
 # Module-level kernel cache: key is the tuple of compile-time params.
 _KERNEL_CACHE: dict = {}
@@ -155,14 +156,18 @@ def sparse_attn_sharedkv(
     ``metadata`` matches the contract of the Ascend C
     ``SparseAttnSharedkv`` op: it is the output of the companion
     ``SparseAttnSharedkvMetadata`` op (see :mod:`metadata`) and carries
-    the per-core FA / FD task ranges. The TileLang kernel runs its own
-    ``T.Kernel`` dispatch and does not consume ``metadata`` for
-    scheduling -- the argument exists for API parity so the test flow
-    can call the metadata + sharedkv ops together, mirroring the
-    Ascend C reference (`sparse_attn_sharedkv_process.py`). ``seqused_q``
-    is likewise accepted for API parity but unused by the kernel.
+    the per-core FA / FD task ranges (``faMetadata[cid] = (enable,
+    bn2_start, m_start, s2_start, bn2_end, m_end, s2_end, ...)``).
+    The TileLang kernel consumes this tensor on-device: each AIC core
+    reads its own row to know which ``(bn2, m)`` work range it owns,
+    matching the Ascend C ``SparseAttnSharedkv`` cube/vector scheduling
+    contract one-to-one. If ``metadata`` is omitted we build it here
+    via the Python port (:func:`metadata.sparse_attn_sharedkv_metadata`)
+    using the inputs already at hand.
+
+    ``seqused_q`` is accepted for API parity but unused by the kernel.
     """
-    del metadata, seqused_q  # API-parity placeholders; kernel does not consume them
+    del seqused_q  # API-parity placeholder; kernel does not consume it
     assert ori_mask_mode == 4, "only ori_mask_mode=4 supported"
     assert cmp_mask_mode == 3 or cmp_kv is None, "only cmp_mask_mode=3 supported"
     assert ori_win_right == 0, "only ori_win_right=0 supported"
@@ -302,6 +307,43 @@ def sparse_attn_sharedkv(
     # ---- Sinks on device, fp32. ----
     sinks_dev = sinks.to(torch.float32).to(q.device)
 
+    # ---- Metadata: produced by the companion scheduler op, drives
+    # per-AIC-core work ranges inside the kernel. Synthesise it here
+    # via the Python port if the caller did not pre-compute it (the
+    # test flow does, mirroring the Ascend C reference). ----
+    if metadata is None:
+        max_seqlen_kv = int(seqused_kv.max().item())
+        meta_kwargs = dict(
+            num_heads_q=N1,
+            num_heads_kv=N2,
+            head_dim=D,
+            cu_seqlens_q=cu_seqlens_q if layout_q == "TND" else None,
+            seqused_kv=seqused_kv,
+            batch_size=int(B),
+            max_seqlen_q=int(S_max),
+            max_seqlen_kv=max_seqlen_kv,
+            ori_mask_mode=ori_mask_mode,
+            ori_win_left=ori_win_left,
+            ori_win_right=ori_win_right,
+            layout_q=layout_q,
+            layout_kv=layout_kv,
+            has_ori_kv=True,
+            has_cmp_kv=cmp_kv is not None,
+            aic_core_num=core_num,
+        )
+        if scenario >= 2:
+            meta_kwargs["cmp_ratio"] = cmp_ratio_eff
+            meta_kwargs["cmp_mask_mode"] = cmp_mask_mode
+        if scenario == 3:
+            meta_kwargs["cmp_topk"] = K
+        metadata = sparse_attn_sharedkv_metadata(**meta_kwargs)
+    metadata_dev = metadata.to(torch.int32).to(q.device)
+    assert metadata_dev.numel() == SAS_META_SIZE, (
+        f"metadata must have {SAS_META_SIZE} int32 entries (got {metadata_dev.numel()})"
+    )
+    # The kernel expects a flat [SAS_META_SIZE] view.
+    metadata_dev = metadata_dev.reshape(SAS_META_SIZE)
+
     # ---- Run kernel. Workspaces are auto-allocated via workspace_idx. ----
     out_flat = func(
         q_flat.contiguous(),
@@ -314,6 +356,7 @@ def sparse_attn_sharedkv(
         act_q_lens.contiguous(),
         seqused_kv_dev.contiguous(),
         sinks_dev.contiguous(),
+        metadata_dev.contiguous(),
     )
 
     # ---- Restore the caller's layout. ----

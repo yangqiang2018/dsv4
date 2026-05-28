@@ -50,6 +50,22 @@ tilelang.cache.clear_cache()
 # Atlas A3 cube/vector pair count.
 DEFAULT_CORE_NUM = 24
 
+# ---- SasMetaData layout mirroring sparse_attn_sharedkv_metadata.h. ----
+# faMetadata[AIC_CORE_NUM][FA_METADATA_SIZE] is laid out first inside
+# the flat int32[SAS_META_SIZE] metadata tensor produced by the Ascend C
+# SparseAttnSharedkvMetadata aicpu kernel (see ``metadata.py`` for the
+# Python port). Each AIC core reads its row to know which (bn2, m) work
+# range it owns.
+_SAS_META_SIZE = 1024
+_FA_METADATA_SIZE = 8
+_FA_CORE_ENABLE_INDEX = 0
+_FA_BN2_START_INDEX = 1
+_FA_M_START_INDEX = 2
+_FA_S2_START_INDEX = 3
+_FA_BN2_END_INDEX = 4
+_FA_M_END_INDEX = 5
+_FA_S2_END_INDEX = 6
+
 # Cross-flag ids for the cube<->vector handshake (per chunk).
 _FLAG_KV_READY = 0  # V -> C : gathered KV is in ws_kv
 _FLAG_SCORE_READY = 1  # C -> V : Q@K^T is in ws_score
@@ -160,7 +176,7 @@ def build_sparse_attn_sharedkv(
         "acc_o_half": 88 * KB,  # aliases acc_o_ub (disjoint phases)
     }
 
-    @tilelang.jit(out_idx=[10], workspace_idx=[11, 12, 13, 14])
+    @tilelang.jit(out_idx=[11], workspace_idx=[12, 13, 14, 15])
     def _make():
         @T.prim_func
         def main(
@@ -174,6 +190,7 @@ def build_sparse_attn_sharedkv(
             actual_q_len: T.Tensor([batch], indices_dtype),  # type: ignore[valid-type]
             actual_kv_len: T.Tensor([batch], indices_dtype),  # type: ignore[valid-type]
             Sinks: T.Tensor([n_heads], accum_dtype),  # type: ignore[valid-type]
+            Metadata: T.Tensor([_SAS_META_SIZE], indices_dtype),  # type: ignore[valid-type]
             Output: T.Tensor(out_shape, dtype),  # type: ignore[valid-type]
             ws_kv: T.Tensor([core_num, BI, D], dtype),  # type: ignore[valid-type]
             ws_score: T.Tensor([core_num, H_per_block, BI], accum_dtype),  # type: ignore[valid-type]
@@ -232,10 +249,50 @@ def build_sparse_attn_sharedkv(
                     }
                 )
 
+                # ---- Read this AIC core's metadata row. ----
+                # Each row is FA_METADATA_SIZE int32 entries; layout
+                # mirrors SasMetaData::faMetadata from the Ascend C
+                # SparseAttnSharedkvMetadata aicpu kernel (see
+                # ``metadata.py`` for the Python port and
+                # ``sparse_attn_sharedkv_metadata.h`` for the canonical
+                # struct definition).
+                #
+                # API constraints: n_kv_heads == 1 and
+                # mBaseSize == groupSize == n_heads, so the (bn2, m)
+                # work coordinate produced by the scheduler maps 1:1 to
+                # this kernel's (batch, seq) work coordinate. Each
+                # ``(bn2_idx, m_idx)`` corresponds to one ``(b_i, s_i)``
+                # work item; the S2 dimension is fully covered by this
+                # kernel's internal ``NI_total`` chunk loop and is
+                # therefore not sliced across cores (supportFd defaults
+                # to False in the aicpu source -- ``s2_start`` and
+                # ``s2_end`` stay at the row's start/end for every
+                # core).
+                meta_base = cid * _FA_METADATA_SIZE
+                core_enable = Metadata[meta_base + _FA_CORE_ENABLE_INDEX]
+                bn2_start = Metadata[meta_base + _FA_BN2_START_INDEX]
+                m_start = Metadata[meta_base + _FA_M_START_INDEX]
+                bn2_end = Metadata[meta_base + _FA_BN2_END_INDEX]
+                m_end = Metadata[meta_base + _FA_M_END_INDEX]
+                # Linearize the (bn2, m) range to a pid range. The
+                # scheduler's ``m`` index counts S1G rows within a batch
+                # (= seq token id when groupSize == mBaseSize). The
+                # planar pid space ``b * max_seq + s`` already accounts
+                # for per-batch padding via the ``s_i < act_q`` guard
+                # below, so the same guard skips padded pids inside the
+                # assigned window automatically.
+                linear_start = bn2_start * max_seq + m_start
+                linear_end = bn2_end * max_seq + m_end
+
+                # Static loop upper bound. The actual range walked per
+                # core is ``linear_end - linear_start``; in the worst
+                # case (one core owns the whole job, e.g. tiny decode
+                # cases) that equals ``batch * max_seq``. Out-of-range
+                # iterations are skipped by the pid range guard.
                 total_work = batch * max_seq
-                for slot in T.serial(T.ceildiv(total_work, core_num)):
-                    pid = slot * core_num + cid
-                    if pid < total_work:
+                for slot in T.serial(total_work):
+                    pid = linear_start + slot
+                    if core_enable != 0 and pid < linear_end:
                         b_i = pid // max_seq
                         s_i = pid % max_seq
                         act_q = actual_q_len[b_i]
