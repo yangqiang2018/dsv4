@@ -167,6 +167,11 @@ def build_sparse_attn_sharedkv(
         "sumexp": 84 * KB + 256,
         "sumexp_i_ub": 84 * KB + 384,
         "sinks_ub": 84 * KB + 512,
+        # lse_ub holds the per-head LogSumExp result before the GM
+        # write-back. ub_len * sizeof(fp32) = 32 * 4 = 128 bytes; fits in
+        # the 128-byte gap between sinks_ub (128 bytes used out of the
+        # 256-byte slot) and idx_int.
+        "lse_ub": 84 * KB + 640,
         "idx_int": 84 * KB + 768,
         "idx_float": 84 * KB + 1024,
         "kv_ub": 84 * KB + 1280,
@@ -176,7 +181,16 @@ def build_sparse_attn_sharedkv(
         "acc_o_half": 88 * KB,  # aliases acc_o_ub (disjoint phases)
     }
 
-    @tilelang.jit(out_idx=[11], workspace_idx=[12, 13, 14, 15])
+    # Output 0: attn_out [total_tokens, n_heads, D] (dtype)
+    # Output 1: lse      [total_tokens, n_heads]     (fp32)
+    # The kernel always writes lse (it is essentially free: the running
+    # row_max / row_sum are already on the vector core; one ln + one add
+    # + one [n_heads] DMA per work item). The api.py wrapper hides it
+    # behind a ``return_softmax_lse`` switch -- this matches the Ascend
+    # C contract (``softmax_lse`` is a REQUIRED output, gated at the
+    # attribute level) and gives every caller (training reverse,
+    # online-softmax composition, etc.) the value for free.
+    @tilelang.jit(out_idx=[11, 12], workspace_idx=[13, 14, 15, 16])
     def _make():
         @T.prim_func
         def main(
@@ -192,6 +206,7 @@ def build_sparse_attn_sharedkv(
             Sinks: T.Tensor([n_heads], accum_dtype),  # type: ignore[valid-type]
             Metadata: T.Tensor([_SAS_META_SIZE], indices_dtype),  # type: ignore[valid-type]
             Output: T.Tensor(out_shape, dtype),  # type: ignore[valid-type]
+            LSE_out: T.Tensor([total_tokens, n_heads], accum_dtype),  # type: ignore[valid-type]
             ws_kv: T.Tensor([core_num, BI, D], dtype),  # type: ignore[valid-type]
             ws_score: T.Tensor([core_num, H_per_block, BI], accum_dtype),  # type: ignore[valid-type]
             ws_p: T.Tensor([core_num, H_per_block, BI], dtype),  # type: ignore[valid-type]
@@ -214,6 +229,7 @@ def build_sparse_attn_sharedkv(
                 sumexp = T.alloc_ub([ub_len], accum_dtype)
                 sumexp_i_ub = T.alloc_ub([ub_len], accum_dtype)
                 sinks_ub = T.alloc_ub([ub_len], accum_dtype)
+                lse_ub = T.alloc_ub([ub_len], accum_dtype)
                 acc_s_ub = T.alloc_ub([v_block, BI], accum_dtype)
                 acc_s_ub_ = T.alloc_ub([v_block, BI], accum_dtype)
                 acc_s_half = T.alloc_ub([v_block, BI], dtype)
@@ -239,6 +255,7 @@ def build_sparse_attn_sharedkv(
                         sumexp: ub_addr["sumexp"],
                         sumexp_i_ub: ub_addr["sumexp_i_ub"],
                         sinks_ub: ub_addr["sinks_ub"],
+                        lse_ub: ub_addr["lse_ub"],
                         idx_int: ub_addr["idx_int"],
                         idx_float: ub_addr["idx_float"],
                         kv_ub: ub_addr["kv_ub"],
@@ -631,6 +648,31 @@ def build_sparse_attn_sharedkv(
                                         t_i,
                                         vid * v_block : vid * v_block + v_block,
                                         :,
+                                    ],
+                                )
+
+                                # ---- LSE epilogue ----
+                                # lse[h] = m_i[h] + ln(sumexp[h])
+                                # FA v2 LogSumExp identity:
+                                #   lse = max_running + ln(sum_running)
+                                # where sum_running is the FA v2 row_sum
+                                # *after* the sink seed -- so the sink
+                                # contribution exp(sink - max) is folded
+                                # in automatically. The Ascend C kernel
+                                # writes this same value when
+                                # return_softmax_lse=True (see
+                                # sparse_attn_sharedkv/op_kernel/arch32/
+                                # sparse_attn_sharedkv_swa_block_vector.h
+                                # `ProcessLse`).
+                                T.tile.ln(lse_ub, sumexp)
+                                T.barrier_all()
+                                T.tile.add(lse_ub, lse_ub, m_i)
+                                T.barrier_all()
+                                T.copy(
+                                    lse_ub,
+                                    LSE_out[
+                                        t_i,
+                                        vid * v_block : vid * v_block + v_block,
                                     ],
                                 )
 

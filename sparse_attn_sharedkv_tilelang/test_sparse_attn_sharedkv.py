@@ -348,7 +348,7 @@ def _build_case(cfg: dict, dtype: torch.dtype, seed: int = 42):
     else:
         cmp_idx_bsnd = None
 
-    cpu_ref = G.sparse_attn_sharedkv_golden_bnsd(
+    cpu_ref, cpu_ref_lse = G.sparse_attn_sharedkv_golden_bnsd(
         q_bnsd_ref,
         ori_k_bnsd,
         sinks,
@@ -362,13 +362,18 @@ def _build_case(cfg: dict, dtype: torch.dtype, seed: int = 42):
         ori_win_right=cfg["ori_win_right"],
         ori_mask_mode=cfg["ori_mask_mode"],
         cmp_mask_mode=cfg["cmp_mask_mode"],
+        return_lse=True,
     )
 
     # Convert golden back to caller layout.
+    # cpu_ref:     BNSD [B, N1, S_max, D] -> TND [T1, N1, D] or BSND [B, S1, N1, D]
+    # cpu_ref_lse: BNS  [B, N1, S_max]    -> TND [T1, N1]    or BSND [B, S1, N1]
     if layout_q == "TND":
         cpu_ref = G.bnsd_to_tnd_out(cpu_ref, cu_seqlens_q)
+        cpu_ref_lse = G.bnsd_to_tnd_lse(cpu_ref_lse, cu_seqlens_q)
     else:
         cpu_ref = cpu_ref.permute(0, 2, 1, 3).contiguous()
+        cpu_ref_lse = cpu_ref_lse.permute(0, 2, 1).contiguous()
 
     return dict(
         cfg=cfg,
@@ -382,6 +387,7 @@ def _build_case(cfg: dict, dtype: torch.dtype, seed: int = 42):
         cu_seqlens_q=cu_seqlens_q,
         seqused_kv=torch.tensor(seqused_kv, dtype=torch.int32),
         cpu_ref=cpu_ref,
+        cpu_ref_lse=cpu_ref_lse,
     )
 
 
@@ -427,6 +433,50 @@ def _check_result(npu_out: torch.Tensor, expect: torch.Tensor) -> None:
     )
     assert max_rel < 10.0, (
         f"max normalized relative error {max_rel:.4f} exceeds cap 10.0 "
+        f"(fulfill {fulfill_pct:.4f}%, {n_err}/{real.size} failing)"
+    )
+
+
+def _check_lse(
+    npu_lse: torch.Tensor, expect_lse: torch.Tensor, q_dtype: torch.dtype
+) -> None:
+    """LSE validation with bf16/fp16-aware tolerance.
+
+    LSE is always fp32 on output, but its inputs (the running row_max
+    and row_sum) are accumulated from bf16/fp16 Q@K^T scores. The
+    Ascend C kernel emits the same fp32 value, but the bit-exactness
+    bound is dictated by the input GEMM precision -- so we use the
+    same dtype-keyed tolerance as ``_check_result``, just relaxed by
+    one bit on rtol because ``ln`` amplifies relative error in
+    ``sumexp`` (which can be near 1.0 for tiny KV sets where the sink
+    term dominates).
+    """
+    if q_dtype == torch.bfloat16:
+        rtol, atol = 0.015, 0.005
+    else:  # float16
+        rtol, atol = 0.01, 0.001
+
+    real = npu_lse.detach().cpu().to(torch.float32).numpy().flatten()
+    expt = expect_lse.detach().cpu().to(torch.float32).numpy().flatten()
+    assert real.size == expt.size, f"lse size mismatch: {real.size} vs {expt.size}"
+
+    ok = np.isclose(real, expt, rtol=rtol, atol=atol, equal_nan=True)
+    n_err = int((~ok).sum())
+    fulfill_pct = (real.size - n_err) / real.size * 100.0
+
+    diff_thd = 0.005
+    norm_floor = (1.0 / (1 << 14)) / diff_thd
+    b = np.maximum(np.maximum(np.abs(real), np.abs(expt)), norm_floor) + 1e-9
+    rel_err = np.abs(real - expt) / b
+    max_rel = float(rel_err[~ok].max()) if n_err > 0 else 0.0
+
+    assert fulfill_pct >= 99.5, (
+        f"lse: only {fulfill_pct:.4f}% within tol "
+        f"(rtol={rtol}, atol={atol}); 99.5% required; "
+        f"{n_err}/{real.size} failing, max rel err {max_rel:.4f}"
+    )
+    assert max_rel < 10.0, (
+        f"lse: max normalized relative error {max_rel:.4f} exceeds cap 10.0 "
         f"(fulfill {fulfill_pct:.4f}%, {n_err}/{real.size} failing)"
     )
 
@@ -503,8 +553,11 @@ def _call_metadata_then_sharedkv(case, cfg, sparse_attn_sharedkv_fn, metadata_fn
     assert metadata_tensor.numel() == 1024  # SAS_META_SIZE
 
     # ---- Step 2: Call sparse_attn_sharedkv with metadata in tow. ----
+    # Ask for lse as well -- the kernel always computes it (cheap
+    # epilogue), and we validate both attn_out and lse in
+    # ``test_sparse_attn_sharedkv``.
     with torch.device("npu"):
-        out = sparse_attn_sharedkv_fn(
+        out, lse = sparse_attn_sharedkv_fn(
             _dev(case["q"]),
             ori_kv=_dev(case["ori_pa"]),
             cmp_kv=_dev(case["cmp_pa"]),
@@ -523,10 +576,11 @@ def _call_metadata_then_sharedkv(case, cfg, sparse_attn_sharedkv_fn, metadata_fn
             ori_win_right=cfg["ori_win_right"],
             layout_q=layout_q,
             layout_kv="PA_ND",
+            return_softmax_lse=True,
             topk_cmp=K,
         )
         torch.npu.synchronize()
-    return out, metadata_tensor
+    return out, lse, metadata_tensor
 
 
 @requires_npu
@@ -544,10 +598,11 @@ def test_sparse_attn_sharedkv(case_name, dtype):
     cfg = SCENARIOS[case_name]
     # Data generation + golden run on CPU (default device).
     case = _build_case(cfg, dtype)
-    out, _ = _call_metadata_then_sharedkv(
+    out, lse, _ = _call_metadata_then_sharedkv(
         case, cfg, sparse_attn_sharedkv, sparse_attn_sharedkv_metadata
     )
     _check_result(out.cpu(), case["cpu_ref"])
+    _check_lse(lse.cpu(), case["cpu_ref_lse"], dtype)
 
 
 # ---- CPU-only metadata tests (no NPU required). ----
@@ -790,7 +845,7 @@ def test_golden_math_matches_single_shot_softmax():
             take = min(K, valid)
             idx[0, s, 0, :take] = torch.arange(take, dtype=torch.int32)
 
-    chunked = G.sparse_attn_sharedkv_golden_bnsd(
+    chunked, chunked_lse = G.sparse_attn_sharedkv_golden_bnsd(
         q,
         ori_k_bnsd,
         sinks,
@@ -800,10 +855,12 @@ def test_golden_math_matches_single_shot_softmax():
         cmp_k_bnsd=cmp_k_bnsd,
         cmp_sparse_indices=idx,
         cmp_ratio=cmp_ratio,
+        return_lse=True,
     )
 
     # Reference: per (s) row, build the same sparse K=V slice and do one-shot.
     ref = torch.zeros_like(q)
+    ref_lse = torch.zeros((1, N1, S1), dtype=torch.float32)
     for s in range(S1):
         s_global = seqused_kv[0] - S1 + s
         ori_left = max(s_global - 127, 0)
@@ -819,12 +876,17 @@ def test_golden_math_matches_single_shot_softmax():
         )
         k_concat = torch.cat([ori_k, cmp_k], dim=0)  # [n, D]
         q_row = q[0, :, s, :]  # [N1, D]
-        sm = G.sinks_softmax_reference(
+        sm, sm_lse = G.sinks_softmax_reference(
             q_row.unsqueeze(0),
             k_concat.unsqueeze(0),
             sinks=sinks,
             softmax_scale=softmax_scale,
-        ).squeeze(0)
-        ref[0, :, s, :] = sm
+            return_lse=True,
+        )
+        ref[0, :, s, :] = sm.squeeze(0)
+        ref_lse[0, :, s] = sm_lse.squeeze(0)
 
     torch.testing.assert_close(chunked, ref, rtol=2e-4, atol=2e-4)
+    # lse aggregates across the whole row, so its absolute scale is
+    # ~ln(seqlen) + max_score. Stay with fp32 strict-ish tolerance.
+    torch.testing.assert_close(chunked_lse, ref_lse, rtol=1e-4, atol=1e-4)

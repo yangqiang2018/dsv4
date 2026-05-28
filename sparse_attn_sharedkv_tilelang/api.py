@@ -28,11 +28,16 @@ Usage::
         layout_q="TND",
         layout_kv="PA_ND",
     )
+
+Pass ``return_softmax_lse=True`` to also get the per-token LogSumExp
+tensor (fp32), shaped ``[T1, N1]`` for TND or ``[B, S1, N1]`` for BSND.
+``lse[t, h] = max_h + ln(sum_h)`` with the sink contribution folded
+in -- the standard FlashAttention-v2 reverse-pass input.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -142,9 +147,10 @@ def sparse_attn_sharedkv(
     ori_win_right: int = 0,
     layout_q: str = "TND",
     layout_kv: str = "PA_ND",
+    return_softmax_lse: bool = False,
     core_num: int = DEFAULT_CORE_NUM,
     topk_cmp: Optional[int] = None,
-) -> torch.Tensor:
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Forward pass. Returns ``attention_out`` with the same layout as ``q``.
 
     The function detects the scenario from the optional arguments:
@@ -166,6 +172,16 @@ def sparse_attn_sharedkv(
     using the inputs already at hand.
 
     ``seqused_q`` is accepted for API parity but unused by the kernel.
+
+    If ``return_softmax_lse=True`` the function returns a pair
+    ``(attn_out, lse)`` where ``lse`` is fp32 with shape ``[T1, N1]``
+    (TND) or ``[B, S1, N1]`` (BSND). ``lse[t, h] = max_h + ln(sum_h)``
+    over all attended keys, with the per-head sink contribution folded
+    in -- this is the LogSumExp value FlashAttention-v2's backward
+    pass needs to rebuild the softmax probabilities. The kernel always
+    computes lse internally (it is essentially free; see
+    :mod:`kernel`), so the switch only controls whether the value is
+    surfaced to the caller.
     """
     del seqused_q  # API-parity placeholder; kernel does not consume it
     assert ori_mask_mode == 4, "only ori_mask_mode=4 supported"
@@ -345,7 +361,10 @@ def sparse_attn_sharedkv(
     metadata_dev = metadata_dev.reshape(SAS_META_SIZE)
 
     # ---- Run kernel. Workspaces are auto-allocated via workspace_idx. ----
-    out_flat = func(
+    # The kernel signature has two outputs (Output, LSE_out); jit's
+    # out_idx=[11, 12] makes it return a tuple. We always receive both
+    # and only forward lse when the caller asked for it.
+    out_flat, lse_flat = func(
         q_flat.contiguous(),
         ori_kv_dev.contiguous(),
         ori_bt_dev.contiguous(),
@@ -360,6 +379,14 @@ def sparse_attn_sharedkv(
     )
 
     # ---- Restore the caller's layout. ----
+    # out_flat: [total_tokens, N1, D]; lse_flat: [total_tokens, N1].
     if layout_q == "TND":
-        return out_flat  # already [T1, N1, D]
-    return out_flat.reshape(B, S_max, N1, D)
+        out = out_flat  # already [T1, N1, D]
+        lse = lse_flat  # [T1, N1]
+    else:
+        out = out_flat.reshape(B, S_max, N1, D)
+        lse = lse_flat.reshape(B, S_max, N1)
+
+    if return_softmax_lse:
+        return out, lse
+    return out

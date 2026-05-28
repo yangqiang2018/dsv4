@@ -129,7 +129,6 @@ Matching the original Ascend C kernel:
 - `dtype ∈ {bfloat16, float16}` (matched across q/ori_kv/cmp_kv/out)
 - `topk_cmp` must be a multiple of `block_I = 64`
 - `ori_block_size` must be a multiple of `block_I = 64`
-- `return_softmax_lse == False` (lse output is unsupported)
 
 ## Implementation summary
 
@@ -163,6 +162,16 @@ Matching the original Ascend C kernel:
   inner `T.serial(ceildiv(B*S_max, core_num))` slot loop keeps the
   workspace footprint per-physical-core (24 slots) rather than per
   work-item.
+* **LogSumExp output**: the kernel always emits the per-token
+  `lse[t, h] = row_max + ln(row_sum)` (fp32) alongside `attn_out`;
+  `api.sparse_attn_sharedkv(..., return_softmax_lse=True)` surfaces it
+  to the caller as `[T1, N1]` (TND) or `[B, S1, N1]` (BSND). The sink
+  contribution is folded into the state automatically (the FA-v2 seed
+  `(row_max, row_sum) = (sink_h, 1.0)` is exactly `(max, sum)` of a
+  one-element softmax over the sink logit). This is the LSE value the
+  Ascend C kernel emits when `return_softmax_lse=True` (see
+  `sparse_attn_sharedkv_swa_block_vector.h::ProcessLse`) and the
+  exact input FlashAttention-v2's backward pass needs.
 
 ## Numerical accuracy
 
@@ -193,7 +202,6 @@ normalized relative error among failing elements stays below 10.
 
 ## Known limitations / TODO
 
-* `return_softmax_lse` is unsupported (matches the upstream API).
 * `seqused_q` is unsupported (matches the upstream API).
 * `ori_sparse_indices` is unused (matches the upstream API).
 * For scenario 1 (SWA-only) `topk_cmp == 0`, so there are no cmp chunks

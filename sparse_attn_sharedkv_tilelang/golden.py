@@ -82,8 +82,20 @@ def sparse_attn_sharedkv_golden_bnsd(
     ori_mask_mode: int = 4,
     cmp_mask_mode: int = 3,
     s2_tile: int = GOLDEN_S2_TILE,
-) -> torch.Tensor:
-    """Compute ``attention_out`` in BNSD layout, matching the Ascend kernel."""
+    return_lse: bool = False,
+):
+    """Compute ``attention_out`` in BNSD layout, matching the Ascend kernel.
+
+    If ``return_lse=True`` also returns the LogSumExp ``[B, N1, S1]``
+    fp32 tensor, defined as ``lse[b, h, s] = row_max + ln(row_sum)``
+    over all attended keys (sliding window + sparse cmp), with the
+    per-head sink contribution folded into the initial state -- the
+    same definition the Ascend C kernel uses when
+    ``return_softmax_lse=True`` (see
+    ``sparse_attn_sharedkv/op_kernel/arch32/
+    sparse_attn_sharedkv_swa_block_vector.h`` ``ProcessLse``). Padded
+    ``(b, s)`` slots (``s >= act_q_lens[b]``) stay at zero.
+    """
     assert ori_win_right == 0, "only ori_win_right=0 (causal) is supported"
     assert ori_mask_mode == 4, "only ori_mask_mode=4 supported"
 
@@ -92,6 +104,11 @@ def sparse_attn_sharedkv_golden_bnsd(
     G = N1 // N2
     dtype = q_bnsd.dtype
     out = torch.zeros_like(q_bnsd, dtype=dtype)
+    lse = (
+        torch.zeros((B, N1, S1), dtype=torch.float32, device=q_bnsd.device)
+        if return_lse
+        else None
+    )
 
     has_cmp = cmp_k_bnsd is not None and cmp_sparse_indices is not None
     is_dense_cmp = cmp_k_bnsd is not None and cmp_sparse_indices is None
@@ -136,7 +153,12 @@ def sparse_attn_sharedkv_golden_bnsd(
                         (0, D), dtype=torch.float32, device=q_bnsd.device
                     )
 
-                # Online softmax state seeded from sinks.
+                # Online softmax state seeded from sinks. row_max starts
+                # at the sink logit and row_sum at 1 = exp(sink - sink),
+                # i.e. the sink is treated as a virtual KV token with a
+                # zero V row. This makes the final
+                # lse = row_max + ln(row_sum) naturally include the
+                # sink contribution.
                 row_max = sink_group.clone()  # [G]
                 row_sum = torch.ones(G, dtype=torch.float32, device=q_bnsd.device)
                 acc_o = torch.zeros((G, D), dtype=torch.float32, device=q_bnsd.device)
@@ -174,7 +196,11 @@ def sparse_attn_sharedkv_golden_bnsd(
                     acc_o = acc_o * alpha.unsqueeze(1) + pv
 
                 out[b, head_lo:head_hi, s, :] = (acc_o / row_sum.unsqueeze(1)).to(dtype)
+                if return_lse:
+                    lse[b, head_lo:head_hi, s] = row_max + torch.log(row_sum)
 
+    if return_lse:
+        return out, lse
     return out
 
 
@@ -184,7 +210,8 @@ def sinks_softmax_reference(
     *,
     sinks: torch.Tensor,
     softmax_scale: float,
-) -> torch.Tensor:
+    return_lse: bool = False,
+):
     """One-shot softmax reference (no chunking) for math sanity checks.
 
     Computes ``softmax(Q @ K^T * scale  ∪  sinks) @ V`` where ``sinks``
@@ -192,6 +219,11 @@ def sinks_softmax_reference(
 
     ``k_concat_bnsd`` is the full concatenated K (=V) for this work item:
     sliding window slice + sparse cmp slice.
+
+    If ``return_lse=True`` also returns the LogSumExp tensor (the
+    leading dims match ``q_bnsd`` minus the last dim, so for input
+    ``[..., G, D]`` the result is ``[..., G]``). The lse covers the
+    same logit set as the softmax (scores ∪ sinks).
     """
     q = q_bnsd.to(torch.float32)
     k = k_concat_bnsd.to(torch.float32)
@@ -202,7 +234,14 @@ def sinks_softmax_reference(
     y = torch.exp(score - x_max)
     denom = y.sum(dim=-1, keepdim=True) + torch.exp(sinks_b - x_max)
     p = y / denom
-    return torch.matmul(p.to(q_bnsd.dtype).to(torch.float32), k).to(q_bnsd.dtype)
+    out = torch.matmul(p.to(q_bnsd.dtype).to(torch.float32), k).to(q_bnsd.dtype)
+    if return_lse:
+        # lse = ln(sum exp(x_i)) = x_max + ln(denom*exp(x_max-x_max))
+        # but denom here already excludes the x_max shift, so
+        # lse = x_max + ln(sum y + exp(sinks - x_max)) = x_max + ln(denom).
+        lse = (x_max + torch.log(denom)).squeeze(-1)
+        return out, lse
+    return out
 
 
 def unpack_paged_kv(
@@ -255,6 +294,21 @@ def bnsd_to_tnd_out(out_bnsd: torch.Tensor, cu_seqlens_q: torch.Tensor) -> torch
         end = int(cu_seqlens_q[b + 1].item())
         L = end - start
         out[start:end, :, :] = out_bnsd[b, :, :L, :].permute(1, 0, 2)
+    return out
+
+
+def bnsd_to_tnd_lse(lse_bnsd: torch.Tensor, cu_seqlens_q: torch.Tensor) -> torch.Tensor:
+    """Unpad a BNSD lse ``[B, N, S_max]`` back to TND ``[T, N]``."""
+    B, N, _ = lse_bnsd.shape
+    seq_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).tolist()
+    T_total = sum(seq_lens)
+    out = lse_bnsd.new_zeros((T_total, N))
+    for b in range(B):
+        start = int(cu_seqlens_q[b].item())
+        end = int(cu_seqlens_q[b + 1].item())
+        L = end - start
+        # lse_bnsd[b, :, :L]: [N, L] -> [L, N]
+        out[start:end, :] = lse_bnsd[b, :, :L].permute(1, 0)
     return out
 
 
