@@ -7,6 +7,17 @@ B=1) with ``check_result``-style validation: per-element ``np.isclose``
 at the Ascend C tolerances, at least 99.5% of elements must pass, and
 the worst normalized relative error must stay below 10.
 
+The test flow also matches the Ascend C reference 1:1: each NPU case
+first calls ``sparse_attn_sharedkv_metadata`` (the companion
+load-balancing op) to produce the per-core FA / FD task table, then
+feeds it to ``sparse_attn_sharedkv``. This mirrors
+``ops-transformer/.../sparse_attn_sharedkv/tests/pytest/batch/
+sparse_attn_sharedkv_process.py`` where ``torch_npu.npu_sparse_attn_
+sharedkv_metadata`` is invoked before ``torch.ops.custom.npu_sparse_
+attn_sharedkv``. The TileLang sharedkv kernel does its own
+``T.Kernel`` dispatch and does not consume ``metadata`` for
+scheduling -- the call is preserved purely for API parity.
+
 Run on an Ascend NPU host with TileLang-Ascend installed::
 
     pytest -q test_sparse_attn_sharedkv.py
@@ -419,6 +430,104 @@ def _check_result(npu_out: torch.Tensor, expect: torch.Tensor) -> None:
     )
 
 
+def _call_metadata_then_sharedkv(case, cfg, sparse_attn_sharedkv_fn, metadata_fn):
+    """Run the metadata + sharedkv pair, mirroring the Ascend C test flow.
+
+    The Ascend C reference (`sparse_attn_sharedkv_process.py`) calls
+    ``torch_npu.npu_sparse_attn_sharedkv_metadata`` first to obtain the
+    per-core FA / FD task table, then feeds it as ``metadata`` to
+    ``torch.ops.custom.npu_sparse_attn_sharedkv``. We do the same here
+    so the TileLang test flow is one-to-one with the upstream.
+
+    Routing the three scenarios mirrors ``sparse_attn_sharedkv_process``:
+
+    * ``cmp_kv is None``                          → SWA  (template_idx 0)
+    * ``cmp_kv != None, cmp_idx is None``          → CFA  (template_idx 1)
+    * ``cmp_kv != None, cmp_idx != None``          → SCFA (template_idx 2)
+    """
+    layout_q = cfg["layout_q"]
+    N1, N2, D = cfg["N1"], cfg["N2"], cfg["D"]
+    B = cfg["B"]
+    K = cfg.get("K", 0)
+    max_seqlen_q = cfg.get("T1") if layout_q == "TND" else cfg["S1"]
+    max_seqlen_kv = int(max(cfg["seqused_kv"]))
+
+    # Move tensors to NPU.
+    def _dev(t):
+        if t is None:
+            return None
+        return t.npu().contiguous() if hasattr(t, "npu") else t
+
+    cu_seqlens_q_dev = _dev(case["cu_seqlens_q"]) if layout_q == "TND" else None
+    seqused_kv_dev = _dev(case["seqused_kv"])
+
+    scenario = cfg["scenario"]
+    has_ori_kv = True
+    has_cmp_kv = scenario >= 2
+
+    # ---- Step 1: Build metadata (matches Ascend C reference call). ----
+    # The TileLang sharedkv kernel will ignore the returned tensor for
+    # scheduling, but we run the call so the test flow stays aligned
+    # with the Ascend C reference, AND the same metadata tensor is
+    # forwarded to ``sparse_attn_sharedkv``. The Python port
+    # (`metadata.sparse_attn_sharedkv_metadata`) faithfully ports the
+    # aicpu BalanceSchedule + GenMetaData implementation.
+    metadata_kwargs = dict(
+        num_heads_q=N1,
+        num_heads_kv=N2,
+        head_dim=D,
+        cu_seqlens_q=case["cu_seqlens_q"] if layout_q == "TND" else None,
+        cu_seqlens_ori_kv=None,
+        cu_seqlens_cmp_kv=None,
+        seqused_q=None,
+        seqused_kv=case["seqused_kv"],
+        batch_size=B,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_kv=max_seqlen_kv,
+        ori_mask_mode=cfg["ori_mask_mode"],
+        ori_win_left=cfg["ori_win_left"],
+        ori_win_right=cfg["ori_win_right"],
+        layout_q=layout_q,
+        layout_kv="PA_ND",
+        has_ori_kv=has_ori_kv,
+        has_cmp_kv=has_cmp_kv,
+    )
+    if scenario >= 2:
+        metadata_kwargs["cmp_ratio"] = cfg["cmp_ratio"]
+        metadata_kwargs["cmp_mask_mode"] = cfg["cmp_mask_mode"]
+    if scenario == 3:
+        metadata_kwargs["cmp_topk"] = K
+    metadata_tensor = metadata_fn(**metadata_kwargs)
+    assert metadata_tensor.dtype == torch.int32
+    assert metadata_tensor.numel() == 1024  # SAS_META_SIZE
+
+    # ---- Step 2: Call sparse_attn_sharedkv with metadata in tow. ----
+    with torch.device("npu"):
+        out = sparse_attn_sharedkv_fn(
+            _dev(case["q"]),
+            ori_kv=_dev(case["ori_pa"]),
+            cmp_kv=_dev(case["cmp_pa"]),
+            cmp_sparse_indices=_dev(case["cmp_idx"]),
+            ori_block_table=_dev(case["ori_bt"]),
+            cmp_block_table=_dev(case["cmp_bt"]),
+            cu_seqlens_q=cu_seqlens_q_dev,
+            seqused_kv=seqused_kv_dev,
+            sinks=_dev(case["sinks"]),
+            metadata=_dev(metadata_tensor),
+            softmax_scale=cfg["softmax_scale"],
+            cmp_ratio=cfg["cmp_ratio"] if scenario >= 2 else None,
+            ori_mask_mode=cfg["ori_mask_mode"],
+            cmp_mask_mode=cfg["cmp_mask_mode"],
+            ori_win_left=cfg["ori_win_left"],
+            ori_win_right=cfg["ori_win_right"],
+            layout_q=layout_q,
+            layout_kv="PA_ND",
+            topk_cmp=K,
+        )
+        torch.npu.synchronize()
+    return out, metadata_tensor
+
+
 @requires_npu
 @pytest.mark.parametrize(
     "case_name",
@@ -429,45 +538,123 @@ def test_sparse_attn_sharedkv(case_name, dtype):
     # Imported lazily so the CPU-only math test below can run on hosts
     # without tilelang installed.
     from api import sparse_attn_sharedkv
+    from metadata import sparse_attn_sharedkv_metadata
 
     cfg = SCENARIOS[case_name]
     # Data generation + golden run on CPU (default device).
     case = _build_case(cfg, dtype)
-
-    # Move tensors to NPU.
-    def _dev(t):
-        if t is None:
-            return None
-        return t.npu().contiguous() if hasattr(t, "npu") else t
-
-    # The kernel call (and TileLang's auto-allocated output / workspaces)
-    # must run with the NPU as the default device.
-    with torch.device("npu"):
-        out = sparse_attn_sharedkv(
-            _dev(case["q"]),
-            ori_kv=_dev(case["ori_pa"]),
-            cmp_kv=_dev(case["cmp_pa"]),
-            cmp_sparse_indices=_dev(case["cmp_idx"]),
-            ori_block_table=_dev(case["ori_bt"]),
-            cmp_block_table=_dev(case["cmp_bt"]),
-            cu_seqlens_q=_dev(case["cu_seqlens_q"])
-            if cfg["layout_q"] == "TND"
-            else None,
-            seqused_kv=_dev(case["seqused_kv"]),
-            sinks=_dev(case["sinks"]),
-            softmax_scale=cfg["softmax_scale"],
-            cmp_ratio=cfg["cmp_ratio"] if cfg["scenario"] >= 2 else None,
-            ori_mask_mode=cfg["ori_mask_mode"],
-            cmp_mask_mode=cfg["cmp_mask_mode"],
-            ori_win_left=cfg["ori_win_left"],
-            ori_win_right=cfg["ori_win_right"],
-            layout_q=cfg["layout_q"],
-            layout_kv="PA_ND",
-            topk_cmp=cfg.get("K", 0),
-        )
-        torch.npu.synchronize()
-
+    out, _ = _call_metadata_then_sharedkv(
+        case, cfg, sparse_attn_sharedkv, sparse_attn_sharedkv_metadata
+    )
     _check_result(out.cpu(), case["cpu_ref"])
+
+
+# ---- CPU-only metadata tests (no NPU required). ----
+
+
+@pytest.mark.parametrize("case_name", list(SCENARIOS.keys()))
+def test_metadata_shape_and_continuity(case_name):
+    """Validate the Python metadata port for every paramset case.
+
+    Asserts the output is INT32 of length ``SAS_META_SIZE = 1024`` and
+    that the assigned AIC cores form a contiguous chain ``(bn2_start,
+    m_start, s2_start) == (prev.bn2_end, prev.m_end, prev.s2_end)``
+    -- the invariant the Ascend C scheduler maintains.
+    """
+    from metadata import (
+        sparse_attn_sharedkv_metadata,
+        SAS_META_SIZE,
+        AIC_CORE_NUM,
+        FA_METADATA_SIZE,
+    )
+
+    cfg = SCENARIOS[case_name]
+    scenario = cfg["scenario"]
+    layout_q = cfg["layout_q"]
+    max_seqlen_kv = int(max(cfg["seqused_kv"]))
+
+    kwargs = dict(
+        num_heads_q=cfg["N1"],
+        num_heads_kv=cfg["N2"],
+        head_dim=cfg["D"],
+        cu_seqlens_q=torch.tensor(cfg["cu_seqlens_q"], dtype=torch.int32)
+        if layout_q == "TND"
+        else None,
+        seqused_kv=torch.tensor(cfg["seqused_kv"], dtype=torch.int32),
+        batch_size=cfg["B"],
+        max_seqlen_q=cfg.get("T1") if layout_q == "TND" else cfg["S1"],
+        max_seqlen_kv=max_seqlen_kv,
+        ori_mask_mode=cfg["ori_mask_mode"],
+        ori_win_left=cfg["ori_win_left"],
+        ori_win_right=cfg["ori_win_right"],
+        layout_q=layout_q,
+        layout_kv="PA_ND",
+        has_ori_kv=True,
+        has_cmp_kv=scenario >= 2,
+    )
+    if scenario >= 2:
+        kwargs["cmp_ratio"] = cfg["cmp_ratio"]
+        kwargs["cmp_mask_mode"] = cfg["cmp_mask_mode"]
+    if scenario == 3:
+        kwargs["cmp_topk"] = cfg["K"]
+
+    md = sparse_attn_sharedkv_metadata(**kwargs)
+    assert md.dtype == torch.int32
+    assert md.shape == (SAS_META_SIZE,)
+
+    fa = md[: AIC_CORE_NUM * FA_METADATA_SIZE].view(AIC_CORE_NUM, FA_METADATA_SIZE)
+    enable = fa[:, 0].tolist()
+    n_used = sum(enable)
+    assert n_used >= 1, "at least one AIC core must be enabled"
+
+    # Continuity: each enabled core resumes where its predecessor stopped.
+    used = fa[fa[:, 0] == 1]
+    prev_bn2, prev_m, prev_s2 = 0, 0, 0
+    for row in used.tolist():
+        _, bn2s, ms, s2s, bn2e, me, s2e, _ = row
+        assert (bn2s, ms, s2s) == (prev_bn2, prev_m, prev_s2), (
+            f"core resume mismatch in {case_name}: "
+            f"got ({bn2s},{ms},{s2s}), expected ({prev_bn2},{prev_m},{prev_s2})"
+        )
+        prev_bn2, prev_m, prev_s2 = bn2e, me, s2e
+
+    # The last enabled core finishes the batch (next-batch boundary OR
+    # the actual tail of the only batch).
+    if scenario >= 1:
+        assert prev_bn2 in (cfg["B"] * cfg["N2"], 0), (
+            f"last core end bn2 should be batch*kvhead or zero, got {prev_bn2}"
+        )
+
+
+def test_metadata_prefill_uses_many_cores():
+    """The 8192-token prefill case must spread across all 24 AICs."""
+    from metadata import sparse_attn_sharedkv_metadata, AIC_CORE_NUM, FA_METADATA_SIZE
+
+    cfg = SCENARIOS["scfa_prefill"]
+    md = sparse_attn_sharedkv_metadata(
+        num_heads_q=cfg["N1"],
+        num_heads_kv=cfg["N2"],
+        head_dim=cfg["D"],
+        cu_seqlens_q=torch.tensor(cfg["cu_seqlens_q"], dtype=torch.int32),
+        seqused_kv=torch.tensor(cfg["seqused_kv"], dtype=torch.int32),
+        batch_size=cfg["B"],
+        max_seqlen_q=cfg["T1"],
+        max_seqlen_kv=int(max(cfg["seqused_kv"])),
+        cmp_topk=cfg["K"],
+        cmp_ratio=cfg["cmp_ratio"],
+        ori_mask_mode=cfg["ori_mask_mode"],
+        cmp_mask_mode=cfg["cmp_mask_mode"],
+        ori_win_left=cfg["ori_win_left"],
+        ori_win_right=cfg["ori_win_right"],
+        layout_q=cfg["layout_q"],
+        layout_kv="PA_ND",
+    )
+    fa = md[: AIC_CORE_NUM * FA_METADATA_SIZE].view(AIC_CORE_NUM, FA_METADATA_SIZE)
+    n_used = int(fa[:, 0].sum())
+    # The aicpu default is aic_core_num=24; prefill workload (S1=8192,
+    # S2=8192, mBaseSize=64 → 8192 S1G rows) is huge so every core is
+    # used. Decode-sized cases fit on a single core via AssignByBatch.
+    assert n_used == 24, f"expected 24 AIC cores used, got {n_used}"
 
 
 # ---- Math-only test: golden vs single-shot softmax (no NPU required). ----

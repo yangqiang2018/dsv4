@@ -129,8 +129,10 @@ def sparse_attn_sharedkv(
     ori_block_table: torch.Tensor,
     cmp_block_table: Optional[torch.Tensor] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
     seqused_kv: torch.Tensor,
     sinks: torch.Tensor,
+    metadata: Optional[torch.Tensor] = None,
     softmax_scale: float,
     cmp_ratio: Optional[int] = None,
     ori_mask_mode: int = 4,
@@ -149,7 +151,18 @@ def sparse_attn_sharedkv(
     * ``cmp_kv=None, cmp_sparse_indices=None`` → SWA (scenario 1).
     * ``cmp_kv=<tensor>, cmp_sparse_indices=None`` → CFA (scenario 2).
     * ``cmp_kv=<tensor>, cmp_sparse_indices=<tensor>`` → SCFA (scenario 3).
+
+    ``metadata`` matches the contract of the Ascend C
+    ``SparseAttnSharedkv`` op: it is the output of the companion
+    ``SparseAttnSharedkvMetadata`` op (see :mod:`metadata`) and carries
+    the per-core FA / FD task ranges. The TileLang kernel runs its own
+    ``T.Kernel`` dispatch and does not consume ``metadata`` for
+    scheduling -- the argument exists for API parity so the test flow
+    can call the metadata + sharedkv ops together, mirroring the
+    Ascend C reference (`sparse_attn_sharedkv_process.py`). ``seqused_q``
+    is likewise accepted for API parity but unused by the kernel.
     """
+    del metadata, seqused_q  # API-parity placeholders; kernel does not consume them
     assert ori_mask_mode == 4, "only ori_mask_mode=4 supported"
     assert cmp_mask_mode == 3 or cmp_kv is None, "only cmp_mask_mode=3 supported"
     assert ori_win_right == 0, "only ori_win_right=0 supported"

@@ -24,11 +24,55 @@ precision (verified by `test_golden_math_matches_single_shot_softmax`).
 ```
 kernel.py    TileLang prim_func + JIT builder
 api.py       High-level Python entry: layout dispatch, scenario routing
+metadata.py  Python port of the companion SparseAttnSharedkvMetadata
+             aicpu kernel (load-balancing scheduler + GenMetaData),
+             called alongside sharedkv to mirror the Ascend C flow
 golden.py    Python (CPU) golden reference + paged-KV data generators
 test_sparse_attn_sharedkv.py
-             pytest suite; CPU golden math test + NPU end-to-end cases
+             pytest suite; CPU golden math test, metadata sanity
+             checks, and NPU end-to-end cases (metadata + sharedkv)
 README.md    this file
 ```
+
+## metadata + sharedkv pairing
+
+The Ascend C operator ships as **two ops** -- ``SparseAttnSharedkv``
+plus the companion ``SparseAttnSharedkvMetadata``. The metadata op
+runs on the AI CPU and returns a per-AIC FA task table + per-AIV FD
+reduction table; the sharedkv kernel reads it to know which slice of
+``(batch, head, S1G_block, S2_block)`` work to execute.
+
+The TileLang port mirrors the same call shape:
+
+```python
+from metadata import sparse_attn_sharedkv_metadata
+from api import sparse_attn_sharedkv
+
+md = sparse_attn_sharedkv_metadata(
+    num_heads_q=64, num_heads_kv=1, head_dim=512,
+    cu_seqlens_q=cu_seqlens_q, seqused_kv=seqused_kv,
+    batch_size=B, max_seqlen_q=T1, max_seqlen_kv=max(seqused_kv_list),
+    cmp_topk=512, cmp_ratio=4,
+    ori_mask_mode=4, cmp_mask_mode=3,
+    ori_win_left=127, ori_win_right=0,
+    layout_q="TND", layout_kv="PA_ND",
+)
+out = sparse_attn_sharedkv(q, ..., metadata=md, ...)
+```
+
+``metadata.py`` is a faithful Python port of
+``sparse_attn_sharedkv_metadata_aicpu.cpp``: same ``BalanceSchedule``
+algorithm (``AssignByBatch`` → ``AssignByRow`` → ``AssignByBlock``,
+``supportFd=False`` default that matches the upstream source), same
+``GenMetaData`` packing into a flat ``int32[1024]`` tensor laid out as
+``faMetadata[36][8] || fdMetadata[72][8]``.
+
+The TileLang ``sparse_attn_sharedkv`` kernel does its own
+``T.Kernel(core_num)`` dispatch and does not consume ``metadata`` for
+scheduling -- the parameter is accepted purely for API parity so the
+test flow can be 1:1 with the Ascend C reference suite (`ops-
+transformer/.../sparse_attn_sharedkv/tests/pytest/batch/
+sparse_attn_sharedkv_process.py`).
 
 ## Quick start
 
