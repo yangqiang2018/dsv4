@@ -605,6 +605,116 @@ def test_sparse_attn_sharedkv(case_name, dtype):
     _check_lse(lse.cpu(), case["cpu_ref_lse"], dtype)
 
 
+@requires_npu
+def test_api_return_type():
+    """Cover the ``return_softmax_lse`` branch in :mod:`api`.
+
+    The end-to-end tests above hard-code ``return_softmax_lse=True`` to
+    validate the lse value, which means the ``return out`` (single
+    tensor) branch in ``api.sparse_attn_sharedkv`` is never exercised
+    by the numerical-correctness suite. This test calls the api both
+    ways on the cheapest case (``swa_decode``, S1=1, no cmp pass) and
+    asserts the contract:
+
+    * ``return_softmax_lse=False`` → returns a single ``torch.Tensor``
+    * ``return_softmax_lse=True``  → returns a ``(Tensor, Tensor)`` pair
+      where the second element is fp32 and shaped ``[T1, N1]``
+      (TND-only here).
+
+    Numerical accuracy is already covered by ``test_sparse_attn_sharedkv``;
+    this test only checks the api wrapper's branch logic so a future
+    refactor that swaps the two branches gets caught.
+    """
+    from api import sparse_attn_sharedkv
+    from metadata import sparse_attn_sharedkv_metadata
+
+    cfg = SCENARIOS["swa_decode"]
+    dtype = torch.bfloat16
+    case = _build_case(cfg, dtype)
+
+    def _dev(t):
+        return t.npu().contiguous() if t is not None and hasattr(t, "npu") else t
+
+    metadata_tensor = sparse_attn_sharedkv_metadata(
+        num_heads_q=cfg["N1"],
+        num_heads_kv=cfg["N2"],
+        head_dim=cfg["D"],
+        cu_seqlens_q=case["cu_seqlens_q"],
+        seqused_kv=case["seqused_kv"],
+        batch_size=cfg["B"],
+        max_seqlen_q=cfg["T1"],
+        max_seqlen_kv=int(max(cfg["seqused_kv"])),
+        ori_mask_mode=cfg["ori_mask_mode"],
+        ori_win_left=cfg["ori_win_left"],
+        ori_win_right=cfg["ori_win_right"],
+        layout_q="TND",
+        layout_kv="PA_ND",
+        has_ori_kv=True,
+        has_cmp_kv=False,
+    )
+
+    common_kwargs = dict(
+        ori_kv=_dev(case["ori_pa"]),
+        ori_block_table=_dev(case["ori_bt"]),
+        cu_seqlens_q=_dev(case["cu_seqlens_q"]),
+        seqused_kv=_dev(case["seqused_kv"]),
+        sinks=_dev(case["sinks"]),
+        metadata=_dev(metadata_tensor),
+        softmax_scale=cfg["softmax_scale"],
+        ori_mask_mode=cfg["ori_mask_mode"],
+        cmp_mask_mode=cfg["cmp_mask_mode"],
+        ori_win_left=cfg["ori_win_left"],
+        ori_win_right=cfg["ori_win_right"],
+        layout_q="TND",
+        layout_kv="PA_ND",
+        topk_cmp=0,
+    )
+
+    with torch.device("npu"):
+        # Branch 1: return_softmax_lse=False -> single tensor.
+        result_no_lse = sparse_attn_sharedkv(
+            _dev(case["q"]),
+            return_softmax_lse=False,
+            **common_kwargs,
+        )
+        torch.npu.synchronize()
+        # Branch 2: return_softmax_lse=True -> (Tensor, Tensor) pair.
+        result_with_lse = sparse_attn_sharedkv(
+            _dev(case["q"]),
+            return_softmax_lse=True,
+            **common_kwargs,
+        )
+        torch.npu.synchronize()
+
+    # Branch 1 assertions.
+    assert isinstance(result_no_lse, torch.Tensor), (
+        f"return_softmax_lse=False must return a Tensor, got {type(result_no_lse)}"
+    )
+    assert result_no_lse.shape == (cfg["T1"], cfg["N1"], cfg["D"])
+    assert result_no_lse.dtype == dtype
+
+    # Branch 2 assertions.
+    assert isinstance(result_with_lse, tuple), (
+        f"return_softmax_lse=True must return a tuple, got {type(result_with_lse)}"
+    )
+    assert len(result_with_lse) == 2, (
+        f"tuple must have 2 elements (out, lse), got {len(result_with_lse)}"
+    )
+    out, lse = result_with_lse
+    assert isinstance(out, torch.Tensor) and isinstance(lse, torch.Tensor)
+    assert out.shape == (cfg["T1"], cfg["N1"], cfg["D"])
+    assert out.dtype == dtype
+    # lse is always fp32 regardless of q dtype.
+    assert lse.shape == (cfg["T1"], cfg["N1"]), (
+        f"lse shape must be [T1, N1]={(cfg['T1'], cfg['N1'])} for TND, got {tuple(lse.shape)}"
+    )
+    assert lse.dtype == torch.float32, f"lse dtype must be fp32, got {lse.dtype}"
+
+    # The two branches must produce the same attn_out (modulo nondeterminism
+    # there isn't any here: same kernel, same inputs).
+    torch.testing.assert_close(out.cpu(), result_no_lse.cpu())
+
+
 # ---- CPU-only metadata tests (no NPU required). ----
 
 
