@@ -389,7 +389,7 @@
   <h2 id="s2"><span class="num">2</span>老办法为什么浪费：给每个人预留一整层楼</h2>
   <p>最直觉的存法是：<strong>给每条序列开一块「连续的大数组」</strong>，而且大小要按「<strong>最长可能的长度</strong>」来开。</p>
   <p>为什么非要连续、非要按最长开？因为老式的注意力代码喜欢「一口气把这条序列的所有 K 读进来」，连续摆放才好一把抓；而它<strong>事先不知道这条序列最终会多长</strong>，只能按最坏情况预留。这就像一家酒店的蠢规矩：</p>
-  <blockquote><p><strong>每来一位客人，不管他住几晚，先把一整层楼（按最长可能住的天数）划给他。</strong></p></blockquote>
+  <blockquote><p><strong>每来一位客人，无论他实际只要几间房，前台都把一整层楼整个包给他一个人——别人一间都不能用。</strong></p></blockquote>
 
   <figure>
     <div class="figcard">
@@ -402,17 +402,18 @@
             <div class="room empty"></div><div class="room empty"></div><div class="room empty"></div>
             <div class="room empty"></div><div class="room empty"></div>
           </div>
-          <p style="font-size:13px;color:#64748b;margin:10px 0 0">客人只住 3 晚，却占着按 10 晚预留的一整层楼，其余 7 间一直空着也不给别人用。<br>→ 序列只有 100 词，却占着按 2000 词预留的空间。</p>
+          <p style="font-size:13px;color:#64748b;margin:10px 0 0">一层楼共 <strong>10 间房</strong>。这位客人其实只要 <strong>3 间</strong>，却被整层包走——剩下的 <strong>7 间</strong>（10 − 3 = 7）一直空着，也不分给别人。<br>→ 对应 KV Cache：序列只有 100 个词，却占着按 2000 个词（最长可能）预留的空间。</p>
         </div>
         <div class="floor">
           <h4>② 楼与楼夹缝 · <span class="badwaste">外部碎片</span></h4>
           <div class="rooms">
-            <div class="room used"></div><div class="room empty"></div><div class="room used"></div>
-            <div class="room empty"></div><div class="room used"></div>
-            <div class="room empty"></div><div class="room used"></div><div class="room empty"></div>
+            <div class="room used"></div><div class="room used"></div><div class="room used"></div>
+            <div class="room empty"></div><div class="room empty"></div>
+            <div class="room used"></div><div class="room used"></div>
+            <div class="room empty"></div>
             <div class="room used"></div><div class="room empty"></div>
           </div>
-          <p style="font-size:13px;color:#64748b;margin:10px 0 0">退房入住反复发生，空房东一块西一块。单看总空房不少，但<strong>没有一整层连续的</strong>能给新客人 → 只能拒之门外。</p>
+          <p style="font-size:13px;color:#64748b;margin:10px 0 0">不同客人各占一段楼层，退房后空出一段段<strong>长短不一</strong>的区域，零散分布。新客人要的是<strong>一整段连续</strong>的空间——总空房虽不少，却拼不出连续的一段 → 只能拒之门外。</p>
         </div>
       </div>
     </div>
