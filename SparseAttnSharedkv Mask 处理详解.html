@@ -1,0 +1,983 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SparseAttnSharedkv 的 Mask 处理详解</title>
+<style>
+  :root{
+    --bg:#f7f7f4; --panel:#ffffff; --ink:#1f2328; --muted:#5b6470;
+    --line:#e3e6ea; --accent:#2f6fea; --accent-soft:#eaf1ff;
+    --blue:#3b82f6; --blue-bg:#dbeafe; --blue-ink:#1e40af;
+    --green:#10b981; --green-bg:#d1fae5; --green-ink:#065f46;
+    --amber:#f59e0b; --amber-bg:#fef3c7; --amber-ink:#92400e;
+    --purple:#8b5cf6; --purple-bg:#ede9fe; --purple-ink:#5b21b6;
+    --red:#ef4444; --red-bg:#fef2f2; --red-ink:#b91c1c;
+    --gray:#9ca3af; --gray-bg:#eceef1; --gray-ink:#4b5563;
+    --code-bg:#f4f6f8; --code-ink:#1c2733;
+    --radius:12px;
+    --mono:"SF Mono","JetBrains Mono","Fira Code",Consolas,"Cascadia Code",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:var(--sans); font-size:16.5px; line-height:1.85;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:880px; margin:0 auto; padding:0 22px 120px;}
+
+  /* ---- header ---- */
+  header.hero{ max-width:880px; margin:0 auto; padding:54px 22px 26px; }
+  .kicker{
+    display:inline-block; font-size:12.5px; letter-spacing:.16em; font-weight:700;
+    color:var(--accent); background:var(--accent-soft); padding:5px 12px; border-radius:999px;
+    text-transform:uppercase; margin-bottom:18px;
+  }
+  h1{font-size:38px; line-height:1.22; margin:.1em 0 .35em; letter-spacing:-.01em;}
+  .sub{color:var(--muted); font-size:16px; margin:0;}
+
+  /* ---- typography ---- */
+  h2{
+    font-size:25px; margin:64px 0 18px; padding-top:16px; letter-spacing:-.01em;
+    border-top:2px solid var(--line);
+  }
+  h2 .num{color:var(--accent); font-variant-numeric:tabular-nums; margin-right:.45em;}
+  h3{font-size:19px; margin:34px 0 12px; color:#2b3340;}
+  p{margin:14px 0;}
+  a{color:var(--accent); text-decoration:none;}
+  a:hover{text-decoration:underline;}
+  strong{font-weight:700; color:#16324f;}
+  ul,ol{margin:14px 0; padding-left:1.4em;}
+  li{margin:7px 0;}
+  hr{border:none; border-top:1px solid var(--line); margin:40px 0;}
+
+  code{
+    font-family:var(--mono); font-size:.88em; background:var(--code-bg);
+    color:#b3344a; padding:2px 6px; border-radius:6px; border:1px solid #e7e2e4;
+  }
+  pre{
+    background:#0f1b2d; color:#dbe7f3; border-radius:var(--radius);
+    padding:18px 20px; overflow:auto; font-family:var(--mono); font-size:13.5px;
+    line-height:1.7; margin:18px 0; border:1px solid #0a1320;
+    box-shadow:0 1px 0 rgba(0,0,0,.04);
+  }
+  pre code{background:none; color:inherit; border:none; padding:0; font-size:inherit;}
+  pre .cmt{color:#7d93ad;} pre .hl{color:#ffd479;} pre .ok{color:#7ee0a1;}
+  pre .kw{color:#c792ea;} pre .fn{color:#82aaff;} pre .no{color:#ff9eb0;}
+
+  blockquote{
+    margin:18px 0; padding:14px 18px; background:var(--panel);
+    border-left:4px solid var(--accent); border-radius:0 10px 10px 0;
+    color:#33414f; box-shadow:0 1px 2px rgba(20,40,80,.05);
+  }
+  blockquote p:first-child{margin-top:0}
+  blockquote p:last-child{margin-bottom:0}
+
+  .note{
+    margin:18px 0; padding:16px 18px; background:var(--accent-soft);
+    border:1px solid #d4e2ff; border-radius:var(--radius); font-size:15px; color:#2b4a73;
+  }
+  .note p{margin:6px 0}
+  .note code{background:#fff;}
+  .warn{
+    margin:18px 0; padding:14px 18px; background:var(--amber-bg);
+    border:1px solid #f3d27a; border-radius:var(--radius); font-size:15px; color:#7a4d09;
+  }
+  .warn code{background:#fff;}
+  .key{
+    margin:18px 0; padding:16px 18px; background:var(--green-bg);
+    border:1px solid #86efac; border-radius:var(--radius); font-size:15px; color:#075f46;
+  }
+  .key code{background:#fff;}
+  .key b{color:#064e3b;}
+
+  /* tables */
+  .tablewrap{overflow-x:auto; margin:18px 0;}
+  table{border-collapse:collapse; width:100%; font-size:14.5px; background:var(--panel);
+    border-radius:10px; overflow:hidden; box-shadow:0 1px 2px rgba(20,40,80,.05);}
+  th,td{padding:10px 14px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top;}
+  th{background:#eef2f7; font-weight:700; color:#2b3340;}
+  tr:last-child td{border-bottom:none;}
+  td code,th code{font-size:.85em;}
+  .hl-row td{background:#fffaf0;}
+  .num-cell{font-family:var(--mono); font-variant-numeric:tabular-nums;}
+
+  /* TOC */
+  nav.toc{
+    background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+    padding:18px 24px; margin:30px 0;
+  }
+  nav.toc h2{border:none; margin:0 0 10px; padding:0; font-size:16px; color:var(--muted);
+    letter-spacing:.04em; text-transform:uppercase;}
+  nav.toc ol{margin:0; padding-left:1.5em; columns:2; column-gap:34px;}
+  nav.toc li{margin:5px 0; break-inside:avoid;}
+  nav.toc a{color:#33414f;}
+  nav.toc .ix{color:var(--accent); font-weight:700; font-variant-numeric:tabular-nums;}
+
+  /* figures */
+  figure{margin:26px 0; padding:0;}
+  figure svg{display:block; width:100%; height:auto;}
+  .figcard{
+    background:var(--panel); border:1px solid var(--line); border-radius:14px;
+    padding:22px; box-shadow:0 2px 10px rgba(20,40,80,.05);
+  }
+  figcaption{font-size:13.5px; color:var(--muted); text-align:center; margin-top:12px;}
+  .figtitle{margin:0 0 14px; font-size:14.5px; font-weight:700; color:#334155; text-align:center;}
+
+  /* equations */
+  .eqwrap{display:flex; justify-content:center; margin:22px 0;}
+  .eq{font-family:var(--mono); font-size:16.5px; display:inline-flex; align-items:center;
+      gap:.45em; flex-wrap:wrap; justify-content:center; background:var(--panel);
+      border:1px solid var(--line); border-radius:12px; padding:16px 22px;
+      box-shadow:0 1px 2px rgba(20,40,80,.05); color:#22303f;}
+  .frac{display:inline-flex; flex-direction:column; text-align:center; vertical-align:middle; margin:0 .12em;}
+  .frac>.n{padding:0 .6em .25em;}
+  .frac>.d{padding:.25em .6em 0; border-top:2px solid currentColor;}
+  .eq .op{color:var(--muted); padding:0 .12em;}
+  .t-blue{color:var(--blue-ink);} .t-amber{color:var(--amber-ink);}
+  .t-green{color:var(--green-ink);} .t-purple{color:var(--purple-ink);} .t-red{color:var(--red-ink);}
+
+  /* ===== token-cell grids (the core mask visuals) ===== */
+  .legend{display:flex; gap:20px; flex-wrap:wrap; justify-content:center; margin:16px 0 6px; font-size:13px; color:#475569;}
+  .legend span{display:inline-flex; align-items:center; gap:7px;}
+  .swatch{width:17px; height:17px; border-radius:5px; border:1.5px solid; flex:none;}
+  .sw-ok{background:#ecfdf5; border-color:#6ee7b7;}
+  .sw-no{background:#fef2f2; border-color:#fca5a5;}
+  .sw-sink{background:#faf5ff; border-color:#d8b4fe;}
+  .sw-fut{background:#f1f5f9; border-color:#cbd5e1;}
+
+  .chunks{display:flex; gap:16px; flex-wrap:wrap; justify-content:center; margin:16px 0;}
+  .chunk{border:1.5px solid var(--line); border-radius:13px; padding:12px 14px 14px; background:#fbfcfe;}
+  .chunk .clab{font-size:12px; font-weight:700; color:#64748b; text-align:center; margin-bottom:10px; letter-spacing:.02em;}
+  .toks{display:flex; gap:7px;}
+  .tok{width:50px; border-radius:9px; border:1.5px solid; padding:8px 0 6px; text-align:center; font-family:var(--mono); line-height:1.25;}
+  .tok .ti{font-size:16px; font-weight:700;}
+  .tok .tm{font-size:10px; font-family:var(--sans); margin-top:4px; opacity:.85;}
+  .tok.ok{background:#ecfdf5; border-color:#6ee7b7; color:#065f46;}
+  .tok.no{background:#fef2f2; border-color:#fca5a5; color:#b91c1c;}
+  .tok.sink{background:#faf5ff; border-color:#d8b4fe; color:#7c3aed;}
+  .tok.fut{background:#f1f5f9; border-color:#cbd5e1; color:#64748b;}
+
+  /* small inline pills */
+  .pass{font-family:var(--mono); font-size:12px; padding:2px 9px; border-radius:999px; font-weight:700;}
+  .pass.ori{background:var(--amber-bg); color:var(--amber-ink);}
+  .pass.cmp{background:var(--blue-bg); color:var(--blue-ink);}
+
+  /* step trace cards */
+  .trace{display:flex; flex-direction:column; gap:0; margin:14px 0;}
+  .tstep{background:var(--panel); border:1px solid var(--line); border-radius:11px; padding:12px 16px;
+        box-shadow:0 1px 2px rgba(20,40,80,.05);}
+  .tstep .th{font-weight:700; font-size:13.5px; color:#2b3340; display:flex; gap:9px; align-items:center; flex-wrap:wrap;}
+  .tstep .tx{font-family:var(--mono); font-size:13px; color:#3a4654; margin-top:7px; line-height:1.75;}
+  .tstep .tx .res{color:#0b6b3a; font-weight:700;}
+  .tstep .tx .bad{color:#b91c1c; font-weight:700;}
+  .stepnum{font-family:var(--mono); font-size:12px; background:#e2e8f0; color:#475569; border-radius:6px; padding:1px 8px; font-weight:700;}
+  .tarrow{display:flex; align-items:center; justify-content:center; color:#cbd5e1; font-size:14px; margin:5px 0;}
+
+  /* side nav */
+  .sidenav{display:none;}
+  @media (min-width:1180px){
+    .sidenav{
+      display:block; position:fixed; top:0; left:0; width:268px; height:100vh;
+      overflow-y:auto; padding:30px 16px 48px; box-sizing:border-box;
+      background:#fbfbf8; border-right:1px solid var(--line);
+    }
+    .sidenav .snav-title{
+      margin:0 0 14px; padding-left:12px; font-size:12px; font-weight:700;
+      letter-spacing:.14em; text-transform:uppercase; color:var(--muted);
+    }
+    .sidenav ol{list-style:none; margin:0; padding:0;}
+    .sidenav li{margin:1px 0;}
+    .sidenav a{
+      display:flex; gap:9px; align-items:baseline; padding:6px 11px;
+      border-radius:8px; border-left:2px solid transparent;
+      color:#475461; font-size:13.5px; line-height:1.45;
+    }
+    .sidenav a .n{color:var(--accent); font-weight:700; font-variant-numeric:tabular-nums; min-width:16px; text-align:right;}
+    .sidenav a:hover{background:var(--accent-soft); text-decoration:none;}
+    nav.toc{display:none;}
+    header.hero{margin-left:max(304px, calc((100% - 880px)/2)); margin-right:auto;}
+    .wrap{margin-left:max(304px, calc((100% - 880px)/2)); margin-right:auto;}
+  }
+
+  .totop{
+    position:fixed; right:22px; bottom:22px; width:44px; height:44px; border-radius:50%;
+    background:var(--accent); color:#fff; display:flex; align-items:center; justify-content:center;
+    font-size:20px; box-shadow:0 4px 14px rgba(47,111,234,.4); opacity:.92; z-index:50;
+  }
+  .totop:hover{text-decoration:none; opacity:1;}
+
+  @media (max-width:640px){
+    body{font-size:16px;}
+    h1{font-size:29px;}
+    nav.toc ol{columns:1;}
+    .tok{width:42px;}
+  }
+</style>
+</head>
+<body>
+<a id="top"></a>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+  <marker id="ar" markerWidth="10" markerHeight="10" refX="7.5" refY="3" orient="auto">
+    <path d="M0,0 L7.5,3 L0,6 Z" fill="#2f6fea"/>
+  </marker>
+  <marker id="arg" markerWidth="10" markerHeight="10" refX="7.5" refY="3" orient="auto">
+    <path d="M0,0 L7.5,3 L0,6 Z" fill="#9ca3af"/>
+  </marker>
+  <marker id="arr" markerWidth="10" markerHeight="10" refX="7.5" refY="3" orient="auto">
+    <path d="M0,0 L7.5,3 L0,6 Z" fill="#ef4444"/>
+  </marker>
+</defs></svg>
+
+<aside class="sidenav" aria-label="目录">
+  <p class="snav-title">目录</p>
+  <ol>
+    <li><a href="#s0"><span class="n">0</span><span>先说人话：mask 是什么</span></a></li>
+    <li><a href="#s1"><span class="n">1</span><span>贯穿全文的小例子</span></a></li>
+    <li><a href="#s2"><span class="n">2</span><span>mask 的本质 = 加 −∞</span></a></li>
+    <li><a href="#s3"><span class="n">3</span><span>滑窗因果 mask（ori）</span></a></li>
+    <li><a href="#s4"><span class="n">4</span><span>压缩稀疏 mask（cmp）</span></a></li>
+    <li><a href="#s5"><span class="n">5</span><span>双重保险：gather 也填 0</span></a></li>
+    <li><a href="#s6"><span class="n">6</span><span>s_global 的玄机</span></a></li>
+    <li><a href="#s7"><span class="n">7</span><span>永不被 mask 的 sink</span></a></li>
+    <li><a href="#s8"><span class="n">8</span><span>拼出完整的「能看名单」</span></a></li>
+    <li><a href="#s9"><span class="n">9</span><span>原理对回代码</span></a></li>
+    <li><a href="#s10"><span class="n">10</span><span>一页速查 + 总结</span></a></li>
+  </ol>
+</aside>
+
+<header class="hero">
+  <span class="kicker">注意力算子 · Mask</span>
+  <h1>SparseAttnSharedkv 的 Mask 处理详解</h1>
+  <p class="sub">这个 TileLang 算子是怎么决定「当前这个词能看见哪些词、不能看见哪些词」的 —— 用一个小例子从头讲到尾，高中生也能读懂</p>
+</header>
+
+<div class="wrap">
+
+  <div class="note">
+    <p><strong>本文配套代码：</strong><a href="sparse_attn_sharedkv_tilelang/kernel.py">sparse_attn_sharedkv_tilelang/kernel.py</a>，重点是 <code>T.Scope("V")</code> 段里第 393–550 行构建并施加 mask 的部分。</p>
+    <p><strong>目标读者：没学过神经网络的高中生。</strong>你只需要会这几样：</p>
+    <ul style="margin:4px 0">
+      <li>加减乘除、比大小（<code>≤</code>、<code>&lt;</code>）、求最大值；</li>
+      <li>知道指数函数 <code>exp(x)</code>（也写作 <code>eˣ</code>）：<code>x</code> 越大它越大，且永远是正数；特别地 <code>exp(−∞) = 0</code>；</li>
+      <li>知道「整数除法」<code>//</code>：例如 <code>5 // 2 = 2</code>（只取商、丢掉余数）。</li>
+    </ul>
+    <p>全文用<strong>同一个小例子</strong>贯穿，每一步都能拿计算器自己验算。涉及在线 softmax 的细节可参考姊妹篇 <a href="OnlineSoftmax 原理详解.html">《Online Softmax 原理详解》</a>。</p>
+  </div>
+
+  <nav class="toc">
+    <h2>目录</h2>
+    <ol start="0">
+      <li><span class="ix">0.</span> <a href="#s0">先说人话：mask 到底是什么、为什么需要它</a></li>
+      <li><span class="ix">1.</span> <a href="#s1">立一个贯穿全文的小例子</a></li>
+      <li><span class="ix">2.</span> <a href="#s2">mask 的本质：给分数加 −∞</a></li>
+      <li><span class="ix">3.</span> <a href="#s3">第一种 mask：滑动窗口的因果遮挡（ori pass）</a></li>
+      <li><span class="ix">4.</span> <a href="#s4">第二种 mask：压缩稀疏的双重遮挡（cmp pass）</a></li>
+      <li><span class="ix">5.</span> <a href="#s5">双重保险：搬数据时也按 mask 填 0</a></li>
+      <li><span class="ix">6.</span> <a href="#s6">s_global 的玄机：query 比 kv 短怎么办</a></li>
+      <li><span class="ix">7.</span> <a href="#s7">永远不被 mask 的虚拟 token：sink</a></li>
+      <li><span class="ix">8.</span> <a href="#s8">把所有块拼起来：当前 query 的完整「能看名单」</a></li>
+      <li><span class="ix">9.</span> <a href="#s9">原理对回代码：kernel.py 行号映射</a></li>
+      <li><span class="ix">10.</span> <a href="#s10">一页速查 + 总结</a></li>
+    </ol>
+  </nav>
+
+  <!-- ===================== 0 ===================== -->
+  <h2 id="s0"><span class="num">0</span>先说人话：mask 到底是什么、为什么需要它</h2>
+
+  <p>想象你在读一个句子，读到第 6 个字（我们叫它 <strong>query</strong>，"提问的人"）。模型要做的事是：让这个字去「看」句子里的其他字（这些字叫 <strong>key</strong>，"被看的人"），算出<strong>它该多关注每一个字</strong>，再据此把信息汇总起来。</p>
+
+  <p>但不是每个字都<strong>允许</strong>被看。比如：</p>
+  <ul>
+    <li><strong>不能看未来。</strong>读到第 6 个字时，第 7、8 个字还没出现，偷看就作弊了（这叫<strong>因果 causal</strong> 限制）。</li>
+    <li><strong>不能看不存在的东西。</strong>有些位置只是为了凑整数而留的空位（占位符），里面没有真东西。</li>
+    <li><strong>只看该看的。</strong>这个算子很「省」，只让 query 看<strong>最近的一小段</strong>，外加<strong>远处被特意挑出来的几个</strong>。其余一律不看。</li>
+  </ul>
+
+  <blockquote><p><strong>Mask（掩码）</strong>就是这样一张「<strong>能看 / 不能看</strong>」的名单。它对每一个 key 给一个标记：<span class="t-green">✓ 能看</span> 或 <span class="t-red">✗ 不能看</span>。算子的任务，就是<strong>正确地造出这张名单，并让"不能看"的 key 对结果毫无影响</strong>。</p></blockquote>
+
+  <figure>
+    <div class="figcard">
+      <p class="figtitle">一张图看懂 mask：query 去看一排 key，有的允许、有的被挡住</p>
+      <svg viewBox="0 0 840 250" role="img" aria-label="query 看一排 key，部分被 mask 挡住">
+        <!-- query -->
+        <rect x="24" y="96" width="120" height="58" rx="12" fill="#ede9fe" stroke="#8b5cf6" stroke-width="1.5"/>
+        <text x="84" y="120" text-anchor="middle" font-size="13" font-weight="700" fill="#5b21b6">query</text>
+        <text x="84" y="140" text-anchor="middle" font-size="11.5" fill="#7c3aed">当前这个词</text>
+        <!-- keys row -->
+        <g font-family="var(--mono)">
+          <!-- allowed keys -->
+          <g>
+            <rect x="250" y="40" width="84" height="44" rx="9" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="1.5"/>
+            <text x="292" y="67" text-anchor="middle" font-size="13" fill="#065f46" font-weight="700">key ✓</text>
+            <rect x="250" y="98" width="84" height="44" rx="9" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="1.5"/>
+            <text x="292" y="125" text-anchor="middle" font-size="13" fill="#065f46" font-weight="700">key ✓</text>
+            <rect x="250" y="166" width="84" height="44" rx="9" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="1.5"/>
+            <text x="292" y="193" text-anchor="middle" font-size="13" fill="#065f46" font-weight="700">key ✓</text>
+          </g>
+          <!-- masked keys -->
+          <g>
+            <rect x="250" y="224" width="84" height="20" rx="6" fill="none"/>
+            <rect x="380" y="40" width="84" height="44" rx="9" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 3"/>
+            <text x="422" y="67" text-anchor="middle" font-size="13" fill="#94a3b8" font-weight="700">key ✗</text>
+            <rect x="380" y="166" width="84" height="44" rx="9" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 3"/>
+            <text x="422" y="193" text-anchor="middle" font-size="13" fill="#94a3b8" font-weight="700">key ✗</text>
+          </g>
+        </g>
+        <!-- arrows from query to allowed keys -->
+        <path d="M146,118 C200,90 210,62 248,62" fill="none" stroke="#2f6fea" stroke-width="2" marker-end="url(#ar)"/>
+        <path d="M146,124 L246,120" fill="none" stroke="#2f6fea" stroke-width="2" marker-end="url(#ar)"/>
+        <path d="M146,130 C200,158 210,186 248,188" fill="none" stroke="#2f6fea" stroke-width="2" marker-end="url(#ar)"/>
+        <!-- blocked arrows (greyed, with X) -->
+        <path d="M340,62 L378,62" fill="none" stroke="#cbd5e1" stroke-width="2" stroke-dasharray="4 3"/>
+        <text x="360" y="56" text-anchor="middle" font-size="15" fill="#ef4444" font-weight="700">✗</text>
+        <path d="M340,188 L378,188" fill="none" stroke="#cbd5e1" stroke-width="2" stroke-dasharray="4 3"/>
+        <text x="360" y="182" text-anchor="middle" font-size="15" fill="#ef4444" font-weight="700">✗</text>
+        <!-- result -->
+        <path d="M468,125 L548,125" fill="none" stroke="#2f6fea" stroke-width="2" marker-end="url(#ar)"/>
+        <rect x="556" y="92" width="168" height="66" rx="12" fill="#0f1b2d"/>
+        <text x="640" y="118" text-anchor="middle" font-size="12.5" fill="#9fb6d1">只把 ✓ 的信息</text>
+        <text x="640" y="138" text-anchor="middle" font-size="12.5" fill="#7ee0a1" font-weight="700">加权汇总成输出</text>
+        <text x="292" y="28" text-anchor="middle" font-size="12" fill="#065f46" font-weight="700">能看的 key</text>
+        <text x="422" y="28" text-anchor="middle" font-size="12" fill="#94a3b8" font-weight="700">被 mask 挡住的 key</text>
+      </svg>
+      <figcaption>Mask = 一张「能看 / 不能看」的名单。被挡住的 key（虚线）对最终输出贡献为零。</figcaption>
+    </div>
+  </figure>
+
+  <p>本文要回答的核心问题就是：<strong>这个算子怎么造出这张名单，又怎么让"✗"的 key 真正变成"零贡献"。</strong>下面先立一个小例子。</p>
+
+  <!-- ===================== 1 ===================== -->
+  <h2 id="s1"><span class="num">1</span>立一个贯穿全文的小例子</h2>
+
+  <p>真实算子里的数字很大（一次看 64 个 token、每个 token 是 512 维向量、有 64 个"注意力头"）—— 这些大数字不影响 mask 的<strong>逻辑</strong>，只会让手算变难。所以本文把它们<strong>等比例缩小</strong>成能用手算的小数字；逻辑和真实代码<strong>一模一样</strong>。</p>
+
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>参数</th><th>含义（人话）</th><th>本文小例子</th><th>真实算子</th></tr></thead>
+    <tbody>
+      <tr><td class="num-cell">BI</td><td>一次处理多少个 key（"一块"的大小）</td><td class="num-cell">4</td><td class="num-cell">64</td></tr>
+      <tr><td class="num-cell">ori_win_left</td><td>滑动窗口往左能看多远</td><td class="num-cell">7</td><td class="num-cell">127</td></tr>
+      <tr class="hl-row"><td class="num-cell">窗口大小</td><td>= win_left + 1（含自己）</td><td class="num-cell">8</td><td class="num-cell">128</td></tr>
+      <tr><td class="num-cell">NI_ori</td><td>窗口要分成几块 = ⌈窗口/BI⌉</td><td class="num-cell">2</td><td class="num-cell">2</td></tr>
+      <tr><td class="num-cell">cmp_ratio</td><td>多少个原始 token 压缩成 1 个</td><td class="num-cell">2</td><td class="num-cell">4</td></tr>
+      <tr><td class="num-cell">topk (K)</td><td>远处最多挑几个压缩 token 来看</td><td class="num-cell">8</td><td class="num-cell">512</td></tr>
+      <tr><td class="num-cell">NI_cmp</td><td>这些压缩 token 分成几块 = K/BI</td><td class="num-cell">2</td><td class="num-cell">8</td></tr>
+      <tr><td class="num-cell">act_kv</td><td>这一条序列实际有多少个原始 token</td><td class="num-cell">8</td><td>因输入而定</td></tr>
+      <tr><td class="num-cell">act_q</td><td>这次要算多少个 query</td><td class="num-cell">8</td><td>因输入而定</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="note"><p><strong>为什么可以忽略"头"和"512 维"？</strong>因为 mask 只跟<strong>位置</strong>有关（第几个 query 看第几个 key），<strong>对所有 64 个头、所有 512 维都一模一样</strong>。所以代码只造<strong>一份</strong>长度为 BI 的 mask，然后套用到所有头上。本文只盯着位置，头和维度先放一边。</p></div>
+
+  <h3>例子的舞台：8 个原始 token，4 个压缩 token，聚光灯打在位置 5 的 query 上</h3>
+
+  <p>这条序列有 <strong>8 个原始 token</strong>，位置编号 0~7。把每 <code>cmp_ratio = 2</code> 个原始 token 打包"压缩"成 1 个，就得到 <strong>4 个压缩 token</strong>（编号 0~3）：压缩 token 0 概括原始 [0,1]，压缩 token 1 概括 [2,3]，依此类推。</p>
+
+  <p>我们全程盯着<strong>位置 5 的那个 query</strong>（记 <code>s = 5</code>）。它是一个还在句子<strong>中间</strong>的词 —— 这样才能同时看到「因为是中间，所以右边有东西要遮」的效果。</p>
+
+  <figure>
+    <div class="figcard">
+      <p class="figtitle">例子全景：原始序列、压缩序列，以及聚光灯下的 query（位置 5）</p>
+      <svg viewBox="0 0 840 322" role="img" aria-label="8个原始token与4个压缩token，query在位置5">
+        <!-- query marker -->
+        <g>
+          <path d="M300,18 l13,0 0,16 -6.5,8 -6.5,-8 z" fill="#8b5cf6"/>
+          <text x="306" y="14" text-anchor="middle" font-size="12.5" font-weight="700" fill="#5b21b6">query 在位置 5（s=5）</text>
+        </g>
+        <line x1="306" y1="42" x2="306" y2="70" stroke="#8b5cf6" stroke-width="2" stroke-dasharray="3 3"/>
+
+        <!-- original tokens row -->
+        <text x="40" y="64" font-size="12.5" font-weight="700" fill="#475569">原始 token</text>
+        <g font-family="var(--mono)" font-size="15" font-weight="700" text-anchor="middle">
+          <!-- 0..5 visible (past+self), 6..7 future -->
+          <g>
+            <rect x="40"  y="74" width="44" height="44" rx="9" fill="#ecfdf5" stroke="#6ee7b7"/><text x="62"  y="102" fill="#065f46">0</text>
+            <rect x="92"  y="74" width="44" height="44" rx="9" fill="#ecfdf5" stroke="#6ee7b7"/><text x="114" y="102" fill="#065f46">1</text>
+            <rect x="144" y="74" width="44" height="44" rx="9" fill="#ecfdf5" stroke="#6ee7b7"/><text x="166" y="102" fill="#065f46">2</text>
+            <rect x="196" y="74" width="44" height="44" rx="9" fill="#ecfdf5" stroke="#6ee7b7"/><text x="218" y="102" fill="#065f46">3</text>
+            <rect x="248" y="74" width="44" height="44" rx="9" fill="#ecfdf5" stroke="#6ee7b7"/><text x="270" y="102" fill="#065f46">4</text>
+            <rect x="300" y="74" width="44" height="44" rx="9" fill="#d8f5e6" stroke="#10b981" stroke-width="2.5"/><text x="322" y="102" fill="#065f46">5</text>
+          </g>
+          <g>
+            <rect x="352" y="74" width="44" height="44" rx="9" fill="#f1f5f9" stroke="#cbd5e1" stroke-dasharray="4 3"/><text x="374" y="102" fill="#94a3b8">6</text>
+            <rect x="404" y="74" width="44" height="44" rx="9" fill="#f1f5f9" stroke="#cbd5e1" stroke-dasharray="4 3"/><text x="426" y="102" fill="#94a3b8">7</text>
+          </g>
+        </g>
+        <text x="270" y="138" text-anchor="middle" font-size="11" fill="#065f46">← 位置 0–5：已出现（可看）</text>
+        <text x="400" y="138" text-anchor="middle" font-size="11" fill="#94a3b8">6–7：未来（不可看）</text>
+
+        <!-- bracket from original to compressed -->
+        <g stroke="#94a3b8" stroke-width="1.2" fill="none">
+          <path d="M40,158 L40,166 L136,166 L136,158"/>
+          <path d="M144,158 L144,166 L240,166 L240,158"/>
+          <path d="M248,158 L248,166 L344,166 L344,158"/>
+          <path d="M352,158 L352,166 L448,166 L448,158"/>
+        </g>
+        <text x="88"  y="182" text-anchor="middle" font-size="10.5" fill="#94a3b8">压缩→</text>
+
+        <!-- compressed tokens row -->
+        <text x="40" y="214" font-size="12.5" font-weight="700" fill="#475569">压缩 token</text>
+        <g font-family="var(--mono)" font-size="15" font-weight="700" text-anchor="middle">
+          <rect x="40"  y="224" width="96" height="44" rx="9" fill="#dbeafe" stroke="#3b82f6"/><text x="88"  y="252" fill="#1e40af">c0</text>
+          <rect x="144" y="224" width="96" height="44" rx="9" fill="#dbeafe" stroke="#3b82f6"/><text x="192" y="252" fill="#1e40af">c1</text>
+          <rect x="248" y="224" width="96" height="44" rx="9" fill="#dbeafe" stroke="#3b82f6"/><text x="296" y="252" fill="#1e40af">c2</text>
+          <rect x="352" y="224" width="96" height="44" rx="9" fill="#f1f5f9" stroke="#cbd5e1" stroke-dasharray="4 3"/><text x="400" y="252" fill="#94a3b8">c3</text>
+        </g>
+        <text x="88"  y="286" text-anchor="middle" font-size="10" fill="#1e40af">概括 0,1</text>
+        <text x="192" y="286" text-anchor="middle" font-size="10" fill="#1e40af">概括 2,3</text>
+        <text x="296" y="286" text-anchor="middle" font-size="10" fill="#1e40af">概括 4,5</text>
+        <text x="400" y="286" text-anchor="middle" font-size="10" fill="#94a3b8">概括 6,7（未来）</text>
+
+        <!-- right side explanation -->
+        <g>
+          <rect x="500" y="74" width="300" height="194" rx="12" fill="#f8fafc" stroke="#e2e8f0"/>
+          <text x="520" y="100" font-size="13" font-weight="700" fill="#334155">这个 query（位置 5）该看谁？</text>
+          <text x="520" y="128" font-size="12.5" fill="#475569">①「近处」：滑动窗口里</text>
+          <text x="536" y="148" font-size="12.5" fill="#92400e">最近 8 个原始 token</text>
+          <text x="520" y="176" font-size="12.5" fill="#475569">②「远处」：被挑出来的</text>
+          <text x="536" y="196" font-size="12.5" fill="#1e40af">几个压缩 token</text>
+          <text x="520" y="226" font-size="12.5" fill="#475569">③ 都<strong>不能</strong>越过位置 5</text>
+          <text x="536" y="246" font-size="12.5" fill="#b91c1c">（不能偷看未来 6、7）</text>
+        </g>
+      </svg>
+      <figcaption>位置 6、7 是这个 query 的「未来」，必须被遮住。注意：压缩 token c3 正好概括了未来的 6、7 —— 等会儿你会看到，两套 mask 在这件事上<strong>完全一致</strong>。</figcaption>
+    </div>
+  </figure>
+
+  <p>这个算子对每个 query 分<strong>两趟（pass）</strong>来看 key：</p>
+  <ul>
+    <li><span class="pass ori">ori pass</span> <strong>滑动窗口</strong>：看最近的一段原始 token（窗口大小 8，分 2 块）。负责"近处细节"。</li>
+    <li><span class="pass cmp">cmp pass</span> <strong>压缩稀疏</strong>：看远处被挑出来的压缩 token（最多 8 个，分 2 块）。负责"远处大意"。</li>
+  </ul>
+  <p>两趟各有自己的 mask 规则。我们先讲清楚「mask 是怎么起作用的」这件公共机制，再分别看两趟。</p>
+
+  <!-- ===================== 2 ===================== -->
+  <h2 id="s2"><span class="num">2</span>mask 的本质：给分数加 −∞</h2>
+
+  <p>query 看每个 key，会先算出一个<strong>分数</strong>（score），分数越高表示"越该关注"。之后这些分数会过一道叫 <strong>softmax</strong> 的工序，变成一组加起来等于 1 的<strong>权重</strong>。softmax 的关键一步是对每个分数取 <code>exp</code>（指数）：</p>
+
+  <div class="eqwrap"><div class="eq">权重<span class="op">∝</span>exp(分数)<span class="op">，</span>且<span class="op"></span>exp(−∞)<span class="op">=</span><span class="t-red">0</span></div></div>
+
+  <p>这就给了我们一个<strong>极其干净</strong>的遮挡办法：</p>
+
+  <div class="key">
+    <p><b>要遮住一个 key，就在它的分数上加一个 <code>−∞</code>（负无穷）。</b></p>
+    <ul style="margin:6px 0">
+      <li>能看的 key：分数 <code>+ 0</code> → 分数不变 → 权重正常。</li>
+      <li>被遮的 key：分数 <code>+ (−∞)</code> → 变成 <code>−∞</code> → <code>exp(−∞) = 0</code> → <strong>权重正好是 0</strong>，对结果毫无影响。</li>
+    </ul>
+    <p>这叫 <strong>additive mask（加性掩码）</strong>。妙处在于：不管那个 key 的原始分数多高，加上 <code>−∞</code> 后权重一定归零，<strong>干净利落、没有例外</strong>。</p>
+  </div>
+
+  <figure>
+    <div class="figcard">
+      <p class="figtitle">同一道分数，加 0 还是加 −∞，命运截然不同</p>
+      <svg viewBox="0 0 840 250" role="img" aria-label="additive mask 机制：加0保留，加负无穷归零">
+        <!-- top lane: keep -->
+        <text x="30" y="58" font-size="13" font-weight="700" fill="#065f46">能看的 key</text>
+        <rect x="150" y="36" width="92" height="40" rx="9" fill="#eef2f7" stroke="#94a3b8"/>
+        <text x="196" y="61" text-anchor="middle" font-family="var(--mono)" font-size="14" fill="#475569">分数 3.0</text>
+        <text x="270" y="50" text-anchor="middle" font-size="13" fill="#065f46" font-weight="700">+ 0</text>
+        <path d="M250,57 L300,57" stroke="#2f6fea" stroke-width="2" marker-end="url(#ar)"/>
+        <rect x="308" y="36" width="92" height="40" rx="9" fill="#ecfdf5" stroke="#6ee7b7"/>
+        <text x="354" y="61" text-anchor="middle" font-family="var(--mono)" font-size="14" fill="#065f46">3.0</text>
+        <text x="428" y="50" text-anchor="middle" font-size="13" fill="#475569" font-weight="700">exp</text>
+        <path d="M408,57 L460,57" stroke="#2f6fea" stroke-width="2" marker-end="url(#ar)"/>
+        <rect x="468" y="36" width="104" height="40" rx="9" fill="#ecfdf5" stroke="#6ee7b7"/>
+        <text x="520" y="61" text-anchor="middle" font-family="var(--mono)" font-size="14" fill="#065f46">≈ 20.1</text>
+        <path d="M580,57 L632,57" stroke="#2f6fea" stroke-width="2" marker-end="url(#ar)"/>
+        <rect x="640" y="32" width="168" height="48" rx="10" fill="#d8f5e6" stroke="#10b981"/>
+        <text x="724" y="52" text-anchor="middle" font-size="12.5" fill="#065f46">权重</text>
+        <text x="724" y="70" text-anchor="middle" font-size="13" font-weight="700" fill="#065f46">正常参与 ✓</text>
+
+        <!-- divider -->
+        <line x1="30" y1="118" x2="810" y2="118" stroke="#e3e6ea"/>
+
+        <!-- bottom lane: mask -->
+        <text x="30" y="178" font-size="13" font-weight="700" fill="#b91c1c">被遮的 key</text>
+        <rect x="150" y="156" width="92" height="40" rx="9" fill="#eef2f7" stroke="#94a3b8"/>
+        <text x="196" y="181" text-anchor="middle" font-family="var(--mono)" font-size="14" fill="#475569">分数 3.0</text>
+        <text x="270" y="170" text-anchor="middle" font-size="13" fill="#b91c1c" font-weight="700">+(−∞)</text>
+        <path d="M250,177 L300,177" stroke="#ef4444" stroke-width="2" marker-end="url(#arr)"/>
+        <rect x="308" y="156" width="92" height="40" rx="9" fill="#fef2f2" stroke="#fca5a5"/>
+        <text x="354" y="181" text-anchor="middle" font-family="var(--mono)" font-size="14" fill="#b91c1c">−∞</text>
+        <text x="428" y="170" text-anchor="middle" font-size="13" fill="#475569" font-weight="700">exp</text>
+        <path d="M408,177 L460,177" stroke="#ef4444" stroke-width="2" marker-end="url(#arr)"/>
+        <rect x="468" y="156" width="104" height="40" rx="9" fill="#fef2f2" stroke="#fca5a5"/>
+        <text x="520" y="181" text-anchor="middle" font-family="var(--mono)" font-size="14" fill="#b91c1c">0</text>
+        <path d="M580,177 L632,177" stroke="#ef4444" stroke-width="2" marker-end="url(#arr)"/>
+        <rect x="640" y="152" width="168" height="48" rx="10" fill="#fef2f2" stroke="#fca5a5"/>
+        <text x="724" y="172" text-anchor="middle" font-size="12.5" fill="#b91c1c">权重 = 0</text>
+        <text x="724" y="190" text-anchor="middle" font-size="13" font-weight="700" fill="#b91c1c">零贡献 ✗</text>
+      </svg>
+      <figcaption>这就是全部秘密：mask 不是「删掉」key，而是把它的分数压到 −∞，让 softmax 自动把它的权重算成 0。</figcaption>
+    </div>
+  </figure>
+
+  <p>所以代码里造 mask 的套路永远是<strong>三步</strong>，后面两趟 pass 都照这个套路走：</p>
+  <ol>
+    <li><strong>判断</strong>每个 key 能不能看 → 得到一串 0/1 的标记（叫 <code>mask_ub</code>，1=能看，0=遮住）。</li>
+    <li><strong>翻译</strong>成加性掩码：能看→加 <code>0</code>，遮住→加 <code>−∞</code>（代码里用 <code>T.tile.select</code> 一步完成）。</li>
+    <li><strong>相加</strong>：把这个加性掩码加到分数上，再交给 softmax。</li>
+  </ol>
+
+  <div class="note"><p><strong>代码里的小细节：</strong>算子其实是先把加性掩码（0 / −∞）放进 <code>acc_s_ub</code>，再 <code>加上</code>原始分数、最后乘以缩放系数 <code>scale</code>。因为 <code>(−∞ + 任何数) × 正数 = −∞</code>，顺序不影响结果：被遮的位置最终还是 <code>−∞</code>。见第 513–549 行。</p></div>
+
+  <!-- ===================== 3 ===================== -->
+  <h2 id="s3"><span class="num">3</span>第一种 mask：滑动窗口的因果遮挡（ori pass）</h2>
+
+  <p><span class="pass ori">ori pass</span> 让 query 看<strong>最近的一段连续原始 token</strong>。"最近一段"就是一个长度为 8 的<strong>滑动窗口</strong>，窗口右端顶着 query 自己，左端往回数 7 个：</p>
+
+  <div class="eqwrap"><div class="eq">窗口<span class="op">=</span>[ <span class="t-amber">max(s−7, 0)</span> <span class="op">,</span> <span class="t-green">s</span> ]<span class="op">，</span>本例 s=5<span class="op">→</span>[ max(−2,0), 5 ] = [<span class="t-amber">0</span>, <span class="t-green">5</span>]</div></div>
+
+  <p>注意右端是 <code>s = 5</code>（含自己），不是 7。<strong>位置 6、7 是未来，不能看。</strong>这就是<strong>因果遮挡</strong>。</p>
+
+  <h3>关键观察：左边界天然成立，只需检查右边界</h3>
+
+  <p>窗口要分成 <code>NI_ori = 2</code> 块，每块 <code>BI = 4</code> 个。每块的起点是 <code>chunk_start = ori_left + 块号 × 4</code>，而 <code>ori_left = max(s−7,0) = 0</code>。于是：</p>
+  <ul>
+    <li>第 0 块：token <code>[0, 1, 2, 3]</code></li>
+    <li>第 1 块：token <code>[4, 5, 6, 7]</code></li>
+  </ul>
+
+  <div class="key"><p>因为每块都从 <code>ori_left</code> 往右排，所以<strong>不可能有 token 比左边界还小</strong> —— 左边界<strong>自动满足</strong>。代码因此<strong>只检查右边界一个条件</strong>：</p>
+  <div class="eqwrap" style="margin:10px 0 4px"><div class="eq">能看 <span class="op">⟺</span> token 编号 <span class="t-green">≤ s</span><span class="op">（本例 ≤ 5）</span></div></div></div>
+
+  <p>套到两块上，mask 名单是这样（绿=能看，红=被 −∞ 遮住）：</p>
+
+  <div class="legend">
+    <span><i class="swatch sw-ok"></i> ✓ 能看（加 0）</span>
+    <span><i class="swatch sw-no"></i> ✗ 被遮（加 −∞）</span>
+  </div>
+
+  <div class="chunks">
+    <div class="chunk">
+      <div class="clab">ori 第 0 块 &nbsp;chunk_start = 0</div>
+      <div class="toks">
+        <div class="tok ok"><div class="ti">0</div><div class="tm">0≤5 ✓</div></div>
+        <div class="tok ok"><div class="ti">1</div><div class="tm">1≤5 ✓</div></div>
+        <div class="tok ok"><div class="ti">2</div><div class="tm">2≤5 ✓</div></div>
+        <div class="tok ok"><div class="ti">3</div><div class="tm">3≤5 ✓</div></div>
+      </div>
+    </div>
+    <div class="chunk">
+      <div class="clab">ori 第 1 块 &nbsp;chunk_start = 4</div>
+      <div class="toks">
+        <div class="tok ok"><div class="ti">4</div><div class="tm">4≤5 ✓</div></div>
+        <div class="tok ok"><div class="ti">5</div><div class="tm">5≤5 ✓</div></div>
+        <div class="tok no"><div class="ti">6</div><div class="tm">6≤5? ✗</div></div>
+        <div class="tok no"><div class="ti">7</div><div class="tm">7≤5? ✗</div></div>
+      </div>
+    </div>
+  </div>
+
+  <p>位置 6、7 是未来，被遮住了 —— 正是我们想要的因果效果。</p>
+
+  <h3>对回代码：三个动作造出这张名单</h3>
+
+  <p>代码（第 396–407 行）用三个动作完成第 1 块的判断：</p>
+
+  <div class="trace">
+    <div class="tstep">
+      <div class="th"><span class="stepnum">动作 1</span> 生成本块的 token 编号 &nbsp;<code>T.tile.createvecindex</code></div>
+      <div class="tx">从 <code>chunk_start = 4</code> 起，自动生成一串连号：<br>idx = [<span class="res">4, 5, 6, 7</span>]</div>
+    </div>
+    <div class="tarrow">▼</div>
+    <div class="tstep">
+      <div class="th"><span class="stepnum">动作 2</span> 和右边界比大小 &nbsp;<code>T.tile.compare(..., ori_right, "LE")</code></div>
+      <div class="tx">逐个判断 <code>idx ≤ 5</code> ("LE" = less-or-equal，小于等于)：<br>
+      4≤5→<span class="res">1</span>, 5≤5→<span class="res">1</span>, 6≤5→<span class="bad">0</span>, 7≤5→<span class="bad">0</span>　得到 mask = [1,1,0,0]</div>
+    </div>
+    <div class="tarrow">▼</div>
+    <div class="tstep">
+      <div class="th"><span class="stepnum">动作 3</span> 翻译成加性掩码 &nbsp;<code>T.tile.select(mask, 0.0, −∞)</code></div>
+      <div class="tx">mask=1 的位置填 <code>0.0</code>，mask=0 的位置填 <code>−∞</code>：<br>
+      加性掩码 = [<span class="res">0</span>, <span class="res">0</span>, <span class="bad">−∞</span>, <span class="bad">−∞</span>]　→ 加到分数上，6、7 归零</div>
+    </div>
+  </div>
+
+  <pre><code><span class="cmt"># kernel.py 第 396-407 行（ori pass 的 mask）</span>
+chunk_start = ori_left + chunk * BI            <span class="cmt"># 本块第一个 token 编号</span>
+T.tile.<span class="fn">createvecindex</span>(idx_int, chunk_start)   <span class="cmt"># 动作1: idx = [4,5,6,7]</span>
+T.<span class="fn">copy</span>(idx_int, idx_float)
+T.tile.<span class="fn">compare</span>(mask_ub, idx_float,
+               T.float32(ori_right), <span class="hl">"LE"</span>)      <span class="cmt"># 动作2: idx &lt;= s ? 1 : 0</span>
+<span class="cmt"># ... 之后第 516 行用 select 把 mask 变成 0 / -inf（动作3）</span></code></pre>
+
+  <div class="note"><p><strong>窗口怎么"滑动"？</strong>换一个 query 位置，<code>s</code> 变了，窗口 <code>[max(s−7,0), s]</code> 整段跟着平移。比如 query 在位置 10：窗口 = [3,10]，看的是 token 3~10。窗口像一个固定宽度的取景框，跟着 query 一起往右滑 —— 这正是"滑动窗口 sliding window"名字的由来。只有当 query 还在<strong>句子很靠前</strong>（s &lt; 7）时，左端才会被 <code>max(...,0)</code> 顶在 0，窗口右侧才会出现"够不着、被遮住"的格子（就像本例的 6、7）。</p></div>
+
+  <!-- ===================== 4 ===================== -->
+  <h2 id="s4"><span class="num">4</span>第二种 mask：压缩稀疏的双重遮挡（cmp pass）</h2>
+
+  <p><span class="pass cmp">cmp pass</span> 负责"远处大意"。它不看原始 token，而看<strong>压缩 token</strong>：每 <code>cmp_ratio = 2</code> 个原始 token 概括成 1 个压缩 token。本例 8 个原始 → 4 个压缩（c0~c3）。</p>
+
+  <h3>4.1 压缩空间里的"不能看未来"：threshold</h3>
+
+  <p>query 在原始空间能看到位置 <code>0..5</code>。换算到压缩空间，它能看几个压缩 token？答案由一个<strong>门槛 threshold</strong> 决定：</p>
+
+  <div class="eqwrap"><div class="eq">threshold<span class="op">=</span><span class="frac"><span class="n">s + 1</span><span class="d">cmp_ratio</span></span><span class="op">（整除）</span><span class="op">=</span><span class="frac"><span class="n">5 + 1</span><span class="d">2</span></span><span class="op">=</span><span class="t-blue">3</span></div></div>
+
+  <p>意思是：<strong>压缩 token 编号 <code>&lt; 3</code> 才能看</strong>，即 c0、c1、c2 能看，c3 不能看。</p>
+
+  <div class="key"><p><b>为什么这个门槛是对的？</b>c3 概括的是原始 token 6、7 —— 正是 query 看不到的未来！所以"压缩空间 idx &lt; 3"和"原始空间不能看 6、7"<strong>说的是同一件事</strong>。两套 mask 在边界上完全咬合，绝不矛盾。</p></div>
+
+  <h3>4.2 还要防"占位符"：idx ≥ 0</h3>
+
+  <p>cmp pass 看的是"被特意挑出来的"压缩 token，编号存在一个列表 <code>cmp_indices</code> 里。但列表长度固定为 K=8，挑不满时用 <code>−1</code> 补齐（占位符，表示"这格没有真东西"）。所以还要第二个条件：<strong>编号必须 ≥ 0</strong>（≥0 才是真编号，−1 是占位符要遮掉）。</p>
+
+  <p>合起来，cmp pass 的 mask 是<strong>两个条件同时成立</strong>（逻辑 AND）：</p>
+
+  <div class="eqwrap"><div class="eq">能看 <span class="op">⟺</span> ( idx <span class="t-green">≥ 0</span> ) <span class="op">且</span> ( idx <span class="t-blue">&lt; threshold</span> )</div></div>
+
+  <h3>4.3 SCFA 场景：编号来自外部挑选的列表（演示 idx ≥ 0）</h3>
+
+  <p>在 SCFA（场景 3）里，"该看哪些压缩 token"由模型在别处算好，传进来一个列表。假设对这个 query，挑出的是 c2、c0、c1 三个，列表补齐到 8 格：</p>
+
+  <div class="eqwrap"><div class="eq">cmp_indices = [ <span class="t-green">2, 0, 1</span>, <span class="t-red">−1, −1, −1, −1, −1</span> ]</div></div>
+
+  <p>分成 2 块（每块 4 个）。注意三个真编号 2、0、1 都 <code>&lt; threshold=3</code>，所以"因果"条件全过；真正发挥作用的是"≥0"把那些 <code>−1</code> 占位符遮掉：</p>
+
+  <div class="legend">
+    <span><i class="swatch sw-ok"></i> ✓ 能看</span>
+    <span><i class="swatch sw-no"></i> ✗ 被遮（占位符 −1）</span>
+  </div>
+
+  <div class="chunks">
+    <div class="chunk">
+      <div class="clab">cmp 第 0 块（=总第 2 块）</div>
+      <div class="toks">
+        <div class="tok ok"><div class="ti">2</div><div class="tm">≥0 ✓<br>&lt;3 ✓</div></div>
+        <div class="tok ok"><div class="ti">0</div><div class="tm">≥0 ✓<br>&lt;3 ✓</div></div>
+        <div class="tok ok"><div class="ti">1</div><div class="tm">≥0 ✓<br>&lt;3 ✓</div></div>
+        <div class="tok no"><div class="ti">−1</div><div class="tm">≥0? ✗</div></div>
+      </div>
+    </div>
+    <div class="chunk">
+      <div class="clab">cmp 第 1 块（=总第 3 块）</div>
+      <div class="toks">
+        <div class="tok no"><div class="ti">−1</div><div class="tm">≥0? ✗</div></div>
+        <div class="tok no"><div class="ti">−1</div><div class="tm">≥0? ✗</div></div>
+        <div class="tok no"><div class="ti">−1</div><div class="tm">≥0? ✗</div></div>
+        <div class="tok no"><div class="ti">−1</div><div class="tm">≥0? ✗</div></div>
+      </div>
+    </div>
+  </div>
+
+  <h3>4.4 CFA 场景：编号是稠密的 0,1,2,…（演示 idx &lt; threshold）</h3>
+
+  <p>在 CFA（场景 2）里没有外部列表，算子直接用 <code>createvecindex</code> 生成<strong>稠密连号</strong> <code>0,1,2,3,…</code>，意思是"挨个看所有压缩 token"。这时"≥0"永远成立，真正发挥作用的是 <strong>threshold 因果门槛</strong>把 c3 挡掉：</p>
+
+  <div class="legend">
+    <span><i class="swatch sw-ok"></i> ✓ 能看（&lt; threshold=3）</span>
+    <span><i class="swatch sw-no"></i> ✗ 被遮（≥ threshold）</span>
+  </div>
+
+  <div class="chunks">
+    <div class="chunk">
+      <div class="clab">cmp 第 0 块（CFA 稠密编号）</div>
+      <div class="toks">
+        <div class="tok ok"><div class="ti">0</div><div class="tm">0&lt;3 ✓</div></div>
+        <div class="tok ok"><div class="ti">1</div><div class="tm">1&lt;3 ✓</div></div>
+        <div class="tok ok"><div class="ti">2</div><div class="tm">2&lt;3 ✓</div></div>
+        <div class="tok no"><div class="ti">3</div><div class="tm">3&lt;3? ✗</div></div>
+      </div>
+    </div>
+    <div class="chunk">
+      <div class="clab">cmp 第 1 块（CFA 稠密编号）</div>
+      <div class="toks">
+        <div class="tok no"><div class="ti">4</div><div class="tm">4&lt;3? ✗</div></div>
+        <div class="tok no"><div class="ti">5</div><div class="tm">5&lt;3? ✗</div></div>
+        <div class="tok no"><div class="ti">6</div><div class="tm">6&lt;3? ✗</div></div>
+        <div class="tok no"><div class="ti">7</div><div class="tm">7&lt;3? ✗</div></div>
+      </div>
+    </div>
+  </div>
+
+  <p>c3（编号 3）被门槛挡掉 —— 又一次印证：query 看不到未来的原始 6、7，也就看不到概括它们的 c3。</p>
+
+  <h3>对回代码：两次比较 + 一次 AND</h3>
+
+  <p>cmp pass 的判断比 ori 多一步（两个条件要 AND 在一起），见第 463–483 行：</p>
+
+  <div class="trace">
+    <div class="tstep">
+      <div class="th"><span class="stepnum">动作 1</span> 拿到编号</div>
+      <div class="tx">SCFA：从 <code>cmp_indices</code> 读列表 [2,0,1,−1]；&nbsp; CFA：用 <code>createvecindex</code> 生成 [0,1,2,3]</div>
+    </div>
+    <div class="tarrow">▼</div>
+    <div class="tstep">
+      <div class="th"><span class="stepnum">动作 2a</span> 第一个条件 &nbsp;<code>compare(idx, −0.5, "GT")</code></div>
+      <div class="tx">判断 <code>idx &gt; −0.5</code>（等价于 <code>idx ≥ 0</code>，整数大于 −0.5 就是 ≥0）→ 把 −1 占位符标成 0</div>
+    </div>
+    <div class="tarrow">▼</div>
+    <div class="tstep">
+      <div class="th"><span class="stepnum">动作 2b</span> 第二个条件 &nbsp;<code>compare(idx, threshold, "LT")</code></div>
+      <div class="tx">判断 <code>idx &lt; 3</code>（"LT" = less-than，小于）→ 把越过门槛的标成 0</div>
+    </div>
+    <div class="tarrow">▼</div>
+    <div class="tstep">
+      <div class="th"><span class="stepnum">动作 3</span> 两个条件取交集 &nbsp;<code>T.tile.bitwise_and</code></div>
+      <div class="tx">两个都为 1 才算"能看"：<code>mask = (idx≥0) AND (idx&lt;3)</code> → 再 <code>select</code> 成 0 / −∞</div>
+    </div>
+  </div>
+
+  <pre><code><span class="cmt"># kernel.py 第 465-483 行（cmp pass 的 mask）</span>
+<span class="cmt"># 条件1: idx >= 0（剔除 -1 占位符）</span>
+T.tile.<span class="fn">compare</span>(mask_ub,   idx_float, T.float32(-0.5),          <span class="hl">"GT"</span>)
+<span class="cmt"># 条件2: idx &lt; threshold（压缩空间的因果门槛）</span>
+T.tile.<span class="fn">compare</span>(mask_ub_2, idx_float, T.float32(cmp_threshold), <span class="hl">"LT"</span>)
+<span class="cmt"># 两个条件取 AND</span>
+T.tile.<span class="fn">bitwise_and</span>(mask_ub, mask_ub, mask_ub_2)
+<span class="cmt"># 之后同样用 select 翻译成 0 / -inf</span></code></pre>
+
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>场景</th><th>编号从哪来</th><th>主要靠哪个条件遮挡</th><th>本例被遮的</th></tr></thead>
+    <tbody>
+      <tr><td>SCFA（场景 3）</td><td>外部传入的稀疏列表（含 −1 补齐）</td><td><code>idx ≥ 0</code>（剔占位符）</td><td>5 个 −1</td></tr>
+      <tr><td>CFA（场景 2）</td><td>算子现场生成稠密 0,1,2,…</td><td><code>idx &lt; threshold</code>（因果）</td><td>c3 及之后</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="sub" style="font-size:14px">（两个条件其实<strong>都</strong>在跑，上表只是说"哪个在该场景里更显眼"。SWA-only 即场景 1 没有 cmp pass，<code>NI_cmp=0</code>，这一节整段跳过。）</p>
+
+  <!-- ===================== 5 ===================== -->
+  <h2 id="s5"><span class="num">5</span>双重保险：搬数据时也按 mask 填 0</h2>
+
+  <p>到这里 mask 的"数学"已经讲完了：被遮的 key 分数加 −∞，权重归零。但代码还多做了一件事 —— <strong>在搬运 KV 数据时，也按 mask 把非法位置填成 0</strong>。为什么要画蛇添足？因为有<strong>内存安全</strong>问题：</p>
+
+  <ul>
+    <li>一个 <code>−1</code> 占位符，如果硬要拿它当编号去内存里取数据，会读到<strong>非法地址</strong>（越界、读到垃圾，甚至崩溃）。</li>
+    <li>所以代码在取数前先看一眼：编号合法（<code>≥ 0</code>，或 ori 的 <code>≤ s</code>）才真去取；否则<strong>直接往工作区填一行 0</strong>，根本不碰内存。</li>
+  </ul>
+
+  <figure>
+    <div class="figcard">
+      <p class="figtitle">每个 key 的命运由两道关卡共同决定：搬数据这关 + 算分数这关</p>
+      <svg viewBox="0 0 840 248" role="img" aria-label="gather 填0 与 logit 加负无穷 两道保险">
+        <rect x="24" y="100" width="120" height="48" rx="11" fill="#ede9fe" stroke="#8b5cf6"/>
+        <text x="84" y="122" text-anchor="middle" font-size="12.5" fill="#5b21b6">一个 key 编号</text>
+        <text x="84" y="140" text-anchor="middle" font-size="11" fill="#7c3aed">合法？ / −1？</text>
+
+        <!-- gate A: gather -->
+        <path d="M150,114 C180,70 200,52 236,52" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arg)"/>
+        <path d="M150,134 C180,178 200,196 236,196" fill="none" stroke="#94a3b8" stroke-width="2" marker-end="url(#arg)"/>
+        <rect x="240" y="28" width="250" height="52" rx="11" fill="#f8fafc" stroke="#e2e8f0"/>
+        <text x="258" y="50" font-size="12.5" font-weight="700" fill="#334155">关卡①：搬 KV 数据（内存安全）</text>
+        <text x="258" y="69" font-size="12" fill="#065f46">合法 → 真去内存取这一行</text>
+        <rect x="240" y="170" width="250" height="52" rx="11" fill="#fef2f2" stroke="#fca5a5"/>
+        <text x="258" y="192" font-size="12.5" font-weight="700" fill="#b91c1c">非法/−1 → 不碰内存</text>
+        <text x="258" y="211" font-size="12" fill="#b91c1c">→ 直接填一行 0（安全占位）</text>
+
+        <!-- gate B: logit -->
+        <path d="M490,54 C540,70 545,96 560,110" fill="none" stroke="#2f6fea" stroke-width="2" marker-end="url(#ar)"/>
+        <path d="M490,196 C540,178 545,150 560,138" fill="none" stroke="#ef4444" stroke-width="2" marker-end="url(#arr)"/>
+        <rect x="566" y="96" width="252" height="56" rx="11" fill="#0f1b2d"/>
+        <text x="584" y="120" font-size="12.5" font-weight="700" fill="#9fb6d1">关卡②：算分数（数学正确）</text>
+        <text x="584" y="140" font-size="12" fill="#7ee0a1">合法 +0　|　非法 +(−∞)→权重 0</text>
+      </svg>
+      <figcaption>关卡①保证程序<strong>不崩</strong>（不读非法内存），关卡②保证结果<strong>不错</strong>（被遮的权重为零）。即使关卡①填了 0 行进去，关卡②的 −∞ 也会让它权重为 0，所以最终结果只由"能看"的 key 决定。</figcaption>
+    </div>
+  </figure>
+
+  <pre><code><span class="cmt"># kernel.py 第 413-428 行（ori）/ 第 489-503 行（cmp）：取数前的安全闸门</span>
+<span class="kw">if</span> g_idx &lt;= ori_right:        <span class="cmt"># ori：编号没越过当前位置才取</span>
+    ... 解析分页表，T.<span class="fn">copy</span>(真实 KV 行 → kv_ub)
+<span class="kw">else</span>:
+    T.tile.<span class="fn">fill</span>(kv_ub, <span class="no">0.0</span>)    <span class="cmt"># 否则填 0，不碰内存</span>
+
+<span class="kw">if</span> cmp_idx &gt;= 0:              <span class="cmt"># cmp：是真编号才取（-1 不取）</span>
+    ... 解析分页表，T.<span class="fn">copy</span>(真实 KV 行 → kv_ub)
+<span class="kw">else</span>:
+    T.tile.<span class="fn">fill</span>(kv_ub, <span class="no">0.0</span>)    <span class="cmt"># -1 占位符 → 填 0</span></code></pre>
+
+  <div class="key"><p><b>一句话记住：</b>mask 被执行了<strong>两遍</strong> —— 一遍在<strong>搬数据</strong>时（防止读非法内存，填 0 占位），一遍在<strong>算分数</strong>时（加 −∞ 让权重归零）。前者保平安，后者保正确。</p></div>
+
+  <!-- ===================== 6 ===================== -->
+  <h2 id="s6"><span class="num">6</span>s_global 的玄机：query 比 kv 短怎么办</h2>
+
+  <p>前面一直用 <code>s</code> 表示 query 的位置。代码里这个位置其实叫 <code>s_global</code>，它由一条公式算出：</p>
+
+  <div class="eqwrap"><div class="eq">s_global<span class="op">=</span><span class="t-blue">act_kv</span><span class="op">−</span><span class="t-amber">act_q</span><span class="op">+</span>s_i</div></div>
+
+  <p>本文的主例里 <code>act_kv = act_q = 8</code>，所以 <code>s_global = s_i</code>（位置就是序号），公式看不出名堂。但在另一种常见情形下它很关键：<strong>KV 缓存里已经有一批老 token，这次只算少数几个新 query</strong>（比如聊天时模型逐字往外蹦，叫 decode；或者分批喂入 prompt）。</p>
+
+  <p>举例：内存里已存了 <code>act_kv = 8</code> 个 token（位置 0~7），这次只来了 <code>act_q = 1</code> 个新 query（<code>s_i = 0</code>）。它其实是<strong>第 8 个</strong>词，真实位置应该是 7：</p>
+
+  <div class="eqwrap"><div class="eq">s_global = 8 − 1 + 0 = <span class="t-green">7</span><span class="op">（不是 0！）</span></div></div>
+
+  <figure>
+    <div class="figcard">
+      <p class="figtitle">新来的 query 排在老 token 队尾：s_global 把"本批序号"翻译成"全局位置"</p>
+      <svg viewBox="0 0 840 168" role="img" aria-label="act_kv与act_q偏移示意">
+        <text x="40" y="40" font-size="12.5" font-weight="700" fill="#475569">KV 里已有 8 个 token（act_kv=8）</text>
+        <g font-family="var(--mono)" font-size="13" font-weight="700" text-anchor="middle" fill="#1e40af">
+          <rect x="40"  y="52" width="42" height="40" rx="8" fill="#dbeafe" stroke="#93c5fd"/><text x="61"  y="78">0</text>
+          <rect x="88"  y="52" width="42" height="40" rx="8" fill="#dbeafe" stroke="#93c5fd"/><text x="109" y="78">1</text>
+          <rect x="136" y="52" width="42" height="40" rx="8" fill="#dbeafe" stroke="#93c5fd"/><text x="157" y="78">2</text>
+          <rect x="184" y="52" width="42" height="40" rx="8" fill="#dbeafe" stroke="#93c5fd"/><text x="205" y="78">3</text>
+          <rect x="232" y="52" width="42" height="40" rx="8" fill="#dbeafe" stroke="#93c5fd"/><text x="253" y="78">4</text>
+          <rect x="280" y="52" width="42" height="40" rx="8" fill="#dbeafe" stroke="#93c5fd"/><text x="301" y="78">5</text>
+          <rect x="328" y="52" width="42" height="40" rx="8" fill="#dbeafe" stroke="#93c5fd"/><text x="349" y="78">6</text>
+        </g>
+        <!-- new query at position 7 -->
+        <rect x="376" y="52" width="42" height="40" rx="8" fill="#d8f5e6" stroke="#10b981" stroke-width="2.5"/>
+        <text x="397" y="78" font-family="var(--mono)" font-size="13" font-weight="700" text-anchor="middle" fill="#065f46">7</text>
+        <path d="M397,30 l9,0 0,11 -4.5,6 -4.5,-6 z" fill="#10b981"/>
+        <text x="397" y="24" text-anchor="middle" font-size="11" font-weight="700" fill="#065f46">新 query</text>
+        <text x="397" y="112" text-anchor="middle" font-size="11" fill="#065f46">s_i=0 → s_global=7</text>
+
+        <!-- right text -->
+        <rect x="470" y="40" width="340" height="96" rx="11" fill="#f8fafc" stroke="#e2e8f0"/>
+        <text x="490" y="66" font-size="12.5" fill="#475569">如果直接用 s_i = 0 当位置，窗口会</text>
+        <text x="490" y="86" font-size="12.5" fill="#b91c1c">错以为自己在开头，把老 token 全遮掉。</text>
+        <text x="490" y="112" font-size="12.5" fill="#475569">用 s_global = 7，窗口正确覆盖</text>
+        <text x="490" y="132" font-size="12.5" fill="#065f46">[max(7−7,0), 7] = [0,7]，看全 8 个。</text>
+      </svg>
+      <figcaption>有了 s_global，无论这次喂进来几个 query，因果窗口和门槛都按"它在整条序列里的真实位置"来算 —— mask 逻辑对 prefill / decode / 分批 全部通用。</figcaption>
+    </div>
+  </figure>
+
+  <p>所以前面所有用到 <code>s</code> 的地方（窗口右端、threshold），严格说都是 <code>s_global</code>。理解了它，你就明白为什么这套 mask 不管"一次算多少 query"都成立。</p>
+
+  <!-- ===================== 7 ===================== -->
+  <h2 id="s7"><span class="num">7</span>永远不被 mask 的虚拟 token：sink</h2>
+
+  <p>还有一个特殊的"key"叫 <strong>sink</strong>（直译"水槽/汇点"）。它不是序列里的真 token，而是一个<strong>虚拟的、永远在场、永远不被 mask</strong> 的占位 key，每个注意力头一个。它的作用是给 softmax 一个"<strong>谁都不特别想看</strong>"时的<strong>泄洪口</strong>：当所有真 key 的分数都不高时，注意力可以"倒"一部分到 sink 上，相当于一个可学习的"什么都不关注"选项。</p>
+
+  <p>实现上，sink 不走 mask 这条路，而是被<strong>当作初始状态"种"进在线 softmax</strong>里：把 <code>(行最大值, 行求和)</code> 初始化为 <code>(sink_h, 1.0)</code>，等价于"先放进去一个分数为 <code>sink_h</code>、对应 value 全为 0 的虚拟 key"。因为它的 value 是 0，所以它只改变分母（让权重总和略小于把它去掉时的值），不给输出加任何内容。</p>
+
+  <div class="note"><p>本文聚焦 mask，sink 只点到为止。它的完整推导（为什么种子是 <code>(sink, 1)</code>、怎么不影响数值）见姊妹篇 <a href="OnlineSoftmax 原理详解.html">《Online Softmax 原理详解》</a>第 6 节。对应代码在 <code>kernel.py</code> 第 382–387 行（<code>T.copy(Sinks..., m_i)</code> 把 sink 种进 <code>m_i</code>，并把 <code>sumexp</code> 填 1.0）。</p></div>
+
+  <!-- ===================== 8 ===================== -->
+  <h2 id="s8"><span class="num">8</span>把所有块拼起来：当前 query 的完整「能看名单」</h2>
+
+  <p>现在把位置 5 这个 query 的全部 4 个块拼到一起（这里 cmp 用 SCFA 列表 [2,0,1,−1,…]）。这就是它<strong>最终真正参与计算</strong>的 key 全集：</p>
+
+  <div class="legend">
+    <span><i class="swatch sw-ok"></i> ✓ 能看（加 0，参与）</span>
+    <span><i class="swatch sw-no"></i> ✗ 被遮（加 −∞，零贡献）</span>
+    <span><i class="swatch sw-sink"></i> sink（虚拟，永远在）</span>
+  </div>
+
+  <div class="chunks">
+    <div class="chunk">
+      <div class="clab"><span class="pass ori">ori</span> 第 0 块 · 原始 token</div>
+      <div class="toks">
+        <div class="tok ok"><div class="ti">0</div></div>
+        <div class="tok ok"><div class="ti">1</div></div>
+        <div class="tok ok"><div class="ti">2</div></div>
+        <div class="tok ok"><div class="ti">3</div></div>
+      </div>
+    </div>
+    <div class="chunk">
+      <div class="clab"><span class="pass ori">ori</span> 第 1 块 · 原始 token</div>
+      <div class="toks">
+        <div class="tok ok"><div class="ti">4</div></div>
+        <div class="tok ok"><div class="ti">5</div></div>
+        <div class="tok no"><div class="ti">6</div><div class="tm">未来</div></div>
+        <div class="tok no"><div class="ti">7</div><div class="tm">未来</div></div>
+      </div>
+    </div>
+  </div>
+  <div class="chunks">
+    <div class="chunk">
+      <div class="clab"><span class="pass cmp">cmp</span> 第 0 块 · 压缩 token</div>
+      <div class="toks">
+        <div class="tok ok"><div class="ti">c2</div></div>
+        <div class="tok ok"><div class="ti">c0</div></div>
+        <div class="tok ok"><div class="ti">c1</div></div>
+        <div class="tok no"><div class="ti">−1</div><div class="tm">占位</div></div>
+      </div>
+    </div>
+    <div class="chunk">
+      <div class="clab"><span class="pass cmp">cmp</span> 第 1 块 · 压缩 token</div>
+      <div class="toks">
+        <div class="tok no"><div class="ti">−1</div><div class="tm">占位</div></div>
+        <div class="tok no"><div class="ti">−1</div><div class="tm">占位</div></div>
+        <div class="tok no"><div class="ti">−1</div><div class="tm">占位</div></div>
+        <div class="tok no"><div class="ti">−1</div><div class="tm">占位</div></div>
+      </div>
+    </div>
+    <div class="chunk">
+      <div class="clab">虚拟</div>
+      <div class="toks">
+        <div class="tok sink"><div class="ti">sink</div><div class="tm">永在</div></div>
+      </div>
+    </div>
+  </div>
+
+  <p>于是这个 query 实际"看见"的，是 <strong>原始 token 0~5（近处细节）</strong> + <strong>压缩 token c0、c1、c2（远处大意）</strong> + <strong>sink（兜底）</strong>。所有被遮的格子（未来的 6、7；占位 −1）权重都是 0。softmax 只在这些"✓"上分配权重、加权汇总出输出 —— 这正是开头那张图说的事。</p>
+
+  <p>真实算子里只是把数字放大：窗口 128 个原始 token（2 块×64）+ 最多 512 个压缩 token（8 块×64）+ sink，对 64 个头同时算。<strong>判断规则一字不差</strong>。</p>
+
+  <!-- ===================== 9 ===================== -->
+  <h2 id="s9"><span class="num">9</span>原理对回代码：kernel.py 行号映射</h2>
+
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>原理（本文）</th><th>代码动作</th><th>kernel.py 行号</th></tr></thead>
+    <tbody>
+      <tr><td>算出 query 真实位置 s_global</td><td><code>s_global = act_kv − act_q + s_i</code></td><td class="num-cell">324</td></tr>
+      <tr><td>窗口右端 / 左端</td><td><code>ori_right = s_global</code>；<code>ori_left = max(s_global−127, 0)</code></td><td class="num-cell">325–330</td></tr>
+      <tr><td>压缩门槛 threshold</td><td><code>cmp_threshold = (s_global+1)//cmp_ratio</code></td><td class="num-cell">331</td></tr>
+      <tr class="hl-row"><td><b>ori：</b>生成本块编号</td><td><code>T.tile.createvecindex(idx, chunk_start)</code></td><td class="num-cell">396–399</td></tr>
+      <tr class="hl-row"><td><b>ori：</b>右边界判断 idx ≤ s</td><td><code>T.tile.compare(..., ori_right, "LE")</code></td><td class="num-cell">402–407</td></tr>
+      <tr><td>ori：取数安全闸门（否则填 0）</td><td><code>if g_idx ≤ ori_right: copy 真实KV  else: fill 0</code></td><td class="num-cell">413–428</td></tr>
+      <tr><td>cmp：编号来源（SCFA 读 / CFA 生成）</td><td><code>copy(cmp_indices...)</code> / <code>createvecindex</code></td><td class="num-cell">436–463</td></tr>
+      <tr class="hl-row"><td><b>cmp：</b>条件1 idx ≥ 0</td><td><code>T.tile.compare(..., −0.5, "GT")</code></td><td class="num-cell">466–471</td></tr>
+      <tr class="hl-row"><td><b>cmp：</b>条件2 idx &lt; threshold</td><td><code>T.tile.compare(..., cmp_threshold, "LT")</code></td><td class="num-cell">472–477</td></tr>
+      <tr class="hl-row"><td><b>cmp：</b>两条件取 AND</td><td><code>T.tile.bitwise_and(mask_ub, mask_ub, mask_ub_2)</code></td><td class="num-cell">479–483</td></tr>
+      <tr><td>cmp：取数安全闸门（否则填 0）</td><td><code>if cmp_idx ≥ 0: copy 真实KV  else: fill 0</code></td><td class="num-cell">489–503</td></tr>
+      <tr class="hl-row"><td><b>翻译成加性掩码 0 / −∞</b></td><td><code>T.tile.select(mask, 0.0, −inf)</code></td><td class="num-cell">513–522</td></tr>
+      <tr><td>把掩码加到分数、再缩放</td><td><code>add(分数+掩码)</code> → <code>mul(×scale)</code></td><td class="num-cell">530–549</td></tr>
+      <tr><td>sink 种进在线 softmax 初始状态</td><td><code>copy(Sinks→m_i)</code>；<code>fill(sumexp, 1.0)</code></td><td class="num-cell">382–387</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <!-- ===================== 10 ===================== -->
+  <h2 id="s10"><span class="num">10</span>一页速查 + 总结</h2>
+
+  <p>对每个 query（真实位置 <code>s = s_global</code>），mask 决定它能看哪些 key：</p>
+
+  <pre><code><span class="cmt"># ===== ori pass（滑动窗口·近处）：窗口 [max(s-7,0), s]，分 2 块 =====</span>
+<span class="kw">for</span> 块 <span class="kw">in</span> ori 的 2 个块:
+    生成本块编号 idx = [chunk_start, chunk_start+1, ...]
+    mask = ( idx <span class="hl">≤ s</span> )                 <span class="cmt"># 只查右边界；左边界由起点保证</span>
+
+<span class="cmt"># ===== cmp pass（压缩稀疏·远处）：阈值 threshold = (s+1)//cmp_ratio =====</span>
+<span class="kw">for</span> 块 <span class="kw">in</span> cmp 的若干块:
+    idx = 外部稀疏列表（SCFA） 或 稠密 0,1,2,...（CFA）
+    mask = ( idx <span class="hl">≥ 0</span> ) <span class="kw">and</span> ( idx <span class="hl">&lt; threshold</span> )  <span class="cmt"># 去占位符 且 不越界</span>
+
+<span class="cmt"># ===== 公共：把 mask 变成加性掩码，让被遮的权重归零 =====</span>
+加性掩码 = <span class="kw">where</span>(mask, <span class="ok">0.0</span>, <span class="no">-inf</span>)      <span class="cmt"># 能看→0，被遮→-inf</span>
+分数 = (分数 + 加性掩码) × scale            <span class="cmt"># 被遮的位置 → -inf</span>
+权重 = softmax(分数)                       <span class="cmt"># exp(-inf)=0 → 被遮零贡献</span>
+<span class="cmt"># 另：取 KV 数据时，非法编号直接填 0（内存安全，双重保险）</span>
+<span class="cmt"># 另：sink 作为永不 mask 的虚拟 key，种进 softmax 初始状态</span></code></pre>
+
+  <div class="key">
+    <p style="margin-top:0"><b>三句话总结这个算子的 mask：</b></p>
+    <ol style="margin:8px 0">
+      <li><b>本质</b>：mask = 给被遮 key 的分数加 <code>−∞</code>，靠 <code>exp(−∞)=0</code> 让它权重归零（additive mask）。规则对所有头、所有维度通用，只跟位置有关。</li>
+      <li><b>两类规则</b>：① <span class="pass ori">ori</span> 滑窗只查 <code>idx ≤ s</code>（因果，右边界）；② <span class="pass cmp">cmp</span> 压缩查 <code>idx ≥ 0</code>（去 −1 占位）<b>且</b> <code>idx &lt; threshold</code>（压缩空间因果）。两套规则在"看不到未来"这件事上完全咬合。</li>
+      <li><b>两道执行</b>：搬数据时按 mask 填 0（保不崩），算分数时加 −∞（保不错）；外加一个永不 mask 的 sink 兜底。</li>
+    </ol>
+  </div>
+
+  <p style="margin-top:34px; color:var(--muted); font-size:14.5px;">配套文件：<a href="sparse_attn_sharedkv_tilelang/kernel.py">kernel.py</a> ·
+  <a href="sparse_attn_sharedkv_tilelang/golden.py">golden.py</a>（CPU 参考实现，mask 逻辑同样可读）·
+  姊妹篇 <a href="OnlineSoftmax 原理详解.html">Online Softmax 原理详解</a> ·
+  <a href="PagedAttention 原理详解.html">PagedAttention 原理详解</a>。</p>
+
+</div>
+
+<a href="#top" class="totop" aria-label="回到顶部">↑</a>
+</body>
+</html>
