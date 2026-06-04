@@ -1,0 +1,1292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Online Softmax 原理详解</title>
+<style>
+  :root{
+    --bg:#f7f7f4; --panel:#ffffff; --ink:#1f2328; --muted:#5b6470;
+    --line:#e3e6ea; --accent:#2f6fea; --accent-soft:#eaf1ff;
+    --blue:#3b82f6; --blue-bg:#dbeafe; --blue-ink:#1e40af;
+    --green:#10b981; --green-bg:#d1fae5; --green-ink:#065f46;
+    --amber:#f59e0b; --amber-bg:#fef3c7; --amber-ink:#92400e;
+    --purple:#8b5cf6; --purple-bg:#ede9fe; --purple-ink:#5b21b6;
+    --red:#ef4444; --red-ink:#b91c1c;
+    --gray:#9ca3af; --gray-bg:#eceef1; --gray-ink:#4b5563;
+    --code-bg:#f4f6f8; --code-ink:#1c2733;
+    --radius:12px;
+    --mono:"SF Mono","JetBrains Mono","Fira Code",Consolas,"Cascadia Code",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei","Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:var(--sans); font-size:16.5px; line-height:1.85;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:880px; margin:0 auto; padding:0 22px 120px;}
+
+  /* ---- header ---- */
+  header.hero{ max-width:880px; margin:0 auto; padding:54px 22px 26px; }
+  .kicker{
+    display:inline-block; font-size:12.5px; letter-spacing:.16em; font-weight:700;
+    color:var(--accent); background:var(--accent-soft); padding:5px 12px; border-radius:999px;
+    text-transform:uppercase; margin-bottom:18px;
+  }
+  h1{font-size:38px; line-height:1.22; margin:.1em 0 .35em; letter-spacing:-.01em;}
+  .sub{color:var(--muted); font-size:16px; margin:0;}
+
+  /* ---- typography ---- */
+  h2{
+    font-size:25px; margin:64px 0 18px; padding-top:16px; letter-spacing:-.01em;
+    border-top:2px solid var(--line);
+  }
+  h2 .num{color:var(--accent); font-variant-numeric:tabular-nums; margin-right:.45em;}
+  h3{font-size:19px; margin:34px 0 12px; color:#2b3340;}
+  p{margin:14px 0;}
+  a{color:var(--accent); text-decoration:none;}
+  a:hover{text-decoration:underline;}
+  strong{font-weight:700; color:#16324f;}
+  ul,ol{margin:14px 0; padding-left:1.4em;}
+  li{margin:7px 0;}
+  hr{border:none; border-top:1px solid var(--line); margin:40px 0;}
+
+  /* inline code */
+  code{
+    font-family:var(--mono); font-size:.88em; background:var(--code-bg);
+    color:#b3344a; padding:2px 6px; border-radius:6px; border:1px solid #e7e2e4;
+  }
+  /* code blocks */
+  pre{
+    background:#0f1b2d; color:#dbe7f3; border-radius:var(--radius);
+    padding:18px 20px; overflow:auto; font-family:var(--mono); font-size:14px;
+    line-height:1.7; margin:18px 0; border:1px solid #0a1320;
+    box-shadow:0 1px 0 rgba(0,0,0,.04);
+  }
+  pre code{background:none; color:inherit; border:none; padding:0; font-size:inherit;}
+  pre .cmt{color:#7d93ad;} pre .hl{color:#ffd479;} pre .ok{color:#7ee0a1;}
+  pre .kw{color:#c792ea;} pre .fn{color:#82aaff;}
+
+  /* blockquote / callout */
+  blockquote{
+    margin:18px 0; padding:14px 18px; background:var(--panel);
+    border-left:4px solid var(--accent); border-radius:0 10px 10px 0;
+    color:#33414f; box-shadow:0 1px 2px rgba(20,40,80,.05);
+  }
+  blockquote p:first-child{margin-top:0}
+  blockquote p:last-child{margin-bottom:0}
+
+  .note{
+    margin:18px 0; padding:16px 18px; background:var(--accent-soft);
+    border:1px solid #d4e2ff; border-radius:var(--radius); font-size:15px; color:#2b4a73;
+  }
+  .note p{margin:6px 0}
+  .note code{background:#fff;}
+  .warn{
+    margin:18px 0; padding:14px 18px; background:var(--amber-bg);
+    border:1px solid #f3d27a; border-radius:var(--radius); font-size:15px; color:#7a4d09;
+  }
+  .warn code{background:#fff;}
+
+  /* tables */
+  .tablewrap{overflow-x:auto; margin:18px 0;}
+  table{border-collapse:collapse; width:100%; font-size:15px; background:var(--panel);
+    border-radius:10px; overflow:hidden; box-shadow:0 1px 2px rgba(20,40,80,.05);}
+  th,td{padding:10px 14px; text-align:left; border-bottom:1px solid var(--line); vertical-align:top;}
+  th{background:#eef2f7; font-weight:700; color:#2b3340;}
+  tr:last-child td{border-bottom:none;}
+  td code,th code{font-size:.85em;}
+  .hl-row td{background:#fffaf0;}
+  .num-cell{font-family:var(--mono); font-variant-numeric:tabular-nums;}
+
+  /* TOC */
+  nav.toc{
+    background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+    padding:18px 24px; margin:30px 0;
+  }
+  nav.toc h2{border:none; margin:0 0 10px; padding:0; font-size:16px; color:var(--muted);
+    letter-spacing:.04em; text-transform:uppercase;}
+  nav.toc ol{margin:0; padding-left:1.5em; columns:2; column-gap:34px;}
+  nav.toc li{margin:5px 0; break-inside:avoid;}
+  nav.toc a{color:#33414f;}
+  nav.toc .ix{color:var(--accent); font-weight:700; font-variant-numeric:tabular-nums;}
+
+  /* figures */
+  figure{margin:26px 0; padding:0;}
+  figure svg{display:block; width:100%; height:auto;}
+  .figcard{
+    background:var(--panel); border:1px solid var(--line); border-radius:14px;
+    padding:22px; box-shadow:0 2px 10px rgba(20,40,80,.05);
+  }
+  figcaption{font-size:13.5px; color:var(--muted); text-align:center; margin-top:12px;}
+  .fig-mono{font-family:var(--mono);}
+  .figtitle{margin:0 0 14px; font-size:14.5px; font-weight:700; color:#334155;}
+
+  /* ===== math: fractions & equations ===== */
+  .eqwrap{display:flex; justify-content:center; margin:22px 0;}
+  .eq{font-family:var(--mono); font-size:17px; display:inline-flex; align-items:center;
+      gap:.45em; flex-wrap:wrap; justify-content:center; background:var(--panel);
+      border:1px solid var(--line); border-radius:12px; padding:18px 24px;
+      box-shadow:0 1px 2px rgba(20,40,80,.05); color:#22303f;}
+  .frac{display:inline-flex; flex-direction:column; text-align:center; vertical-align:middle; margin:0 .12em;}
+  .frac>.n{padding:0 .6em .25em;}
+  .frac>.d{padding:.25em .6em 0; border-top:2px solid currentColor;}
+  .eq .op{color:var(--muted); padding:0 .12em; font-size:.95em;}
+  .eq .lab{font-family:var(--sans); font-size:11.5px; color:var(--muted); display:block; margin-top:2px;}
+  .t-blue{color:var(--blue-ink);} .t-amber{color:var(--amber-ink);} .t-green{color:var(--green-ink);} .t-purple{color:var(--purple-ink);}
+
+  /* annotated underbrace equation */
+  .annot-eq{display:flex; justify-content:center; flex-wrap:wrap; align-items:flex-start;
+      gap:.4em; font-family:var(--mono); font-size:16px; margin:8px 0 2px;}
+  .annot{display:inline-flex; flex-direction:column; align-items:center; margin:0 .15em;}
+  .annot .term{padding:2px 6px; border-radius:6px;}
+  .annot small{font-family:var(--sans); font-size:11.5px; margin-top:5px; padding-top:5px;
+      border-top:2px solid currentColor; align-self:stretch; text-align:center; line-height:1.35;}
+  .annot.blue .term{background:#eff6ff;} .annot.blue{color:var(--blue-ink);}
+  .annot.amber .term{background:#fffaf0;} .annot.amber{color:var(--amber-ink);}
+  .annot.plain{color:#22303f;}
+
+  /* ===== bar charts ===== */
+  .bars{margin:6px 0; display:flex; flex-direction:column; gap:9px;}
+  .brow{display:grid; grid-template-columns:118px 1fr 96px; align-items:center; gap:12px; font-size:14px;}
+  .brow .blab{font-family:var(--mono); color:#475569; text-align:right; line-height:1.3;}
+  .btrack{height:28px; background:#eef1f5; border-radius:7px; overflow:hidden;}
+  .bfill{height:100%; border-radius:7px; background:linear-gradient(90deg,#7db8ff,#3b82f6); min-width:2px;}
+  .bfill.win{background:linear-gradient(90deg,#fcd34d,#f59e0b);}
+  .bfill.dim{background:linear-gradient(90deg,#cbd5e1,#94a3b8);}
+  .brow .bval{font-family:var(--mono); color:#1e3a5f; font-weight:600; font-variant-numeric:tabular-nums;}
+  .bgrouplab{font-size:13px; font-weight:700; color:#475569; margin:14px 0 4px;}
+
+  /* ===== running ledger tape (the core flow) ===== */
+  .tape{display:flex; flex-direction:column; gap:0; margin:6px 0;}
+  .step{background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 18px;
+        box-shadow:0 1px 3px rgba(20,40,80,.06);}
+  .step.init{border-style:dashed; background:#fbfcfe;}
+  .step.bump{border-color:#f3d27a; box-shadow:0 0 0 3px rgba(245,158,11,.10);}
+  .shead{font-weight:700; font-size:14.5px; color:#2b3340; display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
+  .pill{font-family:var(--mono); font-size:12px; padding:2px 9px; border-radius:999px; font-weight:700;}
+  .pill.b1{background:var(--blue-bg); color:var(--blue-ink);}
+  .pill.b2{background:var(--green-bg); color:var(--green-ink);}
+  .pill.up{background:var(--amber-bg); color:var(--amber-ink);}
+  .calc{font-family:var(--mono); font-size:13.5px; color:#3a4654; margin:8px 0 2px; line-height:1.85;}
+  .calc .corr{background:#fef3c7; color:#92400e; border-radius:5px; padding:1px 5px; font-weight:700;}
+  .calc .res{color:#0b6b3a; font-weight:700;}
+  .ledger{display:flex; gap:9px; flex-wrap:wrap; margin-top:10px;}
+  .chip{font-family:var(--mono); font-size:13.5px; border-radius:9px; padding:6px 12px; border:1.5px solid; font-weight:600;}
+  .chip .k{font-weight:700; opacity:.8;}
+  .chip.m{background:#faf5ff; border-color:#d8b4fe; color:#7c3aed;}
+  .chip.d{background:#eff6ff; border-color:#93c5fd; color:#1e40af;}
+  .chip.o{background:#ecfdf5; border-color:#6ee7b7; color:#065f46;}
+  .arrowdown{display:flex; align-items:center; justify-content:center; gap:10px; color:var(--muted);
+     font-size:13px; margin:7px 0;}
+  .arrowdown::before,.arrowdown::after{content:""; height:1px; width:40px; background:var(--line);}
+  .finalbox{margin-top:12px; background:#0f1b2d; color:#dbe7f3; border-radius:12px; padding:14px 18px;
+     font-family:var(--mono); font-size:15px; text-align:center;}
+  .finalbox b{color:#7ee0a1;}
+
+  /* ===== scalar vs vector ===== */
+  .sv{display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:6px 0;}
+  .svbox{border:1.5px solid var(--line); border-radius:12px; padding:16px; background:var(--panel);}
+  .svbox h4{margin:0 0 12px; font-size:14.5px;}
+  .svrow{display:flex; align-items:center; gap:12px; margin:11px 0; font-size:14px;}
+  .svrow .nm{font-family:var(--mono); font-weight:700; width:74px;}
+  .scal{display:inline-flex; width:34px; height:34px; align-items:center; justify-content:center;
+        border-radius:8px; font-family:var(--mono); font-weight:700; font-size:13px; flex:none;}
+  .scal.m{background:#f3e8ff; color:#7c3aed; border:1.5px solid #d8b4fe;}
+  .scal.d{background:#dbeafe; color:#1e40af; border:1.5px solid #93c5fd;}
+  .scal.p{background:#e0e7ff; color:#3730a3; border:1.5px solid #a5b4fc;}
+  .vecstrip{display:flex; gap:3px; align-items:center;}
+  .vcell{width:14px; height:30px; border-radius:3px;}
+  .vcell.v{background:linear-gradient(180deg,#a7f3d0,#34d399);}
+  .vcell.o{background:linear-gradient(180deg,#fcd34d,#fbbf24);}
+  .vellip{font-family:var(--mono); color:#94a3b8; font-size:12px; padding:0 3px;}
+  .svnote{font-size:12.5px; color:var(--muted); margin-top:6px;}
+  .bcast{text-align:center; font-size:13.5px; color:#7a4d09; background:var(--amber-bg);
+     border:1px solid #f3d27a; border-radius:10px; padding:10px 14px; margin-top:14px;}
+
+  /* ===== trace flow chips (key-2) ===== */
+  .trace{display:flex; align-items:center; gap:6px; flex-wrap:wrap; justify-content:center; margin:6px 0;}
+  .tnode{background:var(--panel); border:1.5px solid var(--line); border-radius:10px; padding:9px 12px;
+     font-family:var(--mono); font-size:13px; text-align:center; line-height:1.4;}
+  .tnode b{display:block; font-size:11px; font-family:var(--sans); color:var(--muted); font-weight:700; margin-bottom:3px;}
+  .tnode .big{font-size:15px; color:#0b3d91; font-weight:700;}
+  .tarr{color:var(--accent); font-size:13px; font-family:var(--mono); white-space:nowrap;}
+  .tarr small{display:block; font-family:var(--sans); color:var(--muted); font-size:10.5px;}
+  .teq{background:#ecfdf5; border:1.5px solid #6ee7b7; color:#065f46;}
+
+  /* ===== sink mini ===== */
+  .seedrow{display:flex; gap:10px; flex-wrap:wrap; justify-content:center; margin-top:8px;}
+  .seed{border:1.5px solid; border-radius:10px; padding:9px 14px; font-family:var(--mono); font-size:13.5px; text-align:center;}
+  .seed b{display:block; font-family:var(--sans); font-size:11px; color:var(--muted); margin-bottom:3px;}
+  .seed.m{background:#faf5ff; border-color:#d8b4fe; color:#7c3aed;}
+  .seed.d{background:#eff6ff; border-color:#93c5fd; color:#1e40af;}
+  .seed.o{background:#ecfdf5; border-color:#6ee7b7; color:#065f46;}
+
+  /* compare two results */
+  .vs{display:grid; grid-template-columns:1fr auto 1fr; align-items:center; gap:14px; margin:8px 0;}
+  .vscard{border:1.5px solid var(--line); border-radius:12px; padding:14px 16px; text-align:center; background:var(--panel);}
+  .vscard .lab{font-size:12.5px; color:var(--muted); margin-bottom:6px;}
+  .vscard .val{font-family:var(--mono); font-size:22px; font-weight:700; color:#0b3d91;}
+  .vsmid{font-size:26px; color:var(--green); font-weight:700;}
+
+  .filelink{font-family:var(--mono); font-size:.86em;}
+
+  /* side nav (table of contents) */
+  .sidenav{display:none;}
+  @media (min-width:1180px){
+    .sidenav{
+      display:block; position:fixed; top:0; left:0; width:264px; height:100vh;
+      overflow-y:auto; padding:30px 16px 48px; box-sizing:border-box;
+      background:#fbfbf8; border-right:1px solid var(--line);
+    }
+    .sidenav .snav-title{
+      margin:0 0 14px; padding-left:12px; font-size:12px; font-weight:700;
+      letter-spacing:.14em; text-transform:uppercase; color:var(--muted);
+    }
+    .sidenav ol{list-style:none; margin:0; padding:0;}
+    .sidenav li{margin:1px 0;}
+    .sidenav a{
+      display:flex; gap:9px; align-items:baseline; padding:6px 11px;
+      border-radius:8px; border-left:2px solid transparent;
+      color:#475461; font-size:13.5px; line-height:1.45;
+    }
+    .sidenav a .n{color:var(--accent); font-weight:700; font-variant-numeric:tabular-nums; min-width:16px; text-align:right;}
+    .sidenav a:hover{background:var(--accent-soft); text-decoration:none;}
+    .sidenav a.active{background:var(--accent-soft); color:var(--accent); font-weight:700; border-left-color:var(--accent);}
+    nav.toc{display:none;}
+    header.hero{margin-left:max(300px, calc((100% - 880px)/2)); margin-right:auto;}
+    .wrap{margin-left:max(300px, calc((100% - 880px)/2)); margin-right:auto;}
+  }
+
+  /* back to top */
+  .totop{
+    position:fixed; right:22px; bottom:22px; width:44px; height:44px; border-radius:50%;
+    background:var(--accent); color:#fff; display:flex; align-items:center; justify-content:center;
+    font-size:20px; box-shadow:0 4px 14px rgba(47,111,234,.4); opacity:.92; z-index:50;
+  }
+  .totop:hover{text-decoration:none; opacity:1;}
+
+  @media (max-width:640px){
+    body{font-size:16px;}
+    h1{font-size:30px;}
+    nav.toc ol{columns:1;}
+    .sv{grid-template-columns:1fr;}
+    .vs{grid-template-columns:1fr;}
+    .vsmid{transform:rotate(90deg);}
+    .brow{grid-template-columns:96px 1fr 78px;}
+  }
+</style>
+</head>
+<body>
+<a id="top"></a>
+<!-- shared SVG defs (arrow marker) — resolved document-wide by every inline figure below -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+  <marker id="ar" markerWidth="10" markerHeight="10" refX="7.5" refY="3" orient="auto">
+    <path d="M0,0 L7.5,3 L0,6 Z" fill="#2f6fea"/>
+  </marker>
+</defs></svg>
+<aside class="sidenav" aria-label="目录">
+  <p class="snav-title">目录</p>
+  <ol>
+    <li><a href="#s0"><span class="n">0</span><span>这玩意儿在算什么</span></a></li>
+    <li><a href="#s1"><span class="n">1</span><span>普通 softmax</span></a></li>
+    <li><a href="#s2"><span class="n">2</span><span>exp 会爆炸 · 减最大值</span></a></li>
+    <li><a href="#s3"><span class="n">3</span><span>看不到全部 · 必须分块</span></a></li>
+    <li><a href="#s4"><span class="n">4</span><span>Online Softmax 核心</span></a></li>
+    <li><a href="#s5"><span class="n">5</span><span>加权求和 V</span></a></li>
+    <li><a href="#s6"><span class="n">6</span><span>sink 种子</span></a></li>
+    <li><a href="#s7"><span class="n">7</span><span>副产品 LSE</span></a></li>
+    <li><a href="#s8"><span class="n">8</span><span>原理对回代码</span></a></li>
+    <li><a href="#s9"><span class="n">9</span><span>速查 + 总结</span></a></li>
+  </ol>
+</aside>
+
+<header class="hero">
+  <span class="kicker">数值算法 · Softmax</span>
+  <h1>Online Softmax 原理详解</h1>
+  <p class="sub">一块一块喂数据、只用一点点内存、绝不溢出，还和「一次性全算」分毫不差 —— 高中生也能读懂</p>
+</header>
+
+<div class="wrap">
+
+  <div class="note">
+    <p><strong>本文配套代码：</strong><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py">sparse_attn_sharedkv_tilelang/kernel.py</a>
+    里 <code>T.Scope("V")</code> 段（第 380–677 行）实现的在线 softmax。</p>
+    <p><strong>目标读者：高中生也能读懂。</strong>只需要你会这几样东西：</p>
+    <ul style="margin:4px 0">
+      <li>加减乘除、求最大值、求和；</li>
+      <li>知道指数函数 <code>exp(x)</code>（也写成 <code>eˣ</code>）：<code>x</code> 越大它越大，而且永远是正数；</li>
+      <li>知道对数 <code>ln(x)</code> 是 <code>exp</code> 的反函数（<code>ln(eˣ) = x</code>）。</li>
+    </ul>
+    <p>全文用<strong>同一个小例子</strong>从头贯穿到尾，每一步都能拿计算器自己验算。</p>
+  </div>
+
+  <!-- ===================== TOC ===================== -->
+  <nav class="toc">
+    <h2>目录</h2>
+    <ol start="0">
+      <li><span class="ix">0.</span> <a href="#s0">先说人话：这玩意儿到底在算什么</a></li>
+      <li><span class="ix">1.</span> <a href="#s1">第一步：普通 softmax —— 把一堆分数变成概率</a></li>
+      <li><span class="ix">2.</span> <a href="#s2">第一个麻烦：exp 会「爆炸」—— 减最大值技巧</a></li>
+      <li><span class="ix">3.</span> <a href="#s3">第二个麻烦：一次看不到全部分数 —— 必须分块</a></li>
+      <li><span class="ix">4.</span> <a href="#s4">核心思想：Online Softmax —— 边走边修正</a></li>
+      <li><span class="ix">5.</span> <a href="#s5">注意力不止要概率，还要加权求和 V</a></li>
+      <li><span class="ix">6.</span> <a href="#s6">这个 kernel 的特别之处：sink 种子</a></li>
+      <li><span class="ix">7.</span> <a href="#s7">顺手的副产品：LSE（log-sum-exp）</a></li>
+      <li><span class="ix">8.</span> <a href="#s8">原理对回代码：kernel.py 行号映射</a></li>
+      <li><span class="ix">9.</span> <a href="#s9">一页速查：完整伪代码 + 总结</a></li>
+    </ol>
+  </nav>
+
+  <!-- ===================== 0 ===================== -->
+  <h2 id="s0"><span class="num">0</span>先说人话：这玩意儿到底在算什么</h2>
+  <p>在 Transformer 的<strong>注意力（attention）</strong>里，有这么一件事要做：</p>
+  <blockquote><p>对于当前这个词（query），去看序列里所有的「键」（key），算出<strong>它应该多关注每一个键</strong>（这是一组权重，加起来等于 1），然后按这组权重，把每个键对应的「值」（value）<strong>加权平均</strong>起来，作为输出。</p></blockquote>
+  <p>把分数变成「加起来等于 1 的权重」，用的就是 <strong>softmax</strong>。整件事用一张图就是：</p>
+
+  <figure>
+    <div class="figcard">
+      <svg viewBox="0 0 840 232" role="img" aria-label="注意力整体流程：分数→softmax→权重→加权求和V→输出">
+        <!-- stage 1: scores -->
+        <rect x="20" y="58" width="170" height="116" rx="12" fill="#eef2f7" stroke="#94a3b8"/>
+        <text x="105" y="44" text-anchor="middle" font-size="13.5" font-weight="700" fill="#334155">① 一堆分数 sᵢ</text>
+        <g font-family="var(--mono)" font-size="13" fill="#475569" text-anchor="middle">
+          <text x="105" y="86">s = [1, 3, 2,</text>
+          <text x="105" y="108">     5, 4, 0]</text>
+        </g>
+        <text x="105" y="148" text-anchor="middle" font-size="11.5" fill="#94a3b8">每个键打一个</text>
+        <text x="105" y="164" text-anchor="middle" font-size="11.5" fill="#94a3b8">「该关注多少」分</text>
+        <!-- arrow -->
+        <path d="M192,116 L236,116" stroke="#2f6fea" stroke-width="2" marker-end="url(#ar)"/>
+        <text x="214" y="104" text-anchor="middle" font-size="11.5" fill="#2f6fea" font-weight="700">softmax</text>
+        <!-- stage 2: weights -->
+        <rect x="240" y="58" width="180" height="116" rx="12" fill="#dbeafe" stroke="#3b82f6"/>
+        <text x="330" y="44" text-anchor="middle" font-size="13.5" font-weight="700" fill="#1e40af">② 一组权重 pᵢ</text>
+        <g font-family="var(--mono)" font-size="12.5" fill="#1e40af" text-anchor="middle">
+          <text x="330" y="85">p = [.01,.09,.03,</text>
+          <text x="330" y="105">      .63,.23,.00]</text>
+        </g>
+        <text x="330" y="140" text-anchor="middle" font-size="12" fill="#1e40af" font-weight="700">全部相加 = 1</text>
+        <text x="330" y="160" text-anchor="middle" font-size="11.5" fill="#3b82f6">分数高 → 权重大</text>
+        <!-- arrow -->
+        <path d="M422,116 L466,116" stroke="#2f6fea" stroke-width="2" marker-end="url(#ar)"/>
+        <text x="444" y="104" text-anchor="middle" font-size="11.5" fill="#2f6fea" font-weight="700">× Vᵢ</text>
+        <!-- stage 3: weighted sum -->
+        <rect x="470" y="58" width="180" height="116" rx="12" fill="#d1fae5" stroke="#10b981"/>
+        <text x="560" y="44" text-anchor="middle" font-size="13.5" font-weight="700" fill="#065f46">③ 加权求和值 V</text>
+        <g font-family="var(--mono)" font-size="12.5" fill="#065f46" text-anchor="middle">
+          <text x="560" y="88">Σ pᵢ · Vᵢ</text>
+        </g>
+        <text x="560" y="120" text-anchor="middle" font-size="11.5" fill="#047857">把每个键的内容 Vᵢ</text>
+        <text x="560" y="138" text-anchor="middle" font-size="11.5" fill="#047857">按权重混合起来</text>
+        <!-- arrow -->
+        <path d="M652,116 L696,116" stroke="#2f6fea" stroke-width="2" marker-end="url(#ar)"/>
+        <!-- output -->
+        <rect x="700" y="80" width="118" height="72" rx="12" fill="#fff7ed" stroke="#f59e0b"/>
+        <text x="759" y="64" text-anchor="middle" font-size="13.5" font-weight="700" fill="#92400e">④ 输出 O</text>
+        <text x="759" y="122" text-anchor="middle" font-size="15" font-family="var(--mono)" font-weight="700" fill="#92400e">一个向量</text>
+        <!-- bottom labels: the two troubles -->
+        <text x="105" y="206" text-anchor="middle" font-size="12" fill="#b91c1c" font-weight="700">⚠ 麻烦②：exp 后「又大」会溢出</text>
+        <text x="330" y="206" text-anchor="middle" font-size="12" fill="#b91c1c" font-weight="700">⚠ 麻烦①：序列「又长」放不进内存</text>
+      </svg>
+    </div>
+    <figcaption>注意力四步：分数 → softmax 变权重（Σ=1）→ 按权重混合值 V → 输出。本文专攻中间那步「分数怎么稳定地、分块地变成权重」。</figcaption>
+  </figure>
+
+  <p>听起来很简单，对吧？问题出在三个字：<strong>又长又大</strong>。</p>
+  <ul>
+    <li>序列<strong>很长</strong>（可能几千上万个键），分数一次性放不进高速内存；</li>
+    <li>分数经过 <code>exp</code> 之后<strong>很大</strong>，普通的浮点数会溢出（变成 <code>inf</code>，全盘崩溃）。</li>
+  </ul>
+  <p><strong>Online Softmax（在线 softmax）</strong> 就是为了解决这两个问题而生的算法：它让我们能<strong>一块一块地</strong>喂数据进去，<strong>只用很小的一点内存</strong>，还能<strong>完全避免溢出</strong>，最后算出的结果和「一次性全算」<strong>一模一样，不是近似</strong>。</p>
+  <p>本文就是要把这件事讲透。我们先从最朴素的 softmax 讲起。</p>
+
+  <!-- ===================== 1 ===================== -->
+  <h2 id="s1"><span class="num">1</span>第一步：普通 softmax —— 把一堆分数变成概率</h2>
+
+  <h3>1.1 公式</h3>
+  <p>给定一串分数 <code>s₁, s₂, …, sₙ</code>，softmax 把它们变成一串概率 <code>p₁, p₂, …, pₙ</code>：</p>
+
+  <div class="eqwrap">
+    <div class="eq">
+      <span>pᵢ</span><span class="op">=</span>
+      <span class="frac"><span class="n">exp(sᵢ)</span><span class="d">exp(s₁) + … + exp(sₙ)</span></span>
+    </div>
+  </div>
+
+  <p>也就是：<strong>每个分数先取 exp，再除以所有 exp 的总和</strong>。这样得到的 <code>pᵢ</code> 有两个好性质：</p>
+  <ol>
+    <li>每个都是正数（因为 <code>exp</code> 永远是正的）；</li>
+    <li>全部加起来正好等于 1（分子之和 = 分母）。</li>
+  </ol>
+  <p>所以它是一组合法的「权重 / 概率」。</p>
+
+  <h3>1.2 为什么要用 <code>exp</code>，而不是直接除？</h3>
+  <p>因为 <code>exp</code> 会<strong>放大差距</strong>：分数高的拿到的权重会<strong>多得多</strong>，分数低的几乎被忽略。这正是注意力想要的效果 —— 「重点关注最相关的那几个键」。</p>
+  <blockquote><p>直觉：<code>exp</code> 就像评委打分时的「赢者通吃」。1 分和 3 分看起来只差 2，但 <code>exp(3)/exp(1) = e² ≈ 7.4 倍</code>。</p></blockquote>
+
+  <figure>
+    <div class="figcard">
+      <p class="figtitle">同样是「1 分 vs 3 分」，exp 之后差距被狠狠拉开</p>
+      <div class="bgrouplab">原始分数（线性）—— 看起来只差 3 倍</div>
+      <div class="bars">
+        <div class="brow"><span class="blab">s = 1</span><div class="btrack"><div class="bfill dim" style="width:33%"></div></div><span class="bval">1</span></div>
+        <div class="brow"><span class="blab">s = 3</span><div class="btrack"><div class="bfill dim" style="width:100%"></div></div><span class="bval">3</span></div>
+      </div>
+      <div class="bgrouplab">取 exp 之后 —— 差距变成 7.4 倍</div>
+      <div class="bars">
+        <div class="brow"><span class="blab">exp(1)</span><div class="btrack"><div class="bfill" style="width:13.5%"></div></div><span class="bval">2.72</span></div>
+        <div class="brow"><span class="blab">exp(3)</span><div class="btrack"><div class="bfill win" style="width:100%"></div></div><span class="bval">20.09</span></div>
+      </div>
+    </div>
+    <figcaption>分数差 2（3÷1=3 倍），过 <code>exp</code> 后变成 <code>e² ≈ 7.4</code> 倍 —— 高分被进一步突出，这就是「赢者通吃」。</figcaption>
+  </figure>
+
+  <h3>1.3 贯穿全文的小例子（请记住这组数）</h3>
+  <blockquote><p>假设当前 query 对 <strong>6 个键</strong>算出来的分数（已经乘好缩放系数）是：</p></blockquote>
+
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>键编号 i</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th>6</th></tr></thead>
+    <tbody>
+      <tr><td>分数 sᵢ</td><td><strong>1</strong></td><td><strong>3</strong></td><td><strong>2</strong></td><td><strong>5</strong></td><td><strong>4</strong></td><td><strong>0</strong></td></tr>
+      <tr><td>值 Vᵢ</td><td><strong>10</strong></td><td><strong>20</strong></td><td><strong>30</strong></td><td><strong>40</strong></td><td><strong>50</strong></td><td><strong>60</strong></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>（<code>Vᵢ</code> 是每个键对应的「值」，第 5 节才会用到。先放在这里。）</p>
+
+  <p>为了方便你拿计算器验算，<strong>整篇文章只会用到下面这几个 <code>exp</code> 值</strong>（都是 e 的负整数次方）：</p>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>x</th><th>0</th><th>−1</th><th>−2</th><th>−3</th><th>−4</th><th>−5</th></tr></thead>
+    <tbody>
+      <tr><td>exp(x)</td><td class="num-cell">1</td><td class="num-cell">0.3679</td><td class="num-cell">0.1353</td><td class="num-cell">0.0498</td><td class="num-cell">0.0183</td><td class="num-cell">0.0067</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>现在用 1.1 的公式直接算这 6 个分数的 softmax（先不管溢出问题）：</p>
+  <ul>
+    <li>分子：<code>exp(1), exp(3), exp(2), exp(5), exp(4), exp(0)</code> = <code>2.7183, 20.0855, 7.3891, 148.4132, 54.5982, 1</code></li>
+    <li>分母（全部相加）= <strong>234.204</strong></li>
+  </ul>
+
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>i</th><th>sᵢ</th><th>exp(sᵢ)</th><th>pᵢ = exp(sᵢ)/234.204</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>1</td><td class="num-cell">2.7183</td><td class="num-cell">0.0116</td></tr>
+      <tr><td>2</td><td>3</td><td class="num-cell">20.0855</td><td class="num-cell">0.0858</td></tr>
+      <tr><td>3</td><td>2</td><td class="num-cell">7.3891</td><td class="num-cell">0.0316</td></tr>
+      <tr class="hl-row"><td>4</td><td>5</td><td class="num-cell">148.4132</td><td class="num-cell"><strong>0.6337</strong></td></tr>
+      <tr><td>5</td><td>4</td><td class="num-cell">54.5982</td><td class="num-cell">0.2331</td></tr>
+      <tr><td>6</td><td>0</td><td class="num-cell">1</td><td class="num-cell">0.0043</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <figure>
+    <div class="figcard">
+      <p class="figtitle">这 6 个键的最终注意力权重 —— 第 4 个键（s=5）独占 63%</p>
+      <div class="bars">
+        <div class="brow"><span class="blab">键1 · s=1</span><div class="btrack"><div class="bfill dim" style="width:1.8%"></div></div><span class="bval">0.0116</span></div>
+        <div class="brow"><span class="blab">键2 · s=3</span><div class="btrack"><div class="bfill" style="width:13.5%"></div></div><span class="bval">0.0858</span></div>
+        <div class="brow"><span class="blab">键3 · s=2</span><div class="btrack"><div class="bfill" style="width:5%"></div></div><span class="bval">0.0316</span></div>
+        <div class="brow"><span class="blab">键4 · s=5</span><div class="btrack"><div class="bfill win" style="width:100%"></div></div><span class="bval">0.6337</span></div>
+        <div class="brow"><span class="blab">键5 · s=4</span><div class="btrack"><div class="bfill" style="width:36.8%"></div></div><span class="bval">0.2331</span></div>
+        <div class="brow"><span class="blab">键6 · s=0</span><div class="btrack"><div class="bfill dim" style="width:0.7%"></div></div><span class="bval">0.0043</span></div>
+      </div>
+    </div>
+    <figcaption>分数最高的第 4 个键拿走 <strong>63%</strong> 的权重，分数最低的第 6 个键几乎为 0 —— 这就是 <code>exp</code> 放大差距的效果。6 条加起来 = 1。</figcaption>
+  </figure>
+
+  <p><strong>这 6 个概率加起来 = 1</strong>（验算：0.0116+0.0858+0.0316+0.6337+0.2331+0.0043 ≈ 1.000）。✅</p>
+  <p>到这里，「普通 softmax」讲完了。但它有两个致命问题，下面逐个拆解。</p>
+
+  <!-- ===================== 2 ===================== -->
+  <h2 id="s2"><span class="num">2</span>第一个麻烦：exp 会「爆炸」—— 减最大值技巧</h2>
+
+  <h3>2.1 问题：浮点数装不下</h3>
+  <p>我们例子里的分数最大才 5，<code>exp(5)≈148</code>，没事。但真实模型里分数可能是几十、上百。<code>exp(1000)</code> 是个天文数字，计算机的浮点数（float）<strong>根本存不下</strong>，结果会变成 <code>inf</code>（无穷大），然后 <code>inf / inf = NaN</code>（非数字），整个计算彻底报废。</p>
+
+  <figure>
+    <div class="figcard">
+      <svg viewBox="0 0 840 280" role="img" aria-label="exp 曲线爆炸示意：小分数安全，大分数溢出为 inf">
+        <!-- axes -->
+        <line x1="64" y1="248" x2="800" y2="248" stroke="#94a3b8" stroke-width="1.5"/>
+        <line x1="64" y1="248" x2="64" y2="34" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="800" y="268" text-anchor="end" font-size="12" fill="#64748b">分数 s →</text>
+        <text x="52" y="44" text-anchor="end" font-size="12" fill="#64748b">exp(s)</text>
+        <!-- x ticks -->
+        <g font-family="var(--mono)" font-size="11" fill="#64748b" text-anchor="middle">
+          <text x="170" y="266">2</text><text x="276" y="266">3</text><text x="382" y="266">4</text>
+          <text x="488" y="266">5</text><text x="594" y="266">6</text><text x="700" y="266">7</text>
+        </g>
+        <!-- exp curve (linear y, exp(6)=403 near top) -->
+        <polyline fill="none" stroke="#2f6fea" stroke-width="3"
+          points="64,247.5 170,243.4 276,238 382,221.7 488,174.4 594,48 640,-20"/>
+        <!-- safe point exp(5) -->
+        <circle cx="488" cy="174.4" r="5.5" fill="#10b981"/>
+        <text x="488" y="160" text-anchor="middle" font-size="12" fill="#065f46" font-weight="700">exp(5) = 148 ✓ 安全</text>
+        <!-- exploding zone -->
+        <text x="612" y="92" font-size="12.5" fill="#b91c1c" font-weight="700">分数再大一点，</text>
+        <text x="612" y="110" font-size="12.5" fill="#b91c1c" font-weight="700">曲线就冲出屏幕 →</text>
+        <!-- inf box -->
+        <rect x="600" y="20" width="222" height="56" rx="10" fill="#fef2f2" stroke="#ef4444"/>
+        <text x="711" y="42" text-anchor="middle" font-size="13" fill="#b91c1c" font-weight="700">exp(1000) = 💥 inf</text>
+        <text x="711" y="62" text-anchor="middle" font-size="12" fill="#b91c1c">→ inf / inf = NaN（全盘崩溃）</text>
+        <!-- note -->
+        <text x="80" y="110" font-size="12.5" fill="#64748b">float 能表示的最大数 ≈ exp(88)，</text>
+        <text x="80" y="128" font-size="12.5" fill="#64748b">分数一旦上百，exp 立刻超出量程。</text>
+      </svg>
+    </div>
+    <figcaption>exp 增长极快：<code>exp(5)</code> 才 148 还安全，但真实分数动辄上百，<code>exp</code> 会瞬间超过浮点数能存的范围，变成 <code>inf</code>。</figcaption>
+  </figure>
+
+  <h3>2.2 解法：先把每个分数都减去「最大值」</h3>
+  <p>诀窍很简单：<strong>先找出所有分数里的最大值 <code>m</code>，然后把每个分数都减去 <code>m</code></strong>，再做 softmax。</p>
+  <p>为什么可以这么做？因为 softmax 是个<strong>分数（比值）</strong>，给分子分母同时乘以同一个常数，<strong>结果完全不变</strong>。我们选的常数就是 <code>exp(−m)</code>：</p>
+
+  <div class="eqwrap">
+    <div class="eq">
+      <span>pᵢ</span><span class="op">=</span>
+      <span class="frac"><span class="n">exp(sᵢ)</span><span class="d">Σ exp(sⱼ)</span></span>
+      <span class="op">=</span>
+      <span class="frac"><span class="n">exp(sᵢ)·exp(−m)</span><span class="d">Σ exp(sⱼ)·exp(−m)</span></span>
+      <span class="op">=</span>
+      <span class="frac t-green"><span class="n">exp(sᵢ−m)</span><span class="d">Σ exp(sⱼ−m)</span></span>
+    </div>
+  </div>
+
+  <p><strong>数学上 100% 等价，一点没变。</strong> 但好处是：</p>
+  <ul>
+    <li>最大的那个分数减完变成 0，<code>exp(0)=1</code>，<strong>不会再溢出</strong>；</li>
+    <li>其它分数减完都 ≤ 0，<code>exp</code> 出来都在 0~1 之间，<strong>安全</strong>。</li>
+  </ul>
+  <p>这一招叫 <strong>「safe softmax」（数值稳定的 softmax）</strong>。换个角度看，<strong>「减最大值」其实就是把整把尺子平移，让最高分落在 0 上</strong>：</p>
+
+  <figure>
+    <div class="figcard">
+      <svg viewBox="0 0 840 250" role="img" aria-label="减最大值就是把尺子整体平移，使最大分数对齐到 0">
+        <!-- top line: original -->
+        <text x="20" y="40" font-size="13" font-weight="700" fill="#334155">原始分数（最大值 m = 5）</text>
+        <line x1="90" y1="64" x2="714" y2="64" stroke="#cbd5e1" stroke-width="1.5"/>
+        <g font-family="var(--mono)" font-size="11" fill="#94a3b8" text-anchor="middle">
+          <text x="90" y="84">0</text><text x="214" y="84">1</text><text x="338" y="84">2</text>
+          <text x="462" y="84">3</text><text x="586" y="84">4</text><text x="710" y="84">5</text>
+        </g>
+        <!-- dots at scores [1,3,2,5,4,0] -->
+        <g>
+          <circle cx="214" cy="64" r="6" fill="#3b82f6"/><text x="214" y="52" text-anchor="middle" font-size="10.5" fill="#475569">s₁=1</text>
+          <circle cx="462" cy="64" r="6" fill="#3b82f6"/><text x="462" y="52" text-anchor="middle" font-size="10.5" fill="#475569">s₂=3</text>
+          <circle cx="338" cy="64" r="6" fill="#3b82f6"/><text x="338" y="52" text-anchor="middle" font-size="10.5" fill="#475569">s₃=2</text>
+          <circle cx="710" cy="64" r="7.5" fill="#f59e0b" stroke="#92400e"/><text x="710" y="50" text-anchor="middle" font-size="10.5" fill="#92400e" font-weight="700">s₄=5 ★</text>
+          <circle cx="586" cy="64" r="6" fill="#3b82f6"/><text x="586" y="52" text-anchor="middle" font-size="10.5" fill="#475569">s₅=4</text>
+          <circle cx="90"  cy="64" r="6" fill="#3b82f6"/><text x="90"  y="52" text-anchor="middle" font-size="10.5" fill="#475569">s₆=0</text>
+        </g>
+        <!-- shift arrow -->
+        <path d="M740,64 C 790,64 790,150 740,150" fill="none" stroke="#10b981" stroke-width="2" marker-end="url(#ar)"/>
+        <text x="788" y="112" text-anchor="middle" font-size="12" fill="#065f46" font-weight="700" transform="rotate(90 788 112)">全体 − 5</text>
+        <!-- bottom line: shifted -->
+        <text x="20" y="150" font-size="13" font-weight="700" fill="#334155">减完最大值（尺子平移，最高分对齐到 0）</text>
+        <line x1="90" y1="174" x2="714" y2="174" stroke="#cbd5e1" stroke-width="1.5"/>
+        <g font-family="var(--mono)" font-size="11" fill="#94a3b8" text-anchor="middle">
+          <text x="90" y="194">−5</text><text x="214" y="194">−4</text><text x="338" y="194">−3</text>
+          <text x="462" y="194">−2</text><text x="586" y="194">−1</text><text x="710" y="194">0</text>
+        </g>
+        <!-- same x positions, relabeled; show exp under each -->
+        <g font-family="var(--mono)" font-size="10" fill="#0b6b3a" text-anchor="middle">
+          <circle cx="214" cy="174" r="6" fill="#3b82f6"/><text x="214" y="226">exp=.0183</text>
+          <circle cx="462" cy="174" r="6" fill="#3b82f6"/><text x="462" y="226">exp=.1353</text>
+          <circle cx="338" cy="174" r="6" fill="#3b82f6"/><text x="338" y="226">exp=.0498</text>
+          <circle cx="710" cy="174" r="7.5" fill="#f59e0b" stroke="#92400e"/><text x="710" y="226" font-weight="700">exp=1.000</text>
+          <circle cx="586" cy="174" r="6" fill="#3b82f6"/><text x="586" y="226">exp=.3679</text>
+          <circle cx="90"  cy="174" r="6" fill="#3b82f6"/><text x="90"  y="226">exp=.0067</text>
+        </g>
+      </svg>
+    </div>
+    <figcaption>「减最大值」= 把整把尺子向左平移，让最高分恰好落在 0。点的相对位置没变（结果不变），但所有 <code>exp</code> 都被压进 <strong>0~1</strong>，再也不会爆。</figcaption>
+  </figure>
+
+  <h3>2.3 用例子验证：减最大值后结果不变</h3>
+  <p>我们这组分数的最大值 <code>m = 5</code>。每个分数减 5：</p>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>i</th><th>sᵢ</th><th>sᵢ−5</th><th>exp(sᵢ−5)</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>1</td><td>−4</td><td class="num-cell">0.0183</td></tr>
+      <tr><td>2</td><td>3</td><td>−2</td><td class="num-cell">0.1353</td></tr>
+      <tr><td>3</td><td>2</td><td>−3</td><td class="num-cell">0.0498</td></tr>
+      <tr class="hl-row"><td>4</td><td>5</td><td>0</td><td class="num-cell">1.0000</td></tr>
+      <tr><td>5</td><td>4</td><td>−1</td><td class="num-cell">0.3679</td></tr>
+      <tr><td>6</td><td>0</td><td>−5</td><td class="num-cell">0.0067</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>新的分母 = 0.0183+0.1353+0.0498+1+0.3679+0.0067 = <strong>1.5781</strong></p>
+  <p>新的概率，比如第 4 个键：<code>1.0000 / 1.5781 = 0.6337</code> —— <strong>和第 1 节算的 0.6337 一模一样！</strong> ✅</p>
+  <blockquote><p>记住这个数：<strong>减完最大值后，分母是 1.5781</strong>。后面会反复用到。（它和原始分母 234.204 的关系是 <code>234.204 = exp(5) × 1.5781</code>，因为我们给所有项都乘了 <code>exp(−5)</code>。）</p></blockquote>
+  <p>到这里我们解决了「爆炸」。但还有第二个麻烦。</p>
+
+  <!-- ===================== 3 ===================== -->
+  <h2 id="s3"><span class="num">3</span>第二个麻烦：一次看不到全部分数 —— 必须分块</h2>
+
+  <h3>3.1 矛盾点在哪</h3>
+  <p>第 2 节的「减最大值」技巧有个隐含前提：<strong>你得先知道最大值 <code>m</code></strong>。而要知道最大值，<strong>你必须先把所有分数都看一遍</strong>。</p>
+  <p>可是在真实硬件上（比如这个 kernel 跑的昇腾 NPU），事情是这样的：</p>
+  <ul>
+    <li>序列很长，几千个键的分数<strong>一次性放不进</strong>芯片里那块又小又快的内存（UB / L1）；</li>
+    <li>所以分数是<strong>一块一块（chunk by chunk）</strong>算出来的。在 <a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py">kernel.py</a> 里，每块是 <code>block_I = 64</code> 个键（见第 126 行 <code>BI = block_I</code>，第 390 行 <code>for chunk in range(NI_total)</code> 的分块循环）。</li>
+  </ul>
+
+  <figure>
+    <div class="figcard">
+      <svg viewBox="0 0 840 250" role="img" aria-label="分块的矛盾：高速内存一次只装得下一块，但全局最大值藏在后面的块里">
+        <!-- the 6 keys split into two blocks -->
+        <g font-family="var(--mono)" font-size="13" text-anchor="middle">
+          <!-- block 1 -->
+          <rect x="40"  y="74" width="78" height="58" rx="9" fill="#dbeafe" stroke="#3b82f6"/><text x="79"  y="100" fill="#1e40af">键1</text><text x="79"  y="120" fill="#1e40af">s=1</text>
+          <rect x="126" y="74" width="78" height="58" rx="9" fill="#dbeafe" stroke="#3b82f6"/><text x="165" y="100" fill="#1e40af">键2</text><text x="165" y="120" fill="#1e40af">s=3</text>
+          <rect x="212" y="74" width="78" height="58" rx="9" fill="#dbeafe" stroke="#3b82f6"/><text x="251" y="100" fill="#1e40af">键3</text><text x="251" y="120" fill="#1e40af">s=2</text>
+          <!-- block 2 -->
+          <rect x="430" y="74" width="78" height="58" rx="9" fill="#eef2f7" stroke="#94a3b8"/><text x="469" y="100" fill="#475569">键4</text><text x="469" y="120" fill="#b91c1c" font-weight="700">s=5</text>
+          <rect x="516" y="74" width="78" height="58" rx="9" fill="#eef2f7" stroke="#94a3b8"/><text x="555" y="100" fill="#475569">键5</text><text x="555" y="120" fill="#475569">s=4</text>
+          <rect x="602" y="74" width="78" height="58" rx="9" fill="#eef2f7" stroke="#94a3b8"/><text x="641" y="100" fill="#475569">键6</text><text x="641" y="120" fill="#475569">s=0</text>
+          <text x="720" y="107" fill="#94a3b8">…更多块</text>
+        </g>
+        <!-- block brackets -->
+        <text x="165" y="58" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1e40af">第 1 块</text>
+        <text x="555" y="58" text-anchor="middle" font-size="12.5" font-weight="700" fill="#475569">第 2 块</text>
+        <!-- fast-memory window over block 1 -->
+        <rect x="30" y="64" width="270" height="78" rx="12" fill="none" stroke="#f59e0b" stroke-width="2.5" stroke-dasharray="7 5"/>
+        <text x="165" y="160" text-anchor="middle" font-size="12.5" fill="#92400e" font-weight="700">🔍 高速内存现在只装得下这一块</text>
+        <!-- pointer to s=5 -->
+        <path d="M469,138 L469,182" stroke="#ef4444" stroke-width="1.6" marker-end="url(#ar)"/>
+        <text x="469" y="200" text-anchor="middle" font-size="12" fill="#b91c1c" font-weight="700">全局最大值 m=5 藏在这</text>
+        <text x="469" y="218" text-anchor="middle" font-size="12" fill="#b91c1c">—— 可处理第 1 块时还没看到它！</text>
+      </svg>
+    </div>
+    <figcaption>真实里每块是 <code>block_I = 64</code> 个键（这里画 3 个示意）。处理第 1 块时，全局最大值（在第 2 块的 s=5）<strong>还没出现</strong>，无从减起 —— 这就是矛盾。</figcaption>
+  </figure>
+
+  <p>于是矛盾来了：</p>
+  <blockquote><p>我想减最大值（需要先看完全部），但我又只能一块一块地看（看不到全部）。</p></blockquote>
+  <p><strong>怎么办？难道每块都先存起来，等全部算完再回头处理？</strong>那样就违背了「省内存」的初衷 —— 序列一长，存不下。</p>
+
+  <h3>3.2 思路：能不能「边走边更新」？</h3>
+  <p>Online softmax 的回答是：<strong>可以！</strong></p>
+  <blockquote>
+    <p>我不存全部分数。我只在手边维护<strong>两个小账本</strong>：</p>
+    <ul style="margin:6px 0">
+      <li><code>m</code>：到目前为止<strong>见过的最大分数</strong>（running max）；</li>
+      <li><code>d</code>：到目前为止<strong>已经累加的分母</strong>（running sum，即 exp 之和）。</li>
+    </ul>
+    <p>每来一个新块，我就更新这两个账本。关键技巧是：<strong>如果新块里冒出了一个更大的最大值，我就把旧账本「修正」一下，让它和新的最大值对齐。</strong></p>
+  </blockquote>
+  <p>这个「修正」是整个算法的灵魂。下一节详细讲。</p>
+
+  <!-- ===================== 4 ===================== -->
+  <h2 id="s4"><span class="num">4</span>核心思想：Online Softmax —— 边走边修正</h2>
+
+  <h3>4.1 为什么旧账要「修正」</h3>
+  <p>打个比方 🏀：</p>
+  <blockquote><p>你在一个房间里给每个人测身高，但你只想记录<strong>「比当前最高的人矮多少」</strong>。一开始最高的是小明（180cm），你记下大家相对小明的差值。突然走进来一个 200cm 的巨人 —— 现在「最高」变了！你之前记的所有差值（相对 180）<strong>全都过时了</strong>，必须统一加上 −20（相对 200 重新算），才能和新人放在一把尺子上比较。</p></blockquote>
+
+  <figure>
+    <div class="figcard">
+      <svg viewBox="0 0 840 248" role="img" aria-label="换尺子：最大值变大后，旧账本里的每一项都要重新对齐">
+        <!-- old ruler -->
+        <text x="150" y="32" text-anchor="middle" font-size="13" font-weight="700" fill="#1e40af">旧尺子：最高 = 小明 180</text>
+        <line x1="80" y1="50" x2="80" y2="210" stroke="#3b82f6" stroke-width="2"/>
+        <line x1="72" y1="60" x2="220" y2="60" stroke="#93c5fd" stroke-width="1.5" stroke-dasharray="4 3"/>
+        <text x="226" y="64" font-size="11.5" fill="#1e40af">↤ 180（基准 0）</text>
+        <line x1="72" y1="120" x2="200" y2="120" stroke="#cbd5e1" stroke-width="1.2"/>
+        <text x="206" y="124" font-size="11.5" fill="#64748b">某人 165（差 −15）</text>
+        <line x1="72" y1="170" x2="200" y2="170" stroke="#cbd5e1" stroke-width="1.2"/>
+        <text x="206" y="174" font-size="11.5" fill="#64748b">某人 150（差 −30）</text>
+        <!-- arrow -->
+        <path d="M420,130 L500,130" stroke="#10b981" stroke-width="2.5" marker-end="url(#ar)"/>
+        <text x="460" y="116" text-anchor="middle" font-size="12" fill="#065f46" font-weight="700">巨人 200 进来</text>
+        <text x="460" y="150" text-anchor="middle" font-size="11.5" fill="#065f46">旧差值统一 −20</text>
+        <!-- new ruler -->
+        <text x="660" y="32" text-anchor="middle" font-size="13" font-weight="700" fill="#92400e">新尺子：最高 = 巨人 200</text>
+        <line x1="590" y1="40" x2="590" y2="210" stroke="#f59e0b" stroke-width="2"/>
+        <line x1="582" y1="50" x2="730" y2="50" stroke="#fbbf24" stroke-width="1.5" stroke-dasharray="4 3"/>
+        <text x="736" y="54" font-size="11.5" fill="#92400e">↤ 200（新基准 0）</text>
+        <line x1="582" y1="80" x2="710" y2="80" stroke="#cbd5e1" stroke-width="1.2"/>
+        <text x="716" y="84" font-size="11.5" fill="#64748b">小明 180（差 −20）</text>
+        <line x1="582" y1="140" x2="710" y2="140" stroke="#cbd5e1" stroke-width="1.2"/>
+        <text x="716" y="144" font-size="11.5" fill="#64748b">某人 165（差 −35）</text>
+        <line x1="582" y1="190" x2="710" y2="190" stroke="#cbd5e1" stroke-width="1.2"/>
+        <text x="716" y="194" font-size="11.5" fill="#64748b">某人 150（差 −50）</text>
+      </svg>
+    </div>
+    <figcaption>换了更高的「最大值」就是换了一把尺子。旧账本里每一项都相对旧基准，必须整体打折/平移，才能和新基准对齐。</figcaption>
+  </figure>
+
+  <p>Online softmax 里也是一样。我们存的分母 <code>d</code> 是 <code>Σ exp(分数 − 当前最大值)</code>。一旦最大值从 <code>m_旧</code> 变成 <code>m_新</code>（更大），旧的每一项 <code>exp(分数 − m_旧)</code> 都要乘上一个<strong>修正因子</strong>：</p>
+
+  <div class="figcard" style="margin:18px 0;">
+    <div class="annot-eq">
+      <span class="annot plain"><span class="term">exp(分数 − m_新)</span><small>&nbsp;</small></span>
+      <span class="annot plain" style="align-self:center"><span class="term">=</span></span>
+      <span class="annot blue"><span class="term">exp(分数 − m_旧)</span><small>旧账本里存的</small></span>
+      <span class="annot plain" style="align-self:center"><span class="term">×</span></span>
+      <span class="annot amber"><span class="term">exp(m_旧 − m_新)</span><small>修正因子（≤ 1，打折扣）</small></span>
+    </div>
+  </div>
+
+  <p>所以<strong>只要把整个旧账本 <code>d</code> 乘以 <code>exp(m_旧 − m_新)</code> 这一个数，就等于把里面每一项都重新对齐到新最大值了</strong>。一次乘法，搞定全部历史。</p>
+  <p>注意 <code>m_旧 ≤ m_新</code>，所以 <code>m_旧 − m_新 ≤ 0</code>，修正因子 <code>exp(…) ≤ 1</code>。<strong>它是一个「打折扣」的系数</strong> —— 把旧账本缩小，因为我们换了一把更大的尺子。</p>
+
+  <h3>4.2 算法（先只看分母 d）</h3>
+  <p>把例子的 6 个键分成<strong>两块</strong>，每块 3 个：</p>
+  <ul>
+    <li><strong>第 1 块</strong>：键 1,2,3，分数 <code>[1, 3, 2]</code></li>
+    <li><strong>第 2 块</strong>：键 4,5,6，分数 <code>[5, 4, 0]</code></li>
+  </ul>
+  <p>初始化：<code>m = −∞</code>（还没见过任何数），<code>d = 0</code>。下面这条「账本流水」一步步走，每一步都标出两个小账本的最新值：</p>
+
+  <div class="tape">
+    <div class="step init">
+      <div class="shead">初始化</div>
+      <div class="ledger">
+        <span class="chip m"><span class="k">m</span> = −∞</span>
+        <span class="chip d"><span class="k">d</span> = 0</span>
+      </div>
+    </div>
+    <div class="arrowdown">处理第 1 块 ↓</div>
+    <div class="step">
+      <div class="shead"><span class="pill b1">第 1 块</span> 分数 [1, 3, 2]</div>
+      <div class="calc">
+        ① 局部最大值 m_块 = <b>3</b><br>
+        ② 更新最大值 m_新 = max(−∞, 3) = <b>3</b><br>
+        ③ 修正因子 = exp(−∞ − 3) = <span class="corr">0</span>（旧账空，乘 0 没影响）<br>
+        ④ 块内 exp(分数 − 3)：exp(−2), 1, exp(−1) = 0.1353, 1, 0.3679 → 和 = <b>1.5032</b><br>
+        ⑤ d = 0 × <span class="corr">0</span> + 1.5032 = <span class="res">1.5032</span>
+      </div>
+      <div class="ledger">
+        <span class="chip m"><span class="k">m</span> = 3</span>
+        <span class="chip d"><span class="k">d</span> = 1.5032</span>
+      </div>
+    </div>
+    <div class="arrowdown">处理第 2 块 ↓</div>
+    <div class="step bump">
+      <div class="shead"><span class="pill b2">第 2 块</span> 分数 [5, 4, 0] <span class="pill up">最大值变大 ⬆</span></div>
+      <div class="calc">
+        ① 局部最大值 m_块 = <b>5</b><br>
+        ② 更新最大值 m_新 = max(3, 5) = <b>5</b> ← 变大了！<br>
+        ③ 修正因子 = exp(3 − 5) = exp(−2) = <span class="corr">0.1353</span><br>
+        ④ <strong>先修正旧账本</strong>：d = 1.5032 × <span class="corr">0.1353</span> = 0.2034<br>
+        &nbsp;&nbsp;&nbsp;（把第 1 块的旧分母从「相对 3」重新对齐到「相对 5」）<br>
+        ⑤ 块内 exp(分数 − 5)：1, exp(−1), exp(−5) = 1, 0.3679, 0.0067 → 和 = <b>1.3746</b><br>
+        ⑥ d = 0.2034 + 1.3746 = <span class="res">1.5780</span>
+      </div>
+      <div class="ledger">
+        <span class="chip m"><span class="k">m</span> = 5</span>
+        <span class="chip d"><span class="k">d</span> = 1.5780</span>
+      </div>
+    </div>
+  </div>
+
+  <h3>4.3 见证奇迹的时刻</h3>
+  <p>我们分两块、边走边修正算出来的最终分母是 <strong><code>d = 1.5780</code></strong>。第 2 节里「一次性全算」得到的分母是 <strong><code>1.5781</code></strong>。</p>
+
+  <figure>
+    <div class="figcard">
+      <div class="vs">
+        <div class="vscard"><div class="lab">分块在线（边走边修正）</div><div class="val">1.5780</div></div>
+        <div class="vsmid">=</div>
+        <div class="vscard"><div class="lab">一次性全算（第 2 节）</div><div class="val">1.5781</div></div>
+      </div>
+    </div>
+    <figcaption><strong>完全一致！</strong>小数点后第 4 位的 0.0001 纯粹是四舍五入。✅✅✅</figcaption>
+  </figure>
+
+  <p>这就是 online softmax 的核心承诺：</p>
+  <blockquote><p><strong>分块在线计算的结果，和一次性全算的结果完全相同，不是近似。</strong>而代价只是多存了 <code>m</code> 和 <code>d</code> 两个小数字，外加每次更新时一次「乘修正因子」。</p></blockquote>
+
+  <!-- ===================== 5 ===================== -->
+  <h2 id="s5"><span class="num">5</span>注意力不止要概率，还要加权求和 V</h2>
+  <p>到上一节为止，我们只算了<strong>分母 <code>d</code></strong>。但注意力真正要的输出是：</p>
+
+  <div class="eqwrap">
+    <div class="eq">
+      <span>输出 O</span><span class="op">=</span><span>Σ pᵢ · Vᵢ</span><span class="op">=</span>
+      <span class="frac"><span class="n">Σ exp(分数ᵢ − m) · Vᵢ</span><span class="d">d</span></span>
+    </div>
+  </div>
+
+  <p>也就是用 softmax 权重去<strong>加权平均所有的值 <code>Vᵢ</code></strong>。在动手算之前，先分清楚一件容易绕晕的事：<strong>谁是标量、谁是向量。</strong></p>
+
+  <figure>
+    <div class="figcard">
+      <p class="figtitle">softmax 那套账本全是「标量」，只有值/输出这一侧是「向量」</p>
+      <div class="sv">
+        <div class="svbox">
+          <h4 class="t-purple">标量（每个就一个数）</h4>
+          <div class="svrow"><span class="nm">分数 sᵢ</span><span class="scal p">s</span><span class="svnote">每个键一个分数</span></div>
+          <div class="svrow"><span class="nm">权重 pᵢ</span><span class="scal p">p</span><span class="svnote">每个键一个权重</span></div>
+          <div class="svrow"><span class="nm">最大值 m</span><span class="scal m">m</span><span class="svnote">整组共用一份</span></div>
+          <div class="svrow"><span class="nm">分母 d</span><span class="scal d">d</span><span class="svnote">整组共用一份</span></div>
+        </div>
+        <div class="svbox">
+          <h4 class="t-green">向量（一串数，真实 512 维）</h4>
+          <div class="svrow"><span class="nm">值 Vᵢ</span>
+            <span class="vecstrip"><span class="vcell v"></span><span class="vcell v"></span><span class="vcell v"></span><span class="vcell v"></span><span class="vcell v"></span><span class="vcell v"></span><span class="vellip">…512</span></span>
+          </div>
+          <div class="svrow"><span class="nm">输出 O</span>
+            <span class="vecstrip"><span class="vcell o"></span><span class="vcell o"></span><span class="vcell o"></span><span class="vcell o"></span><span class="vcell o"></span><span class="vcell o"></span><span class="vellip">…512</span></span>
+          </div>
+          <p class="svnote" style="margin-top:14px">维度怎么走：<br><code>pᵢ · Vᵢ</code> = 标量 × 向量 = <strong>向量</strong> → 求和仍是向量 → 再 ÷ 标量 <code>d</code> 仍是向量。<br>所以 <strong>O 是一个向量，和 Vᵢ 同维度</strong>。</p>
+        </div>
+      </div>
+      <div class="bcast">⚠ 连修正因子 <code>exp(m_旧 − m_新)</code> 也是<strong>标量</strong> —— 它会<strong>广播</strong>到 O 的每一个分量上（512 个分量同乘这一个数）。</div>
+    </div>
+    <figcaption>一句话：softmax 那一套账本（<code>m, d, pᵢ</code>）全是标量，只有值/输出这一侧（<code>Vᵢ, O</code>）是向量。</figcaption>
+  </figure>
+
+  <div class="warn">
+    <p>⚠️ 下面的小例子为了能用计算器手算，把每个 <code>Vᵢ</code> 简化成了<strong>单个数字</strong>（10, 20, …），所以例子里的 <code>O</code> 看起来像一个数。但请记住：<strong>真实情况下 <code>Vᵢ</code> 是 512 维向量，<code>O</code> 也是 512 维向量，每一维都独立地、按和本文完全相同的规则更新</strong>（详见第 8 节末尾的提示）。</p>
+  </div>
+
+  <p>好消息是：<strong>分子（加权和）也可以用一模一样的「边走边修正」来算</strong>。我们再多维护一个账本：</p>
+  <ul><li><code>O</code>：到目前为止累加的<strong>（未归一化的）加权值之和</strong>。</li></ul>
+  <p>它遵守和 <code>d</code> <strong>完全相同的修正规则</strong>：每次最大值变大，就把 <code>O</code> 乘上同一个修正因子 <code>exp(m_旧 − m_新)</code>，然后加上新块的贡献。<strong>最后一步</strong>才把 <code>O</code> 除以 <code>d</code>，得到归一化的输出。</p>
+  <blockquote><p>为什么 <code>O</code> 和 <code>d</code> 用同一个修正因子？因为它们的每一项都含有同样的 <code>exp(分数ᵢ − m)</code>，只是 <code>O</code> 的那一项还多乘了一个 <code>Vᵢ</code>。换尺子（换最大值）时，<code>exp</code> 那部分要打的折扣是一样的，<code>Vᵢ</code> 不受影响。</p></blockquote>
+
+  <h3>5.1 用例子走一遍（带上 V）</h3>
+  <p>回忆 <code>V = [10, 20, 30, 40, 50, 60]</code>，对应键 1~6。初始化：<code>m = −∞</code>，<code>d = 0</code>，<code>O = 0</code>。这回账本流水里多了一个 <code>O</code>：</p>
+
+  <div class="tape">
+    <div class="step init">
+      <div class="shead">初始化</div>
+      <div class="ledger">
+        <span class="chip m"><span class="k">m</span> = −∞</span>
+        <span class="chip d"><span class="k">d</span> = 0</span>
+        <span class="chip o"><span class="k">O</span> = 0</span>
+      </div>
+    </div>
+    <div class="arrowdown">第 1 块（分数 [1,3,2]，值 [10,20,30]）↓</div>
+    <div class="step">
+      <div class="shead"><span class="pill b1">第 1 块</span> m_新 = 3，修正因子 = 0（旧账空）</div>
+      <div class="calc">
+        块权重（未归一化）：[exp(−2), 1, exp(−1)] = [0.1353, 1, 0.3679]<br>
+        d = 0 × 0 + (0.1353 + 1 + 0.3679) = <span class="res">1.5032</span><br>
+        O = 0 × 0 + (0.1353×10 + 1×20 + 0.3679×30) = 1.353 + 20 + 11.036 = <span class="res">32.390</span>
+      </div>
+      <div class="ledger">
+        <span class="chip m"><span class="k">m</span> = 3</span>
+        <span class="chip d"><span class="k">d</span> = 1.5032</span>
+        <span class="chip o"><span class="k">O</span> = 32.390</span>
+      </div>
+    </div>
+    <div class="arrowdown">第 2 块（分数 [5,4,0]，值 [40,50,60]）↓</div>
+    <div class="step bump">
+      <div class="shead"><span class="pill b2">第 2 块</span> m_新 = 5 <span class="pill up">⬆</span>，修正因子 = exp(3−5) = <span style="color:#92400e">0.1353</span></div>
+      <div class="calc">
+        <strong>修正旧账本（d 和 O 同乘修正因子）：</strong><br>
+        &nbsp;&nbsp;d = 1.5032 × <span class="corr">0.1353</span> = 0.2034<br>
+        &nbsp;&nbsp;O = 32.390 × <span class="corr">0.1353</span> = 4.383<br>
+        块权重（未归一化）：[1, exp(−1), exp(−5)] = [1, 0.3679, 0.0067]<br>
+        d = 0.2034 + (1 + 0.3679 + 0.0067) = 0.2034 + 1.3746 = <span class="res">1.5780</span><br>
+        O = 4.383 + (1×40 + 0.3679×50 + 0.0067×60) = 4.383 + 58.798 = <span class="res">63.182</span>
+      </div>
+      <div class="ledger">
+        <span class="chip m"><span class="k">m</span> = 5</span>
+        <span class="chip d"><span class="k">d</span> = 1.5780</span>
+        <span class="chip o"><span class="k">O</span> = 63.182</span>
+      </div>
+    </div>
+    <div class="arrowdown">收尾：归一化（整个循环只做这一次）↓</div>
+    <div class="finalbox">最终输出 = O / d = 63.182 / 1.5780 = <b>40.038</b></div>
+  </div>
+
+  <h3>5.2 再次见证奇迹</h3>
+  <p>我们用「一次性全算」来对照（用第 2 节减完最大值的 exp 值）。下面把 6 项分别算好、再合并求和：</p>
+
+  <figure>
+    <div class="figcard">
+      <svg viewBox="0 0 840 250" role="img" aria-label="一次性全算分子：6 个 exp×V 项汇聚成 63.182，再除以 d 得 40.038">
+        <!-- 6 source terms -->
+        <g font-family="var(--mono)" font-size="12.5" text-anchor="middle">
+          <rect x="14"  y="20" width="124" height="40" rx="8" fill="#eef2f7" stroke="#cbd5e1"/><text x="76"  y="36" fill="#475569">0.0183×10</text><text x="76"  y="52" fill="#0b3d91" font-weight="700">= 0.183</text>
+          <rect x="150" y="20" width="124" height="40" rx="8" fill="#eef2f7" stroke="#cbd5e1"/><text x="212" y="36" fill="#475569">0.1353×20</text><text x="212" y="52" fill="#0b3d91" font-weight="700">= 2.707</text>
+          <rect x="286" y="20" width="124" height="40" rx="8" fill="#eef2f7" stroke="#cbd5e1"/><text x="348" y="36" fill="#475569">0.0498×30</text><text x="348" y="52" fill="#0b3d91" font-weight="700">= 1.494</text>
+          <rect x="422" y="20" width="124" height="40" rx="8" fill="#fff7ed" stroke="#f59e0b"/><text x="484" y="36" fill="#92400e">1.0000×40</text><text x="484" y="52" fill="#92400e" font-weight="700">= 40.000</text>
+          <rect x="558" y="20" width="124" height="40" rx="8" fill="#eef2f7" stroke="#cbd5e1"/><text x="620" y="36" fill="#475569">0.3679×50</text><text x="620" y="52" fill="#0b3d91" font-weight="700">= 18.394</text>
+          <rect x="694" y="20" width="124" height="40" rx="8" fill="#eef2f7" stroke="#cbd5e1"/><text x="756" y="36" fill="#475569">0.0067×60</text><text x="756" y="52" fill="#0b3d91" font-weight="700">= 0.404</text>
+        </g>
+        <!-- merge lines to a hub -->
+        <g stroke="#94a3b8" stroke-width="1.3" fill="none">
+          <path d="M76,60  C 76,110 416,100 416,120"/>
+          <path d="M212,60 C 212,108 416,102 416,120"/>
+          <path d="M348,60 C 348,106 416,104 416,120"/>
+          <path d="M484,60 C 484,106 416,104 416,120"/>
+          <path d="M620,60 C 620,108 416,102 416,120"/>
+          <path d="M756,60 C 756,110 416,100 416,120"/>
+        </g>
+        <!-- sum node -->
+        <rect x="300" y="120" width="232" height="48" rx="10" fill="#dbeafe" stroke="#3b82f6"/>
+        <text x="416" y="140" text-anchor="middle" font-size="13" fill="#1e40af">分子 = 6 项相加</text>
+        <text x="416" y="160" text-anchor="middle" font-size="15" font-family="var(--mono)" font-weight="700" fill="#1e40af">63.182</text>
+        <!-- divide -->
+        <path d="M416,168 L416,196" stroke="#2f6fea" stroke-width="2" marker-end="url(#ar)"/>
+        <text x="470" y="188" font-size="12.5" fill="#2f6fea" font-weight="700">÷ d (1.5781)</text>
+        <!-- output -->
+        <rect x="300" y="200" width="232" height="44" rx="10" fill="#ecfdf5" stroke="#10b981"/>
+        <text x="416" y="228" text-anchor="middle" font-size="17" font-family="var(--mono)" font-weight="700" fill="#065f46">最终输出 = 40.038</text>
+      </svg>
+    </div>
+    <figcaption>一次性全算：<code>0.183 + 2.707 + 1.494 + 40 + 18.394 + 0.404 = 63.182</code>，再 <code>÷ 1.5781 = 40.038</code>。</figcaption>
+  </figure>
+
+  <p><strong>又是一模一样的 40.038！</strong> ✅✅✅（在线分块版得到的也是 <code>63.182 / 1.5780 = 40.038</code>。）</p>
+
+  <h3>5.3 一个重要的领悟：最终的概率 <code>pᵢ</code> 其实从没被真正算出来</h3>
+  <p>你可能已经隐约感觉到了：<strong>整个过程里，我们从头到尾都没有单独算出任何一个「最终概率」<code>pᵢ</code>。</strong>这正是 online softmax（也是 FlashAttention）最精髓的地方。</p>
+  <p>回忆最终概率的定义：<code>pᵢ = exp(sᵢ − m_最终) / d_最终</code>。它需要两样<strong>全局信息</strong>：最终的最大值 <code>m_最终</code> 和最终的分母 <code>d_最终</code>，而这两样<strong>只有处理完最后一块才知道</strong>。所以在中途，我们<strong>根本没法</strong>算出任何一个真正的 <code>pᵢ</code>。</p>
+  <p>那中途算的是什么？是<strong>临时的、未归一化的权重</strong> <code>p̃ᵢ = exp(sᵢ − m_当前)</code>：</p>
+  <ul>
+    <li><strong>未归一化</strong>：没除以 <code>d</code>（因为 <code>d</code> 还没定）；</li>
+    <li><strong>临时</strong>：相对的是<em>当前</em>的运行最大值，不是最终的 —— 一旦遇到更大的最大值，它的贡献就要被修正因子重新打折；</li>
+    <li><strong>只存一块的量</strong>：任何时刻内存里只有一块的权重，<strong>完整的注意力概率矩阵从不存在</strong>。</li>
+  </ul>
+
+  <figure>
+    <div class="figcard">
+      <svg viewBox="0 0 840 246" role="img" aria-label="完整概率矩阵从未在内存里存在，取而代之的是三个小账本">
+        <!-- ghost matrix -->
+        <text x="190" y="24" text-anchor="middle" font-size="13" font-weight="700" fill="#9ca3af">完整注意力概率矩阵 P〔所有 query × 所有 key〕</text>
+        <g opacity="0.4">
+          <!-- grid 4x8 -->
+          <g fill="#e5e7eb" stroke="#cbd5e1">
+            <rect x="40" y="40" width="38" height="34" rx="4"/><rect x="80" y="40" width="38" height="34" rx="4"/><rect x="120" y="40" width="38" height="34" rx="4"/><rect x="160" y="40" width="38" height="34" rx="4"/><rect x="200" y="40" width="38" height="34" rx="4"/><rect x="240" y="40" width="38" height="34" rx="4"/><rect x="280" y="40" width="38" height="34" rx="4"/><rect x="320" y="40" width="38" height="34" rx="4"/>
+            <rect x="40" y="76" width="38" height="34" rx="4"/><rect x="80" y="76" width="38" height="34" rx="4"/><rect x="120" y="76" width="38" height="34" rx="4"/><rect x="160" y="76" width="38" height="34" rx="4"/><rect x="200" y="76" width="38" height="34" rx="4"/><rect x="240" y="76" width="38" height="34" rx="4"/><rect x="280" y="76" width="38" height="34" rx="4"/><rect x="320" y="76" width="38" height="34" rx="4"/>
+            <rect x="40" y="112" width="38" height="34" rx="4"/><rect x="80" y="112" width="38" height="34" rx="4"/><rect x="120" y="112" width="38" height="34" rx="4"/><rect x="160" y="112" width="38" height="34" rx="4"/><rect x="200" y="112" width="38" height="34" rx="4"/><rect x="240" y="112" width="38" height="34" rx="4"/><rect x="280" y="112" width="38" height="34" rx="4"/><rect x="320" y="112" width="38" height="34" rx="4"/>
+            <rect x="40" y="148" width="38" height="34" rx="4"/><rect x="80" y="148" width="38" height="34" rx="4"/><rect x="120" y="148" width="38" height="34" rx="4"/><rect x="160" y="148" width="38" height="34" rx="4"/><rect x="200" y="148" width="38" height="34" rx="4"/><rect x="240" y="148" width="38" height="34" rx="4"/><rect x="280" y="148" width="38" height="34" rx="4"/><rect x="320" y="148" width="38" height="34" rx="4"/>
+          </g>
+        </g>
+        <!-- big stamp -->
+        <line x1="44" y1="186" x2="356" y2="44" stroke="#ef4444" stroke-width="2.5" opacity="0.65"/>
+        <rect x="74" y="96" width="252" height="34" rx="8" fill="#fef2f2" stroke="#ef4444"/>
+        <text x="200" y="118" text-anchor="middle" font-size="13" fill="#b91c1c" font-weight="700">✗ 从未在内存里存在过</text>
+        <!-- vs -->
+        <text x="420" y="118" text-anchor="middle" font-size="22" fill="#94a3b8">→</text>
+        <!-- the 3 ledgers we DO keep -->
+        <text x="630" y="24" text-anchor="middle" font-size="13" font-weight="700" fill="#334155">内存里真正保存的（每个 query 头只有这 3 个）</text>
+        <rect x="470" y="50" width="100" height="60" rx="12" fill="#faf5ff" stroke="#d8b4fe"/><text x="520" y="76" text-anchor="middle" font-size="14" font-family="var(--mono)" font-weight="700" fill="#7c3aed">m</text><text x="520" y="96" text-anchor="middle" font-size="11" fill="#7c3aed">标量</text>
+        <rect x="582" y="50" width="100" height="60" rx="12" fill="#eff6ff" stroke="#93c5fd"/><text x="632" y="76" text-anchor="middle" font-size="14" font-family="var(--mono)" font-weight="700" fill="#1e40af">d</text><text x="632" y="96" text-anchor="middle" font-size="11" fill="#1e40af">标量</text>
+        <rect x="694" y="50" width="118" height="60" rx="12" fill="#ecfdf5" stroke="#6ee7b7"/><text x="753" y="76" text-anchor="middle" font-size="14" font-family="var(--mono)" font-weight="700" fill="#065f46">O</text><text x="753" y="96" text-anchor="middle" font-size="11" fill="#065f46">向量(512)</text>
+        <text x="641" y="150" text-anchor="middle" font-size="12.5" fill="#475569">边算边把临时权重×V 累加进 O，</text>
+        <text x="641" y="170" text-anchor="middle" font-size="12.5" fill="#475569"><tspan font-weight="700">最后才 ÷ d 一次性归一化</tspan> —— 概率被「融合」掉了</text>
+      </svg>
+    </div>
+    <figcaption>online softmax 把 softmax 的归一化「融合」进 <code>O</code> 的累加里。完整的概率矩阵<strong>从不落地</strong>，省内存的根本原因就在这。</figcaption>
+  </figure>
+
+  <p>我们拿这些临时权重直接乘 <code>Vᵢ</code> 累加进 <code>O</code>，然后<strong>把「除以 <code>d</code>」这一步推迟到最后，只对 <code>O</code> 做一次</strong>。于是真正的 <code>pᵢ</code> <strong>始终没有以一个完整数组的形式存在过</strong>，但它的<em>效果</em>通过「逐块修正 + 最后归一化」准确地体现在了 <code>O</code> 里。</p>
+
+  <div class="warn"><p>⚠️ 注意：说「没算出概率」不等于「没算 exp」。每处理一块，kernel <strong>确实</strong>算了 <code>exp</code> 权重（就是代码里的 <code>acc_s_ub</code>，还会传给 cube 核去做 <code>P@V</code>）。只是那是<strong>未归一化的临时权重</strong>，不是除过 <code>d</code> 的最终概率。</p></div>
+
+  <p><strong>用例子看第 2 个键（s=3, V=20）：</strong> 它的「真正概率」是 <code>p₂ = exp(3−5)/1.578 = 0.0858</code>。但全程我们一次都没单独算过它，它的贡献是这样一路「攒」进 <code>O</code> 的：</p>
+
+  <figure>
+    <div class="figcard">
+      <div class="trace">
+        <div class="tnode"><b>第 1 块 · 临时权重</b>exp(3−3)=1.0<div class="big">× 20 = 20</div></div>
+        <div class="tarr">→<small>第 2 块 ×修正 0.1353</small></div>
+        <div class="tnode"><b>修正后</b><div class="big">20 × 0.1353<br>= 2.707</div></div>
+        <div class="tarr">→<small>收尾 ÷ d (1.578)</small></div>
+        <div class="tnode"><b>在 O 里的最终贡献</b><div class="big">2.707 / 1.578<br>= 1.715</div></div>
+        <div class="tarr">=</div>
+        <div class="tnode teq"><b>对照 p₂ · V₂</b><div class="big" style="color:#065f46">0.0858 × 20<br>= 1.715</div></div>
+      </div>
+    </div>
+    <figcaption>第 2 个键的贡献，全程没单独算过 <code>0.0858</code> 这个概率，但「逐块修正 + 最后归一化」让它在 <code>O</code> 里的效果<strong>分毫不差</strong>。</figcaption>
+  </figure>
+
+  <p>而 <code>p₂ × V₂ = 0.0858 × 20 = 1.715</code> —— <strong>结果分毫不差</strong>。但你看，那个 <code>0.0858</code> <strong>我们一次都没单独算出来过</strong>，它只是<strong>隐含</strong>在 <code>O</code> 的最终数值里。</p>
+
+  <blockquote><p><strong>结论：online softmax 不是「先把概率都算出来再加权」，而是把 softmax 的归一化与 <code>O</code> 的加权求和融合（fuse）在一起，把归一化推迟到最后一次性完成。</strong> 这样就<strong>永远不必在内存里存下完整的注意力概率矩阵</strong> —— 这正是 FlashAttention 这类算法又快又省内存的根本原因。</p></blockquote>
+
+  <p>至此，注意力的完整在线计算就讲完了。我们只用了三个小账本 <code>m, d, O</code>，就把任意长序列的注意力<strong>分块、不溢出、零误差</strong>地算了出来。</p>
+
+  <!-- ===================== 6 ===================== -->
+  <h2 id="s6"><span class="num">6</span>这个 kernel 的特别之处：sink 种子</h2>
+  <p>前面为了好懂，我们把 <code>m, d, O</code> 初始化成 <code>−∞, 0, 0</code>。但你去看 <a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py">kernel.py</a> 第 380–388 行，它的初始化<strong>不太一样</strong>：</p>
+
+  <pre><code><span class="cmt"># Seed online softmax from sinks.</span>
+T.copy(Sinks[...], m_i)     <span class="cmt"># m 初始化为 sink 的分数（不是 −∞）</span>
+T.tile.fill(acc_o, <span class="hl">0.0</span>)     <span class="cmt"># O 初始化为 0      （这个一样）</span>
+T.tile.fill(sumexp, <span class="hl">1.0</span>)    <span class="cmt"># d 初始化为 1.0    （不是 0！）</span></code></pre>
+
+  <p><code>m</code> 从一个叫 <strong>sink</strong> 的分数开始，<code>d</code> 从 <strong>1.0</strong> 开始。这是什么操作？</p>
+
+  <h3>6.1 什么是 attention sink</h3>
+  <p>你可以把 sink 理解成一个<strong>虚拟的「第 0 号键」</strong>，它有两个特点：</p>
+  <ol>
+    <li>它的<strong>分数是一个固定（或可学习）的值</strong>，叫 <code>sink</code>；</li>
+    <li>它的<strong>值向量 <code>V</code> 全是 0</strong>。</li>
+  </ol>
+
+  <figure>
+    <div class="figcard">
+      <svg viewBox="0 0 840 226" role="img" aria-label="sink 是一个虚拟的第 0 号键，预先把它对 m,d,O 的贡献写进初始账本">
+        <!-- virtual key 0 -->
+        <rect x="20" y="40" width="150" height="92" rx="12" fill="#ede9fe" stroke="#8b5cf6" stroke-dasharray="6 4"/>
+        <text x="95" y="28" text-anchor="middle" font-size="12.5" font-weight="700" fill="#5b21b6">虚拟「第 0 号键」</text>
+        <text x="95" y="72" text-anchor="middle" font-size="13" fill="#5b21b6">分数 = sink</text>
+        <text x="95" y="98" text-anchor="middle" font-size="13" fill="#5b21b6">值 V₀ = 全 0</text>
+        <text x="95" y="120" text-anchor="middle" font-size="11" fill="#7c3aed">（不真的造它）</text>
+        <!-- real keys to the right -->
+        <g font-family="var(--mono)" font-size="11.5" text-anchor="middle" fill="#475569">
+          <rect x="196" y="64" width="46" height="44" rx="7" fill="#eef2f7" stroke="#cbd5e1"/><text x="219" y="90">键1</text>
+          <rect x="248" y="64" width="46" height="44" rx="7" fill="#eef2f7" stroke="#cbd5e1"/><text x="271" y="90">键2</text>
+          <text x="312" y="90">…</text>
+          <rect x="330" y="64" width="46" height="44" rx="7" fill="#eef2f7" stroke="#cbd5e1"/><text x="353" y="90">键6</text>
+        </g>
+        <!-- arrow: seeds -->
+        <path d="M172,86 L196,86" stroke="#94a3b8" stroke-width="1.3"/>
+        <path d="M400,86 L452,86" stroke="#8b5cf6" stroke-width="2" marker-end="url(#ar)"/>
+        <text x="426" y="74" text-anchor="middle" font-size="11.5" fill="#5b21b6" font-weight="700">预先算好它的贡献</text>
+        <!-- seed outcomes -->
+        <rect x="460" y="34" width="356" height="36" rx="9" fill="#faf5ff" stroke="#d8b4fe"/>
+        <text x="476" y="57" font-size="12.5" fill="#7c3aed"><tspan font-family="var(--mono)" font-weight="700">m</tspan> ← sink　（让 sink 这一项的 exp(sink−m)=exp(0)=1）</text>
+        <rect x="460" y="78" width="356" height="36" rx="9" fill="#eff6ff" stroke="#93c5fd"/>
+        <text x="476" y="101" font-size="12.5" fill="#1e40af"><tspan font-family="var(--mono)" font-weight="700">d</tspan> ← 1.0　（= sink 那一项 exp(0) = 1）</text>
+        <rect x="460" y="122" width="356" height="36" rx="9" fill="#ecfdf5" stroke="#6ee7b7"/>
+        <text x="476" y="145" font-size="12.5" fill="#065f46"><tspan font-family="var(--mono)" font-weight="700">O</tspan> ← 0　（= exp(0) × V₀ = 1 × 0 = 0）</text>
+        <!-- conclusion -->
+        <text x="20" y="184" font-size="12.5" fill="#475569">「种子」= 把这个零值虚拟键<strong>预先放进账本</strong>。代码不真的造键，直接把它对 <tspan font-family="var(--mono)">m, d, O</tspan> 的初始贡献写好，省事又高效。</text>
+      </svg>
+    </div>
+    <figcaption>把 sink 当成第 0 号键塞进 softmax：它对 <code>d</code> 贡献 <code>exp(0)=1</code>（所以 <code>d</code> 从 1.0 起），对 <code>O</code> 贡献 <code>1×0=0</code>（所以 <code>O</code> 仍从 0 起）。</figcaption>
+  </figure>
+
+  <p>把它当成普通键塞进 softmax 会发生什么？</p>
+  <ul>
+    <li>它对<strong>分母</strong>的贡献是 <code>exp(sink − m)</code>。如果一开始就让 <code>m = sink</code>，那么这一项 = <code>exp(0) = 1</code> —— 这就是为什么 <code>d</code> 初始化成 <strong>1.0</strong>！</li>
+    <li>它对<strong>分子 <code>O</code></strong> 的贡献是 <code>exp(sink − m) × V₀ = 1 × 0 = 0</code> —— 所以 <code>O</code> 还是从 <strong>0</strong> 开始。</li>
+  </ul>
+  <p><strong>换句话说，「种子」就是把这个虚拟的零值键预先放进账本里。</strong>代码没有真的造一个键，而是直接把它对 <code>m, d, O</code> 的初始贡献写好，省事又高效。</p>
+
+  <h3>6.2 sink 有什么用</h3>
+  <p>它给了模型一个<strong>「什么都不关注」的出口</strong>。</p>
+  <p>普通 softmax 强迫所有权重加起来等于 1 —— 哪怕当前 query 觉得「这些键我一个都不太想理」，它也被迫把 100% 的注意力分摊出去。有了 sink，模型可以把一部分注意力「倒进」这个零值虚拟键里，相当于说「这部分注意力我不用了」。这能让训练更稳定，也是很多大模型里的常见技巧。</p>
+
+  <h3>6.3 用例子看看 sink 的影响</h3>
+  <p>假设 <code>sink = 2</code>。重新走一遍（分数、V 都不变）。初始化：<code>m = 2</code>，<code>d = 1.0</code>，<code>O = 0</code>。</p>
+
+  <div class="tape">
+    <div class="step init">
+      <div class="shead">初始化（sink 种子）</div>
+      <div class="ledger">
+        <span class="chip m"><span class="k">m</span> = 2</span>
+        <span class="chip d"><span class="k">d</span> = 1.0</span>
+        <span class="chip o"><span class="k">O</span> = 0</span>
+      </div>
+    </div>
+    <div class="arrowdown">第 1 块 [1,3,2] ↓</div>
+    <div class="step bump">
+      <div class="shead"><span class="pill b1">第 1 块</span> m_新 = max(2,3) = 3 <span class="pill up">⬆</span>，修正因子 = exp(2−3) = <span style="color:#92400e">0.3679</span></div>
+      <div class="calc">
+        修正旧账：d = 1.0 × <span class="corr">0.3679</span> = 0.3679；O = 0 × <span class="corr">0.3679</span> = 0<br>
+        加这块：d = 0.3679 + 1.5032 = <span class="res">1.8711</span>；O = 0 + 32.390 = <span class="res">32.390</span>
+      </div>
+      <div class="ledger">
+        <span class="chip m"><span class="k">m</span> = 3</span>
+        <span class="chip d"><span class="k">d</span> = 1.8711</span>
+        <span class="chip o"><span class="k">O</span> = 32.390</span>
+      </div>
+    </div>
+    <div class="arrowdown">第 2 块 [5,4,0] ↓</div>
+    <div class="step bump">
+      <div class="shead"><span class="pill b2">第 2 块</span> m_新 = max(3,5) = 5 <span class="pill up">⬆</span>，修正因子 = exp(3−5) = <span style="color:#92400e">0.1353</span></div>
+      <div class="calc">
+        修正旧账：d = 1.8711 × <span class="corr">0.1353</span> = 0.2532；O = 32.390 × <span class="corr">0.1353</span> = 4.383<br>
+        加这块：d = 0.2532 + 1.3746 = <span class="res">1.6278</span>；O = 4.383 + 58.798 = <span class="res">63.182</span>
+      </div>
+      <div class="ledger">
+        <span class="chip m"><span class="k">m</span> = 5</span>
+        <span class="chip d"><span class="k">d</span> = 1.6278</span>
+        <span class="chip o"><span class="k">O</span> = 63.182</span>
+      </div>
+    </div>
+    <div class="arrowdown">收尾 ↓</div>
+    <div class="finalbox">输出 = O / d = 63.182 / 1.6278 = <b>38.813</b></div>
+  </div>
+
+  <p>对照「一次性全算 + sink」：分母里多了 sink 那一项 <code>exp(2−5)=exp(−3)=0.0498</code>，所以 <code>d = 1.5781 + 0.0498 = 1.6279</code>；分子不变（sink 的值是 0）。<code>输出 = 63.182 / 1.6279 = 38.813</code>。<strong>又对上了！</strong> ✅</p>
+
+  <figure>
+    <div class="figcard">
+      <div class="vs">
+        <div class="vscard"><div class="lab">不带 sink</div><div class="val">40.038</div></div>
+        <div class="vsmid" style="color:#b91c1c">↓</div>
+        <div class="vscard" style="border-top:4px solid var(--purple)"><div class="lab">带 sink（sink=2）</div><div class="val">38.813</div></div>
+      </div>
+      <p style="text-align:center; font-size:13px; color:#64748b; margin:12px 0 0">有 <code>0.0498 / 1.6278 ≈ 3%</code> 的注意力被「倒进」零值 sink，拉低了整体加权平均。</p>
+    </div>
+    <figcaption>加了 sink 后输出从 <strong>40.038 降到 38.813</strong> —— 这正是 sink「吸走一部分注意力」的体现。</figcaption>
+  </figure>
+
+  <!-- ===================== 7 ===================== -->
+  <h2 id="s7"><span class="num">7</span>顺手的副产品：LSE（log-sum-exp）</h2>
+  <p>kernel 在最后还会多输出一个东西，叫 <strong>LSE</strong>（<a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py">kernel.py</a> 第 654–677 行）：</p>
+
+  <pre><code>T.tile.ln(lse_ub, sumexp)       <span class="cmt"># lse = ln(d)</span>
+T.tile.add(lse_ub, lse_ub, m_i) <span class="cmt"># lse = ln(d) + m</span></code></pre>
+
+  <p>也就是：</p>
+  <div class="eqwrap"><div class="eq"><span>LSE</span><span class="op">=</span><span>m + ln(d)</span></div></div>
+
+  <h3>7.1 它是什么</h3>
+  <p>LSE 是 "log-sum-exp" 的缩写，意思是 <strong>「所有原始分数取 exp、求和、再取对数」</strong>：</p>
+  <div class="eqwrap"><div class="eq"><span>LSE</span><span class="op">=</span><span>ln( exp(s₁) + exp(s₂) + … + exp(sₙ) )</span></div></div>
+
+  <p>为什么 <code>m + ln(d)</code> 就等于它？因为我们存的 <code>d</code> 是<strong>减完最大值</strong>的分母 <code>d = Σ exp(sᵢ − m)</code>，所以一步步推：</p>
+
+  <div class="figcard" style="margin:18px 0;">
+    <div class="eqwrap" style="margin:0;">
+      <div class="eq" style="flex-direction:column; align-items:flex-start; gap:.55em; font-size:15.5px;">
+        <div><span class="t-purple">m + ln(d)</span> = m + ln( Σ exp(sᵢ − m) )</div>
+        <div><span class="op">=</span> ln( <span class="t-amber">exp(m)</span> · Σ exp(sᵢ − m) ) <span class="lab" style="display:inline">← 把 m 塞进 ln 里变成 exp(m)</span></div>
+        <div><span class="op">=</span> ln( Σ exp(sᵢ) ) <span class="lab" style="display:inline">← exp(m)·exp(sᵢ−m) = exp(sᵢ)</span></div>
+        <div><span class="op">=</span> <span class="t-green">LSE</span> ✓</div>
+      </div>
+    </div>
+  </div>
+
+  <p><strong>妙处</strong>：我们手上正好有 <code>m</code> 和 <code>d</code>，所以 LSE 几乎是<strong>白送的</strong> —— 一次 <code>ln</code> 加一次加法就出来了，不用重新扫描数据。</p>
+
+  <h3>7.2 用例子验证</h3>
+  <p>不带 sink：<code>m = 5</code>，<code>d = 1.5781</code>。<code>LSE = 5 + ln(1.5781) = 5 + 0.4563 = 5.4563</code>。直接验算：<code>ln(234.204) = 5.4563</code>（234.204 就是第 1 节那个原始分母）。✅</p>
+  <p>带 sink：<code>m = 5</code>，<code>d = 1.6279</code>。<code>LSE = 5 + ln(1.6279) = 5 + 0.4873 = 5.4873</code>。✅</p>
+
+  <h3>7.3 LSE 有什么用</h3>
+  <ul>
+    <li><strong>训练反向传播</strong>需要它：softmax 的梯度公式里要用到这个归一化常数的对数；</li>
+    <li><strong>拼接多段注意力</strong>时需要它：当一个超长序列被拆到不同核 / 不同时间段分别算，要把各段的部分结果合并成全局结果，靠的就是各段的 <code>LSE</code> 来重新加权（这正是 FlashAttention 能跨块、跨设备拆分的数学基础）。</li>
+  </ul>
+  <p>所以这个 kernel <strong>总是</strong>把 LSE 算出来（代码注释里写它 "essentially free"，几乎零成本）。</p>
+
+  <!-- ===================== 8 ===================== -->
+  <h2 id="s8"><span class="num">8</span>原理对回代码：kernel.py 行号映射</h2>
+  <p>下面把第 4–7 节的每一个概念，对应到 <a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py">kernel.py</a> 里的变量和行号。（kernel 里把「最大值的修正」用变量 <code>m_i_prev</code> 来承载，下面会标出来。）</p>
+
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>概念（本文）</th><th>代码变量</th><th>行号</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>运行最大值 <code>m</code>，种子 = sink</td><td><code>m_i</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L382">382–385</a></td><td>从 <code>Sinks</code> 拷入，而非 −∞</td></tr>
+      <tr><td>运行输出 <code>O</code>，种子 = 0</td><td><code>acc_o</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L386">386</a></td><td><code>T.tile.fill(acc_o, 0.0)</code></td></tr>
+      <tr><td>运行分母 <code>d</code>，种子 = 1.0</td><td><code>sumexp</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L387">387</a></td><td>1.0 = sink 那一项 <code>exp(0)</code></td></tr>
+      <tr><td>分块主循环</td><td><code>for chunk …</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L390">390</a></td><td><code>NI_total</code> 块，每块 <code>BI=64</code> 键</td></tr>
+      <tr><td>被 mask 的位置设为 −∞</td><td><code>acc_s_ub</code> + <code>select</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L512">512–522</a></td><td>滑窗/稀疏掩码，<code>exp(−∞)=0</code> 不贡献</td></tr>
+      <tr><td>取分数、乘缩放系数</td><td><code>add</code> / <code>mul</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L539">539–549</a></td><td><code>分数 = QKᵀ × softmax_scale</code></td></tr>
+      <tr><td>把旧 <code>m</code> 存起来</td><td><code>m_i_prev = m_i</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L524">524</a></td><td>即本文的 <code>m_旧</code></td></tr>
+      <tr><td>本块局部最大值</td><td><code>reduce_max → m_i</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L552">552</a></td><td><code>m_块</code></td></tr>
+      <tr><td>更新 <code>m = max(m_旧, m_块)</code></td><td><code>T.tile.max</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L563">563</a></td><td>注释专门强调 dst 必须放最后</td></tr>
+      <tr><td>修正因子 <code>exp(m_旧 − m_新)</code></td><td><code>m_i_prev</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L565">565–567</a></td><td>先 <code>sub</code> 再 <code>exp</code>，结果存回 <code>m_i_prev</code></td></tr>
+      <tr><td>本块权重 <code>exp(分数 − m_新)</code></td><td><code>acc_s_ub</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L570">570–578</a></td><td>逐头减最大值后 <code>exp</code></td></tr>
+      <tr><td>本块的和</td><td><code>reduce_sum → sumexp_i_ub</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L580">580–584</a></td><td><code>这块的和</code></td></tr>
+      <tr><td><code>d = d × 修正 + 本块和</code></td><td><code>mul</code> 然后 <code>add</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L586">586–592</a></td><td>先打折扣，再累加</td></tr>
+      <tr><td><code>O = O × 修正</code></td><td><code>mul acc_o</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L595">595–601</a></td><td>旧输出同样打折扣</td></tr>
+      <tr><td><code>O += 本块的 P@V</code></td><td><code>add acc_o</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L619">619–630</a></td><td>P@V 由 cube 核算好后传回</td></tr>
+      <tr><td>收尾归一化 <code>O / d</code></td><td><code>T.tile.div</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L635">635–641</a></td><td>整个循环结束后<strong>只做一次</strong></td></tr>
+      <tr><td>写回输出</td><td><code>T.copy → Output</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L643">643–652</a></td><td></td></tr>
+      <tr><td><code>LSE = m + ln(d)</code></td><td><code>ln</code> 然后 <code>add</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L667">667–669</a></td><td>白送的副产品</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="note">
+    <p><strong>小提示</strong>：真实 kernel 里有两条额外复杂度，和 online softmax 的<strong>原理无关</strong>，是工程实现：</p>
+    <p>1. <strong>cube/vector 双核协作</strong>：矩阵乘 <code>Q@Kᵀ</code>、<code>P@V</code> 在 cube 核上算，softmax 在 vector 核上算，两者用 <code>set_cross_flag</code> / <code>wait_cross_flag</code> 握手传数据。本文把它们当成「分数送进来、P@V 送回去」的黑盒即可。</p>
+    <p>2. <strong>V 其实是个向量</strong>：例子里每个键的 <code>V</code> 是一个数（10, 20…）方便手算；真实里 <code>V</code> 是 <code>head_dim = 512</code> 维的向量，<code>O × 修正</code> 和 <code>O += P@V</code> 都是<strong>对 512 个分量逐个做</strong> —— 但每个分量的规则和本文完全一样。</p>
+  </div>
+
+  <!-- ===================== 9 ===================== -->
+  <h2 id="s9"><span class="num">9</span>一页速查：完整伪代码 + 总结</h2>
+
+  <h3>完整伪代码</h3>
+  <pre><code><span class="cmt"># ---- 初始化（来自 sink 种子）----</span>
+m = sink            <span class="cmt"># 运行最大值</span>
+d = <span class="hl">1.0</span>             <span class="cmt"># 运行分母（= sink 那一项 exp(0)）</span>
+O = <span class="hl">0</span>               <span class="cmt"># 运行输出（未归一化；sink 的值为 0）</span>
+
+<span class="cmt"># ---- 一块一块地处理所有键 ----</span>
+<span class="kw">for</span> 每一块 keys:
+    s        = 缩放后的分数        <span class="cmt"># 被 mask 掉的位置 = −∞（exp 后为 0，不贡献）</span>
+    m_块     = max(s)             <span class="cmt"># 这一块的局部最大值</span>
+    m_new    = max(m, m_块)       <span class="cmt"># 更新运行最大值</span>
+    corr     = exp(m − m_new)     <span class="cmt"># 修正因子（旧账要打的折扣，≤ 1）</span>
+    p        = exp(s − m_new)     <span class="cmt"># 这一块每个 key 的未归一化权重</span>
+    d        = d × corr + sum(p)               <span class="cmt"># 修正旧分母，再加新块</span>
+    O        = O × corr + sum(pᵢ × Vᵢ)         <span class="cmt"># 修正旧输出，再加新块</span>
+    m        = m_new
+
+<span class="cmt"># ---- 收尾 ----</span>
+输出  = O / d           <span class="ok"># 整个序列处理完，只归一化这一次</span>
+LSE   = m + ln(d)       <span class="ok"># 顺手产出 log-sum-exp</span></code></pre>
+
+  <h3>三句话总结</h3>
+  <ol>
+    <li><strong>softmax 要减最大值</strong>，否则 <code>exp</code> 溢出 → 用 <code>safe softmax</code>。</li>
+    <li><strong>但分块时看不到全局最大值</strong> → 维护运行最大值 <code>m</code>，一旦遇到更大的，就用<strong>修正因子 <code>exp(m_旧 − m_新)</code></strong> 把旧的分母 <code>d</code> 和输出 <code>O</code> 统一「打折」对齐。</li>
+    <li>结果与一次性全算<strong>完全相等（零误差）</strong>，代价只是几个标量账本 + 每块一次修正乘法；顺带白送一个 <strong><code>LSE = m + ln(d)</code></strong>，供反向传播和跨块合并使用。</li>
+  </ol>
+
+  <h3>例子一览（不带 sink）</h3>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>阶段</th><th>m</th><th>d</th><th>O</th><th>输出 = O/d</th></tr></thead>
+    <tbody>
+      <tr><td>初始</td><td class="num-cell">−∞</td><td class="num-cell">0</td><td class="num-cell">0</td><td>—</td></tr>
+      <tr><td>第 1 块后</td><td class="num-cell">3</td><td class="num-cell">1.5032</td><td class="num-cell">32.390</td><td>—</td></tr>
+      <tr><td>第 2 块后</td><td class="num-cell">5</td><td class="num-cell">1.5780</td><td class="num-cell">63.182</td><td class="num-cell"><strong>40.038</strong></td></tr>
+      <tr class="hl-row"><td>一次性全算</td><td class="num-cell">5</td><td class="num-cell">1.5781</td><td class="num-cell">63.182</td><td class="num-cell"><strong>40.038</strong> ✅</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p style="text-align:center; color:var(--muted); font-size:14px;"><strong>完全一致</strong> —— 这就是 online softmax 的全部魅力。</p>
+
+  <h3>和姊妹篇的关系</h3>
+  <p>本 kernel 的几篇详解，分别讲它的不同侧面：</p>
+  <ul>
+    <li><strong>本文</strong>：取到 KV 之后，分数怎么变权重、怎么边走边算（<strong>数值算法</strong>）；</li>
+    <li><a href="PagedAttention%20%E5%8E%9F%E7%90%86%E8%AF%A6%E8%A7%A3.html">PagedAttention 原理详解</a>：KV 存在哪、怎么取（<strong>内存管理</strong>）；</li>
+    <li><a href="SparseAttnSharedkv%20%E8%AF%A6%E8%A7%A3.html">SparseAttnSharedkv 详解</a>：整个算子怎么把这些拼起来（<strong>全局架构</strong>）。</li>
+  </ul>
+
+</div>
+
+<a href="#top" class="totop" title="回到顶部">↑</a>
+<script>
+(function(){
+  var heads = Array.prototype.slice.call(document.querySelectorAll('h2[id]'));
+  var links = Array.prototype.slice.call(document.querySelectorAll('.sidenav a'));
+  if(!heads.length || !links.length) return;
+  var ticking = false;
+  function update(){
+    ticking = false;
+    var cur = heads[0];
+    for(var i=0;i<heads.length;i++){
+      if(heads[i].getBoundingClientRect().top <= 130) cur = heads[i];
+    }
+    for(var j=0;j<links.length;j++){
+      links[j].classList.toggle('active', links[j].getAttribute('href') === '#'+cur.id);
+    }
+  }
+  function onScroll(){ if(!ticking){ ticking = true; requestAnimationFrame(update); } }
+  document.addEventListener('scroll', onScroll, {passive:true});
+  window.addEventListener('resize', onScroll, {passive:true});
+  update();
+})();
+</script>
+</body>
+</html>
