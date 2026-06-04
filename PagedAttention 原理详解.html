@@ -153,16 +153,13 @@
   .d2{border-color:var(--gray); background:#f6f7f9;} .d2 .dname{color:var(--gray-ink);}
   .d3{border-color:var(--blue); background:#f3f8ff;} .d3 .dname{color:var(--blue-ink);}
 
-  /* waste / hotel */
-  .hotel{display:grid; grid-template-columns:1fr 1fr; gap:18px;}
-  .floor{border:1.5px solid var(--line); border-radius:12px; padding:14px; background:var(--panel);}
-  .floor h4{margin:0 0 10px; font-size:14px;}
-  .rooms{display:grid; grid-template-columns:repeat(5,1fr); gap:5px;}
-  .room{height:26px; border-radius:5px; border:1px solid #d8dde3; background:#eef1f5;}
-  .room.used{background:#cfe3ff; border-color:#9bc2ff;}
-  .room.empty{background:repeating-linear-gradient(45deg,#fff,#fff 4px,#f1f3f6 4px,#f1f3f6 8px);}
+  /* corridor — fragmentation figures */
+  .corridor{display:flex; gap:5px; margin:6px 0 2px;}
+  .corridor .cell{flex:1; height:38px; border-radius:6px; border:1px solid #d8dde3; background:#eef1f5;}
+  .corridor .cell.used{background:#cfe3ff; border-color:#9bc2ff;}
+  .corridor .cell.empty{background:repeating-linear-gradient(45deg,#fff,#fff 5px,#f1f3f6 5px,#f1f3f6 10px);}
+  .frag-head{margin:0 0 4px; font-size:14px;}
   .badwaste{color:#b54708; font-weight:700; font-size:13px;}
-  .goodwaste{color:var(--green-ink); font-weight:700; font-size:13px;}
 
   /* two cache compare */
   .twocache{display:grid; grid-template-columns:1fr 1fr; gap:16px;}
@@ -389,35 +386,69 @@
   <h2 id="s2"><span class="num">2</span>老办法为什么浪费：给每个人预留一整层楼</h2>
   <p>最直觉的存法是：<strong>给每条序列开一块「连续的大数组」</strong>，而且大小要按「<strong>最长可能的长度</strong>」来开。</p>
   <p>为什么非要连续、非要按最长开？因为老式的注意力代码喜欢「一口气把这条序列的所有 K 读进来」，连续摆放才好一把抓；而它<strong>事先不知道这条序列最终会多长</strong>，只能按最坏情况预留。这就像一家酒店的蠢规矩：</p>
-  <blockquote><p><strong>每来一位客人，无论他实际只要几间房，前台都把一整层楼整个包给他一个人——别人一间都不能用。</strong></p></blockquote>
+  <blockquote><p><strong>每来一位客人，前台一律按他可能要的最多间数，把<em>连续的一长排房间</em>整段包给他一个人——中途别人一间都插不进来，哪怕他根本住不满。</strong></p></blockquote>
 
   <figure>
     <div class="figcard">
-      <div class="hotel">
-        <div class="floor">
-          <h4>① 楼里空房 · <span class="badwaste">内部碎片</span></h4>
-          <div class="rooms">
-            <div class="room used"></div><div class="room used"></div><div class="room used"></div>
-            <div class="room empty"></div><div class="room empty"></div>
-            <div class="room empty"></div><div class="room empty"></div><div class="room empty"></div>
-            <div class="room empty"></div><div class="room empty"></div>
-          </div>
-          <p style="font-size:13px;color:#64748b;margin:10px 0 0">一层楼共 <strong>10 间房</strong>。这位客人其实只要 <strong>3 间</strong>，却被整层包走——剩下的 <strong>7 间</strong>（10 − 3 = 7）一直空着，也不分给别人。<br>→ 对应 KV Cache：序列只有 100 个词，却占着按 2000 个词（最长可能）预留的空间。</p>
-        </div>
-        <div class="floor">
-          <h4>② 楼与楼夹缝 · <span class="badwaste">外部碎片</span></h4>
-          <div class="rooms">
-            <div class="room used"></div><div class="room used"></div><div class="room used"></div>
-            <div class="room empty"></div><div class="room empty"></div>
-            <div class="room used"></div><div class="room used"></div>
-            <div class="room empty"></div>
-            <div class="room used"></div><div class="room empty"></div>
-          </div>
-          <p style="font-size:13px;color:#64748b;margin:10px 0 0">不同客人各占一段楼层，退房后空出一段段<strong>长短不一</strong>的区域，零散分布。新客人要的是<strong>一整段连续</strong>的空间——总空房虽不少，却拼不出连续的一段 → 只能拒之门外。</p>
-        </div>
+      <h4 class="frag-head">① 一条序列：连续预留一大段，却没住满 · <span class="badwaste">内部碎片</span></h4>
+      <div class="corridor">
+        <div class="cell used"></div><div class="cell used"></div><div class="cell used"></div>
+        <div class="cell empty"></div><div class="cell empty"></div><div class="cell empty"></div><div class="cell empty"></div>
+        <div class="cell empty"></div><div class="cell empty"></div><div class="cell empty"></div>
       </div>
+      <p style="font-size:13.5px;color:#64748b;margin:10px 0 0">前台给这位客人一口气划了 <strong>连续 10 间房</strong>（按他可能要的最多），可他其实只住 <strong>3 间</strong>，剩下的 <strong>7 间</strong>（10 − 3 = 7）就卡在他名下空着，也不分给别人。<br>→ 对应 KV Cache：序列只有 100 个词，却占着按 2000 个词（最长可能）预留的连续空间。</p>
     </div>
-    <figcaption>两种浪费：蓝＝真正用上的房间，斜纹＝白白站岗的空房。</figcaption>
+    <figcaption>放大看<strong>一条序列</strong>的预留段：蓝＝真住的房，斜纹＝预留却空着的房。</figcaption>
+  </figure>
+
+  <figure>
+    <div class="figcard">
+      <h4 class="frag-head">② 整栋楼：占用段与空段长短交错，拼不出整段 · <span class="badwaste">外部碎片</span></h4>
+      <svg viewBox="0 0 880 236" role="img" aria-label="外部碎片走廊示意图">
+        <text x="24" y="22" font-size="13" font-weight="700" fill="#334155">整栋楼的房间（地址从左到右连续编号 →）</text>
+        <!-- 甲 (0-2) -->
+        <rect x="24"  y="40" width="51" height="46" rx="6" fill="#dbeafe" stroke="#3b82f6"/>
+        <rect x="77"  y="40" width="51" height="46" rx="6" fill="#dbeafe" stroke="#3b82f6"/>
+        <rect x="130" y="40" width="51" height="46" rx="6" fill="#dbeafe" stroke="#3b82f6"/>
+        <text x="103" y="69" text-anchor="middle" font-size="14" font-weight="700" fill="#1e40af">甲</text>
+        <!-- 空 (3-4) -->
+        <rect x="183" y="40" width="51" height="46" rx="6" fill="#f1f3f6" stroke="#cbd5e1" stroke-dasharray="4 3"/>
+        <rect x="236" y="40" width="51" height="46" rx="6" fill="#f1f3f6" stroke="#cbd5e1" stroke-dasharray="4 3"/>
+        <text x="209" y="68" text-anchor="middle" font-size="11" fill="#94a3b8">空</text>
+        <text x="262" y="68" text-anchor="middle" font-size="11" fill="#94a3b8">空</text>
+        <!-- 乙 (5-9) -->
+        <rect x="289" y="40" width="51" height="46" rx="6" fill="#d1fae5" stroke="#10b981"/>
+        <rect x="342" y="40" width="51" height="46" rx="6" fill="#d1fae5" stroke="#10b981"/>
+        <rect x="395" y="40" width="51" height="46" rx="6" fill="#d1fae5" stroke="#10b981"/>
+        <rect x="448" y="40" width="51" height="46" rx="6" fill="#d1fae5" stroke="#10b981"/>
+        <rect x="501" y="40" width="51" height="46" rx="6" fill="#d1fae5" stroke="#10b981"/>
+        <text x="420" y="69" text-anchor="middle" font-size="14" font-weight="700" fill="#065f46">乙</text>
+        <!-- 空 (10) -->
+        <rect x="554" y="40" width="51" height="46" rx="6" fill="#f1f3f6" stroke="#cbd5e1" stroke-dasharray="4 3"/>
+        <text x="580" y="68" text-anchor="middle" font-size="11" fill="#94a3b8">空</text>
+        <!-- 丙 (11-13) -->
+        <rect x="607" y="40" width="51" height="46" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+        <rect x="660" y="40" width="51" height="46" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+        <rect x="713" y="40" width="51" height="46" rx="6" fill="#ede9fe" stroke="#8b5cf6"/>
+        <text x="686" y="69" text-anchor="middle" font-size="14" font-weight="700" fill="#5b21b6">丙</text>
+        <!-- 空 (14-15) -->
+        <rect x="766" y="40" width="51" height="46" rx="6" fill="#f1f3f6" stroke="#cbd5e1" stroke-dasharray="4 3"/>
+        <rect x="819" y="40" width="51" height="46" rx="6" fill="#f1f3f6" stroke="#cbd5e1" stroke-dasharray="4 3"/>
+        <text x="792" y="68" text-anchor="middle" font-size="11" fill="#94a3b8">空</text>
+        <text x="845" y="68" text-anchor="middle" font-size="11" fill="#94a3b8">空</text>
+        <!-- bracket: largest empty run -->
+        <path d="M766,92 L766,98 L870,98 L870,92" fill="none" stroke="#ef4444" stroke-width="1.5"/>
+        <text x="818" y="114" text-anchor="middle" font-size="12" fill="#ef4444">最大的一段连续空房 = 2 间</text>
+        <!-- new guest 丁 -->
+        <text x="24" y="140" font-size="12.5" fill="#475569">这时来了第 4 位客人丁，他需要——</text>
+        <rect x="24" y="150" width="157" height="40" rx="6" fill="#ffedd5" stroke="#f97316"/>
+        <text x="102" y="175" text-anchor="middle" font-size="13" font-weight="700" fill="#9a3412">连续 3 间</text>
+        <text x="196" y="175" font-size="13" font-weight="700" fill="#ef4444">✗ 放不下：没有连续 3 间的空段</text>
+        <!-- conclusion -->
+        <text x="24" y="220" font-size="12.5" fill="#334155">空房总数有 <tspan font-weight="700">5 间</tspan>，却拼不出连续的 3 间 —— 这就是外部碎片。</text>
+      </svg>
+    </div>
+    <figcaption>缩小看<strong>整栋楼</strong>：每位客人占一段长短不一的连续房间，退房后空段零散；新客人要连续的一段，总空房够却拼不出。</figcaption>
   </figure>
 
   <p>实测中，这种「连续 + 预留最长」的存法，<strong>真正用上的显存常常只有 20%~40%</strong>，剩下大半都在替「可能用得上但其实没用上」的空间站岗。</p>
