@@ -130,19 +130,6 @@
   .p1{border-color:var(--green); background:#f2fdf8;} .p1 .ptitle{color:var(--green-ink);} .p1 .tok{background:var(--green-bg); color:var(--green-ink);}
   .p2{border-color:var(--amber); background:#fffdf2;} .p2 .ptitle{color:var(--amber-ink);} .p2 .tok{background:var(--amber-bg); color:var(--amber-ink);}
 
-  /* arithmetic flow */
-  .flow{display:flex; flex-wrap:wrap; align-items:stretch; gap:0; justify-content:center;}
-  .step{
-    background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:14px 16px;
-    min-width:128px; text-align:center; box-shadow:0 1px 3px rgba(20,40,80,.06);
-  }
-  .step .lab{font-size:12px; color:var(--muted); margin-bottom:6px;}
-  .step .val{font-family:var(--mono); font-size:15px; font-weight:700; color:#16324f;}
-  .step .op{font-family:var(--mono); font-size:12.5px; color:var(--accent); margin-top:6px;}
-  .arrow{display:flex; align-items:center; padding:0 6px; color:var(--accent); font-size:22px; font-weight:700;}
-  .res{background:#eafaf0; border-color:#b7e6c9;}
-  .res .val{color:var(--green-ink);}
-
   /* tensor shape */
   .shape{display:flex; flex-wrap:wrap; gap:10px; justify-content:center; margin:6px 0;}
   .dim{border-radius:10px; padding:12px 14px; min-width:120px; text-align:center; border:1.5px solid;}
@@ -213,9 +200,7 @@
     body{font-size:16px;}
     h1{font-size:30px;}
     nav.toc ol{columns:1;}
-    .hotel,.twocache{grid-template-columns:1fr;}
-    .flow{flex-direction:column; align-items:stretch;}
-    .arrow{justify-content:center; transform:rotate(90deg); padding:6px 0;}
+    .twocache{grid-template-columns:1fr;}
   }
 </style>
 </head>
@@ -655,48 +640,48 @@
 
   <figure>
     <div class="figcard">
-      <div class="flow">
-        <div class="step">
-          <div class="lab">逻辑 token 号</div>
-          <div class="val">g = 6</div>
-        </div>
-        <div class="arrow">→</div>
-        <div class="step">
-          <div class="lab">第 1 步 · 整数除法</div>
-          <div class="val">逻辑页 = 1</div>
-          <div class="op">6 // 4 = 1</div>
-        </div>
-        <div class="arrow">→</div>
-        <div class="step">
-          <div class="lab">第 3 步 · 查块表</div>
-          <div class="val">物理块 = 0</div>
-          <div class="op">block_table[b,1]</div>
-        </div>
-        <div class="arrow">→</div>
-        <div class="step res">
-          <div class="lab">结果：去哪读</div>
-          <div class="val">KV[块0, 行2]</div>
-          <div class="op">＝ t6 ✓</div>
-        </div>
-      </div>
-      <div class="flow" style="margin-top:14px">
-        <div class="step">
-          <div class="lab">逻辑 token 号</div>
-          <div class="val">g = 6</div>
-        </div>
-        <div class="arrow">→</div>
-        <div class="step">
-          <div class="lab">第 2 步 · 取余</div>
-          <div class="val">块内行号 = 2</div>
-          <div class="op">6 % 4 = 2</div>
-        </div>
-        <div class="arrow" style="opacity:0">→</div>
-        <div class="step" style="visibility:hidden"></div>
-        <div class="arrow" style="opacity:0">→</div>
-        <div class="step" style="visibility:hidden"></div>
-      </div>
+      <svg viewBox="0 0 900 330" role="img" aria-label="三步取数算术：g=6 分两路再汇合">
+        <defs>
+          <marker id="fa" markerWidth="10" markerHeight="10" refX="7.5" refY="3.5" orient="auto">
+            <path d="M0,0 L7.5,3.5 L0,7 Z" fill="#2f6fea"/>
+          </marker>
+        </defs>
+        <!-- connectors: g forks into two routes, then both merge into result -->
+        <path d="M146,165 C 172,165 174,70 196,70"  fill="none" stroke="#2f6fea" stroke-width="2.2" marker-end="url(#fa)"/>
+        <path d="M146,165 C 172,165 174,260 196,260" fill="none" stroke="#2f6fea" stroke-width="2.2" marker-end="url(#fa)"/>
+        <path d="M372,70 L424,70"                    fill="none" stroke="#2f6fea" stroke-width="2.2" marker-end="url(#fa)"/>
+        <path d="M614,70 C 650,70 652,148 686,148"   fill="none" stroke="#2563eb" stroke-width="2.4" marker-end="url(#fa)"/>
+        <path d="M372,260 C 540,260 600,182 686,182" fill="none" stroke="#d97706" stroke-width="2.4" marker-end="url(#fa)"/>
+        <!-- labels on the two merging arrows -->
+        <text x="642" y="104" font-size="12" font-weight="700" fill="#2563eb">块 0</text>
+        <text x="556" y="206" font-size="12" font-weight="700" fill="#d97706">行 2</text>
+        <!-- g box -->
+        <rect x="24" y="119" width="122" height="92" rx="12" fill="#ffffff" stroke="#e3e6ea"/>
+        <text x="85" y="152" text-anchor="middle" font-size="12" fill="#5b6470">逻辑 token 号</text>
+        <text x="85" y="183" text-anchor="middle" font-size="18" font-weight="700" fill="#16324f" font-family="ui-monospace,monospace">g = 6</text>
+        <!-- step 1 (upper-left) -->
+        <rect x="196" y="24" width="176" height="92" rx="12" fill="#ffffff" stroke="#e3e6ea"/>
+        <text x="284" y="50"  text-anchor="middle" font-size="12" fill="#5b6470">第 1 步 · 整数除法</text>
+        <text x="284" y="79"  text-anchor="middle" font-size="17" font-weight="700" fill="#16324f">逻辑页 = 1</text>
+        <text x="284" y="101" text-anchor="middle" font-size="13" fill="#2f6fea" font-family="ui-monospace,monospace">6 // 4 = 1</text>
+        <!-- step 3 (upper-right) -->
+        <rect x="424" y="24" width="190" height="92" rx="12" fill="#ffffff" stroke="#e3e6ea"/>
+        <text x="519" y="50"  text-anchor="middle" font-size="12" fill="#5b6470">第 3 步 · 查块表</text>
+        <text x="519" y="79"  text-anchor="middle" font-size="17" font-weight="700" fill="#16324f">物理块 = 0</text>
+        <text x="519" y="101" text-anchor="middle" font-size="12.5" fill="#2f6fea" font-family="ui-monospace,monospace">block_table[b,1]</text>
+        <!-- step 2 (lower) -->
+        <rect x="196" y="214" width="176" height="92" rx="12" fill="#ffffff" stroke="#e3e6ea"/>
+        <text x="284" y="240" text-anchor="middle" font-size="12" fill="#5b6470">第 2 步 · 取余</text>
+        <text x="284" y="269" text-anchor="middle" font-size="17" font-weight="700" fill="#16324f">块内行号 = 2</text>
+        <text x="284" y="291" text-anchor="middle" font-size="13" fill="#2f6fea" font-family="ui-monospace,monospace">6 % 4 = 2</text>
+        <!-- result (merge of both routes) -->
+        <rect x="686" y="119" width="190" height="92" rx="12" fill="#eafaf0" stroke="#b7e6c9"/>
+        <text x="781" y="147" text-anchor="middle" font-size="12" fill="#5b6470">结果 · 去哪读</text>
+        <text x="781" y="176" text-anchor="middle" font-size="16" font-weight="700" fill="#065f46" font-family="ui-monospace,monospace">KV[块0, 行2]</text>
+        <text x="781" y="198" text-anchor="middle" font-size="13" fill="#059669">＝ t6 ✓</text>
+      </svg>
     </div>
-    <figcaption>两步算术（除法定页、取余定行）+ 一次查表，就把逻辑 token 6 定位到「物理块 0、第 2 行」。</figcaption>
+    <figcaption><strong>g = 6 兵分两路</strong>：上路用整数除法（6 // 4）定位「第几个块」、再查块表得<span style="color:#2563eb;font-weight:700">物理块 0</span>；下路用取余（6 % 4）定位「块里第几行」得<span style="color:#d97706;font-weight:700">行号 2</span>。两路<strong>汇合</strong>才拼出结果 <span class="fig-mono">KV[块0, 行2] = t6</span>。</figcaption>
   </figure>
 
   <p><strong>结论：token 6 的 KV，存在「物理块 0、第 2 行」。</strong>回到上面的核心图核对：块 0 = <code>[t4 t5 t6 t7]</code>，第 2 行（从 0 数）正是 <strong>t6</strong>。✅ 你完全可以拿纸笔把 token 0~9 全都验算一遍，每一个都能对上。</p>
