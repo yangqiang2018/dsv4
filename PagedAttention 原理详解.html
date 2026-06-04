@@ -176,6 +176,34 @@
 
   .filelink{font-family:var(--mono); font-size:.86em;}
 
+  /* side nav (table of contents) — hidden by default, shown on wide screens */
+  .sidenav{display:none;}
+  @media (min-width:1180px){
+    .sidenav{
+      display:block; position:fixed; top:0; left:0; width:264px; height:100vh;
+      overflow-y:auto; padding:30px 16px 48px; box-sizing:border-box;
+      background:#fbfbf8; border-right:1px solid var(--line);
+    }
+    .sidenav .snav-title{
+      margin:0 0 14px; padding-left:12px; font-size:12px; font-weight:700;
+      letter-spacing:.14em; text-transform:uppercase; color:var(--muted);
+    }
+    .sidenav ol{list-style:none; margin:0; padding:0;}
+    .sidenav li{margin:1px 0;}
+    .sidenav a{
+      display:flex; gap:9px; align-items:baseline; padding:6px 11px;
+      border-radius:8px; border-left:2px solid transparent;
+      color:#475461; font-size:13.5px; line-height:1.45;
+    }
+    .sidenav a .n{color:var(--accent); font-weight:700; font-variant-numeric:tabular-nums; min-width:16px; text-align:right;}
+    .sidenav a:hover{background:var(--accent-soft); text-decoration:none;}
+    .sidenav a.active{background:var(--accent-soft); color:var(--accent); font-weight:700; border-left-color:var(--accent);}
+    /* hand the top-of-page TOC over to the sidebar; clear the fixed sidebar */
+    nav.toc{display:none;}
+    header.hero{margin-left:max(300px, calc((100% - 880px)/2)); margin-right:auto;}
+    .wrap{margin-left:max(300px, calc((100% - 880px)/2)); margin-right:auto;}
+  }
+
   /* back to top */
   .totop{
     position:fixed; right:22px; bottom:22px; width:44px; height:44px; border-radius:50%;
@@ -196,6 +224,23 @@
 </head>
 <body>
 <a id="top"></a>
+<aside class="sidenav" aria-label="目录">
+  <p class="snav-title">目录</p>
+  <ol>
+    <li><a href="#s0"><span class="n">0</span><span>注意力、KV 是什么</span></a></li>
+    <li><a href="#s1"><span class="n">1</span><span>KV Cache 内存大户</span></a></li>
+    <li><a href="#s2"><span class="n">2</span><span>老办法为什么浪费</span></a></li>
+    <li><a href="#s3"><span class="n">3</span><span>操作系统的分页</span></a></li>
+    <li><a href="#s4"><span class="n">4</span><span>三个主角</span></a></li>
+    <li><a href="#s5"><span class="n">5</span><span>完整小例子</span></a></li>
+    <li><a href="#s6"><span class="n">6</span><span>真实张量布局</span></a></li>
+    <li><a href="#s7"><span class="n">7</span><span>核心两行代码</span></a></li>
+    <li><a href="#s8"><span class="n">8</span><span>容易卡住的细节</span></a></li>
+    <li><a href="#s9"><span class="n">9</span><span>本 kernel 特别之处</span></a></li>
+    <li><a href="#s10"><span class="n">10</span><span>原理对回代码</span></a></li>
+    <li><a href="#s11"><span class="n">11</span><span>速查 + 总结</span></a></li>
+  </ol>
+</aside>
 <header class="hero">
   <span class="kicker">KV Cache · 内存管理</span>
   <h1>PagedAttention 原理详解</h1>
@@ -834,5 +879,27 @@ T.copy(ori_KV[ori_blk, ori_row, 0, :], kv_ub)            <span class="ok"># ← 
 </div>
 
 <a href="#top" class="totop" title="回到顶部">↑</a>
+<script>
+(function(){
+  var heads = Array.prototype.slice.call(document.querySelectorAll('h2[id]'));
+  var links = Array.prototype.slice.call(document.querySelectorAll('.sidenav a'));
+  if(!heads.length || !links.length) return;
+  var ticking = false;
+  function update(){
+    ticking = false;
+    var cur = heads[0];
+    for(var i=0;i<heads.length;i++){
+      if(heads[i].getBoundingClientRect().top <= 130) cur = heads[i];
+    }
+    for(var j=0;j<links.length;j++){
+      links[j].classList.toggle('active', links[j].getAttribute('href') === '#'+cur.id);
+    }
+  }
+  function onScroll(){ if(!ticking){ ticking = true; requestAnimationFrame(update); } }
+  document.addEventListener('scroll', onScroll, {passive:true});
+  window.addEventListener('resize', onScroll, {passive:true});
+  update();
+})();
+</script>
 </body>
 </html>
