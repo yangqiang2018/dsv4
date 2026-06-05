@@ -257,7 +257,7 @@
 <div class="wrap">
 
   <div class="note">
-    <p><strong>本文配套代码：</strong><a href="sparse_attn_sharedkv_tilelang/kernel.py">sparse_attn_sharedkv_tilelang/kernel.py</a>，重点是 <code>T.Scope("V")</code> 段里第 393–550 行构建并施加 mask 的部分。</p>
+    <p><strong>本文讲什么：</strong>注意力算子 <code>sparse_attn_sharedkv</code> 在向量侧（<code>T.Scope("V")</code>）<strong>构建并施加 mask</strong> 的那部分逻辑。</p>
     <p><strong>目标读者：没学过神经网络的高中生。</strong>你只需要会这几样：</p>
     <ul style="margin:4px 0">
       <li>加减乘除、比大小（<code>≤</code>、<code>&lt;</code>）、求最大值；</li>
@@ -279,7 +279,7 @@
       <li><span class="ix">6.</span> <a href="#s6">s_global 的玄机：query 比 kv 短怎么办</a></li>
       <li><span class="ix">7.</span> <a href="#s7">永远不被 mask 的虚拟 token：sink</a></li>
       <li><span class="ix">8.</span> <a href="#s8">把所有块拼起来：当前 query 的完整「能看名单」</a></li>
-      <li><span class="ix">9.</span> <a href="#s9">原理对回代码：kernel.py 行号映射</a></li>
+      <li><span class="ix">9.</span> <a href="#s9">原理对回代码：每一步在做什么</a></li>
       <li><span class="ix">10.</span> <a href="#s10">一页速查 + 总结</a></li>
     </ol>
   </nav>
@@ -527,7 +527,7 @@
     <li><strong>相加</strong>：把这个加性掩码加到分数上，再交给 softmax。</li>
   </ol>
 
-  <div class="note"><p><strong>代码里的小细节：</strong>算子其实是先把加性掩码（0 / −∞）放进 <code>acc_s_ub</code>，再 <code>加上</code>原始分数、最后乘以缩放系数 <code>scale</code>。因为 <code>(−∞ + 任何数) × 正数 = −∞</code>，顺序不影响结果：被遮的位置最终还是 <code>−∞</code>。见第 513–549 行。</p></div>
+  <div class="note"><p><strong>代码里的小细节：</strong>算子其实是先把加性掩码（0 / −∞）放进 <code>acc_s_ub</code>，再 <code>加上</code>原始分数、最后乘以缩放系数 <code>scale</code>。因为 <code>(−∞ + 任何数) × 正数 = −∞</code>，顺序不影响结果：被遮的位置最终还是 <code>−∞</code>。</p></div>
 
   <!-- ===================== 3 ===================== -->
   <h2 id="s3"><span class="num">3</span>第一种 mask：滑动窗口的因果遮挡（ori pass）</h2>
@@ -581,7 +581,7 @@
 
   <h3>对回代码：三个动作造出这张名单</h3>
 
-  <p>代码（第 396–407 行）用三个动作完成第 1 块的判断：</p>
+  <p>代码用三个动作完成第 1 块的判断：</p>
 
   <div class="trace">
     <div class="tstep">
@@ -602,13 +602,13 @@
     </div>
   </div>
 
-  <pre><code><span class="cmt"># kernel.py 第 396-407 行（ori pass 的 mask）</span>
+  <pre><code><span class="cmt"># ori pass 的 mask</span>
 chunk_start = ori_left + chunk * BI            <span class="cmt"># 本块第一个 token 编号</span>
 T.tile.<span class="fn">createvecindex</span>(idx_int, chunk_start)   <span class="cmt"># 动作1: idx = [4,5,6,7]</span>
 T.<span class="fn">copy</span>(idx_int, idx_float)
 T.tile.<span class="fn">compare</span>(mask_ub, idx_float,
                T.float32(ori_right), <span class="hl">"LE"</span>)      <span class="cmt"># 动作2: idx &lt;= s ? 1 : 0</span>
-<span class="cmt"># ... 之后第 516 行用 select 把 mask 变成 0 / -inf（动作3）</span></code></pre>
+<span class="cmt"># ... 之后用 select 把 mask 变成 0 / -inf（动作3）</span></code></pre>
 
   <div class="note"><p><strong>窗口怎么"滑动"？</strong>换一个 query 位置，<code>s</code> 变了，窗口 <code>[max(s−7,0), s]</code> 整段跟着平移。比如 query 在位置 10：窗口 = [3,10]，看的是 token 3~10。窗口像一个固定宽度的取景框，跟着 query 一起往右滑 —— 这正是"滑动窗口 sliding window"名字的由来。只有当 query 还在<strong>句子很靠前</strong>（s &lt; 7）时，左端才会被 <code>max(...,0)</code> 顶在 0，窗口右侧才会出现"够不着、被遮住"的格子（就像本例的 6、7）。</p></div>
 
@@ -733,7 +733,7 @@ T.tile.<span class="fn">compare</span>(mask_ub, idx_float,
 
   <h3>对回代码：两次比较 + 一次 AND</h3>
 
-  <p>cmp pass 的判断比 ori 多一步（两个条件要 AND 在一起），见第 463–483 行：</p>
+  <p>cmp pass 的判断比 ori 多一步（两个条件要 AND 在一起）：</p>
 
   <div class="trace">
     <div class="tstep">
@@ -757,7 +757,7 @@ T.tile.<span class="fn">compare</span>(mask_ub, idx_float,
     </div>
   </div>
 
-  <pre><code><span class="cmt"># kernel.py 第 465-483 行（cmp pass 的 mask）</span>
+  <pre><code><span class="cmt"># cmp pass 的 mask</span>
 <span class="cmt"># 条件1: idx >= 0（剔除 -1 占位符）</span>
 T.tile.<span class="fn">compare</span>(mask_ub,   idx_float, T.float32(-0.5),          <span class="hl">"GT"</span>)
 <span class="cmt"># 条件2: idx &lt; threshold（压缩空间的因果门槛）</span>
@@ -816,7 +816,7 @@ T.tile.<span class="fn">bitwise_and</span>(mask_ub, mask_ub, mask_ub_2)
     </div>
   </figure>
 
-  <pre><code><span class="cmt"># kernel.py 第 413-428 行（ori）/ 第 489-503 行（cmp）：取数前的安全闸门</span>
+  <pre><code><span class="cmt"># 取数前的安全闸门（ori、cmp 各一处）</span>
 <span class="kw">if</span> g_idx &lt;= ori_right:        <span class="cmt"># ori：编号没越过当前位置才取</span>
     ... 解析分页表，T.<span class="fn">copy</span>(真实 KV 行 → kv_ub)
 <span class="kw">else</span>:
@@ -883,7 +883,7 @@ T.tile.<span class="fn">bitwise_and</span>(mask_ub, mask_ub, mask_ub_2)
 
   <p>实现上，sink 不走 mask 这条路，而是被<strong>当作初始状态"种"进在线 softmax</strong>里：把 <code>(行最大值, 行求和)</code> 初始化为 <code>(sink_h, 1.0)</code>，等价于"先放进去一个分数为 <code>sink_h</code>、对应 value 全为 0 的虚拟 key"。因为它的 value 是 0，所以它只改变分母（让权重总和略小于把它去掉时的值），不给输出加任何内容。</p>
 
-  <div class="note"><p>本文聚焦 mask，sink 只点到为止。它的完整推导（为什么种子是 <code>(sink, 1)</code>、怎么不影响数值）见姊妹篇 <a href="OnlineSoftmax 原理详解.html">《Online Softmax 原理详解》</a>第 6 节。对应代码在 <code>kernel.py</code> 第 382–387 行（<code>T.copy(Sinks..., m_i)</code> 把 sink 种进 <code>m_i</code>，并把 <code>sumexp</code> 填 1.0）。</p></div>
+  <div class="note"><p>本文聚焦 mask，sink 只点到为止。它的完整推导（为什么种子是 <code>(sink, 1)</code>、怎么不影响数值）见姊妹篇 <a href="OnlineSoftmax 原理详解.html">《Online Softmax 原理详解》</a>。它的实现是把 sink 种进运行最大值 <code>m_i</code>、并把 <code>sumexp</code> 初始化成 1.0，<strong>不走 mask 这条路</strong>。</p></div>
 
   <!-- ===================== 8 ===================== -->
   <h2 id="s8"><span class="num">8</span>把所有块拼起来：当前 query 的完整「能看名单」</h2>
@@ -948,26 +948,26 @@ T.tile.<span class="fn">bitwise_and</span>(mask_ub, mask_ub, mask_ub_2)
   <p>真实算子里只是把数字放大：窗口 128 个原始 token（2 块×64）+ 最多 512 个压缩 token（8 块×64）+ sink，对 64 个头同时算。<strong>判断规则一字不差</strong>。</p>
 
   <!-- ===================== 9 ===================== -->
-  <h2 id="s9"><span class="num">9</span>原理对回代码：kernel.py 行号映射</h2>
+  <h2 id="s9"><span class="num">9</span>原理对回代码：每一步在做什么</h2>
 
   <div class="tablewrap">
   <table>
-    <thead><tr><th>原理（本文）</th><th>代码动作</th><th>kernel.py 行号</th></tr></thead>
+    <thead><tr><th>原理（本文）</th><th>对应的代码动作（变量 / 函数名）</th></tr></thead>
     <tbody>
-      <tr><td>算出 query 真实位置 s_global</td><td><code>s_global = act_kv − act_q + s_i</code></td><td class="num-cell">324</td></tr>
-      <tr><td>窗口右端 / 左端</td><td><code>ori_right = s_global</code>；<code>ori_left = max(s_global−127, 0)</code></td><td class="num-cell">325–330</td></tr>
-      <tr><td>压缩门槛 threshold</td><td><code>cmp_threshold = (s_global+1)//cmp_ratio</code></td><td class="num-cell">331</td></tr>
-      <tr class="hl-row"><td><b>ori：</b>生成本块编号</td><td><code>T.tile.createvecindex(idx, chunk_start)</code></td><td class="num-cell">396–399</td></tr>
-      <tr class="hl-row"><td><b>ori：</b>右边界判断 idx ≤ s</td><td><code>T.tile.compare(..., ori_right, "LE")</code></td><td class="num-cell">402–407</td></tr>
-      <tr><td>ori：取数安全闸门（否则填 0）</td><td><code>if g_idx ≤ ori_right: copy 真实KV  else: fill 0</code></td><td class="num-cell">413–428</td></tr>
-      <tr><td>cmp：编号来源（SCFA 读 / CFA 生成）</td><td><code>copy(cmp_indices...)</code> / <code>createvecindex</code></td><td class="num-cell">436–463</td></tr>
-      <tr class="hl-row"><td><b>cmp：</b>条件1 idx ≥ 0</td><td><code>T.tile.compare(..., −0.5, "GT")</code></td><td class="num-cell">466–471</td></tr>
-      <tr class="hl-row"><td><b>cmp：</b>条件2 idx &lt; threshold</td><td><code>T.tile.compare(..., cmp_threshold, "LT")</code></td><td class="num-cell">472–477</td></tr>
-      <tr class="hl-row"><td><b>cmp：</b>两条件取 AND</td><td><code>T.tile.bitwise_and(mask_ub, mask_ub, mask_ub_2)</code></td><td class="num-cell">479–483</td></tr>
-      <tr><td>cmp：取数安全闸门（否则填 0）</td><td><code>if cmp_idx ≥ 0: copy 真实KV  else: fill 0</code></td><td class="num-cell">489–503</td></tr>
-      <tr class="hl-row"><td><b>翻译成加性掩码 0 / −∞</b></td><td><code>T.tile.select(mask, 0.0, −inf)</code></td><td class="num-cell">513–522</td></tr>
-      <tr><td>把掩码加到分数、再缩放</td><td><code>add(分数+掩码)</code> → <code>mul(×scale)</code></td><td class="num-cell">530–549</td></tr>
-      <tr><td>sink 种进在线 softmax 初始状态</td><td><code>copy(Sinks→m_i)</code>；<code>fill(sumexp, 1.0)</code></td><td class="num-cell">382–387</td></tr>
+      <tr><td>算出 query 真实位置 s_global</td><td><code>s_global = act_kv − act_q + s_i</code></td></tr>
+      <tr><td>窗口右端 / 左端</td><td><code>ori_right = s_global</code>；<code>ori_left = max(s_global−127, 0)</code></td></tr>
+      <tr><td>压缩门槛 threshold</td><td><code>cmp_threshold = (s_global+1)//cmp_ratio</code></td></tr>
+      <tr class="hl-row"><td><b>ori：</b>生成本块编号</td><td><code>T.tile.createvecindex(idx, chunk_start)</code></td></tr>
+      <tr class="hl-row"><td><b>ori：</b>右边界判断 idx ≤ s</td><td><code>T.tile.compare(..., ori_right, "LE")</code></td></tr>
+      <tr><td>ori：取数安全闸门（否则填 0）</td><td><code>if g_idx ≤ ori_right: copy 真实KV  else: fill 0</code></td></tr>
+      <tr><td>cmp：编号来源（SCFA 读 / CFA 生成）</td><td><code>copy(cmp_indices...)</code> / <code>createvecindex</code></td></tr>
+      <tr class="hl-row"><td><b>cmp：</b>条件1 idx ≥ 0</td><td><code>T.tile.compare(..., −0.5, "GT")</code></td></tr>
+      <tr class="hl-row"><td><b>cmp：</b>条件2 idx &lt; threshold</td><td><code>T.tile.compare(..., cmp_threshold, "LT")</code></td></tr>
+      <tr class="hl-row"><td><b>cmp：</b>两条件取 AND</td><td><code>T.tile.bitwise_and(mask_ub, mask_ub, mask_ub_2)</code></td></tr>
+      <tr><td>cmp：取数安全闸门（否则填 0）</td><td><code>if cmp_idx ≥ 0: copy 真实KV  else: fill 0</code></td></tr>
+      <tr class="hl-row"><td><b>翻译成加性掩码 0 / −∞</b></td><td><code>T.tile.select(mask, 0.0, −inf)</code></td></tr>
+      <tr><td>把掩码加到分数、再缩放</td><td><code>add(分数+掩码)</code> → <code>mul(×scale)</code></td></tr>
+      <tr><td>sink 种进在线 softmax 初始状态</td><td><code>copy(Sinks→m_i)</code>；<code>fill(sumexp, 1.0)</code></td></tr>
     </tbody>
   </table>
   </div>
@@ -1003,9 +1003,7 @@ T.tile.<span class="fn">bitwise_and</span>(mask_ub, mask_ub, mask_ub_2)
     </ol>
   </div>
 
-  <p style="margin-top:34px; color:var(--muted); font-size:14.5px;">配套文件：<a href="sparse_attn_sharedkv_tilelang/kernel.py">kernel.py</a> ·
-  <a href="sparse_attn_sharedkv_tilelang/golden.py">golden.py</a>（CPU 参考实现，mask 逻辑同样可读）·
-  姊妹篇 <a href="OnlineSoftmax 原理详解.html">Online Softmax 原理详解</a> ·
+  <p style="margin-top:34px; color:var(--muted); font-size:14.5px;">延伸阅读：姊妹篇 <a href="OnlineSoftmax 原理详解.html">Online Softmax 原理详解</a> ·
   <a href="PagedAttention 原理详解.html">PagedAttention 原理详解</a>。</p>
 
 </div>
