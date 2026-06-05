@@ -158,8 +158,6 @@
   .cache .meta{font-family:var(--mono); font-size:12.5px; color:#33414f; background:var(--code-bg);
     padding:8px 10px; border-radius:8px; border:1px solid #e7e2e4;}
 
-  .filelink{font-family:var(--mono); font-size:.86em;}
-
   /* side nav (table of contents) — hidden by default, shown on wide screens */
   .sidenav{display:none;}
   @media (min-width:1180px){
@@ -232,10 +230,7 @@
 <div class="wrap">
 
   <div class="note">
-    <p><strong>本文配套代码：</strong><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py">sparse_attn_sharedkv_tilelang/kernel.py</a>
-    里负责「取 KV」的那段（第 393–509 行），以及
-    <a class="filelink" href="sparse_attn_sharedkv_tilelang/golden.py">sparse_attn_sharedkv_tilelang/golden.py</a>
-    里的 <code>gen_ori_kv_paged</code> / <code>unpack_paged_kv</code>（第 247–408 行）。</p>
+    <p><strong>本文配套代码：</strong>实现里负责「取 KV」的那段，以及 <code>gen_ori_kv_paged</code> / <code>unpack_paged_kv</code> 两个函数。</p>
     <p><strong>目标读者：</strong>完全没接触过神经网络也能读懂。你只需要会加减乘除，以及整数除法「<code>//</code>」和取余「<code>%</code>」：比如 <code>7 // 4 = 1</code>（7 里有 1 个完整的 4），<code>7 % 4 = 3</code>（余 3）。</p>
     <p>全文用<strong>同一个小例子</strong>贯穿到底，每一步都能拿纸笔自己验算。神经网络、注意力是什么，第 0 节用大白话从零讲起，不需要任何前置知识。</p>
   </div>
@@ -254,7 +249,7 @@
       <li><span class="ix">7.</span> <a href="#s7">取数的核心两行代码</a></li>
       <li><span class="ix">8.</span> <a href="#s8">几个容易卡住的细节</a></li>
       <li><span class="ix">9.</span> <a href="#s9">本 kernel 的特别之处</a></li>
-      <li><span class="ix">10.</span> <a href="#s10">原理对回代码：行号映射</a></li>
+      <li><span class="ix">10.</span> <a href="#s10">原理对回代码</a></li>
       <li><span class="ix">11.</span> <a href="#s11">一页速查 + 总结</a></li>
     </ol>
   </nav>
@@ -718,7 +713,7 @@
     <li>第 2 维 <code>N2</code>：KV 头数，本 kernel <strong>固定为 1</strong>（代码里有断言 <code>n_kv_heads == 1</code>）；</li>
     <li>第 3 维 <code>D</code>：每个 K/V 向量的长度，本 kernel <strong>固定为 512</strong>。</li>
   </ul>
-  <p>所以「物理块 <code>phys</code>、行号 <code>row</code>」对应的那条 KV 向量，就是切片 <code>KV[phys, row, 0, :]</code>——一条长度 512 的向量。这正是 kernel 里取数那一句（<a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L424">kernel.py:424</a>）。</p>
+  <p>所以「物理块 <code>phys</code>、行号 <code>row</code>」对应的那条 KV 向量，就是切片 <code>KV[phys, row, 0, :]</code>——一条长度 512 的向量。这正是 kernel 里取数那一句。</p>
 
   <h3>6.2 块表：<code>[B, table_len]</code> 的 int32 表，<code>-1</code> 占位</h3>
   <figure>
@@ -732,8 +727,8 @@
   </figure>
 
   <h3>6.3 测试里这套数据怎么造出来的（看得见摸得着的 Python 版）</h3>
-  <p><a class="filelink" href="sparse_attn_sharedkv_tilelang/golden.py">golden.py</a> 的 <code>gen_ori_kv_paged</code> 就是上面小例子的「打包」过程的真实代码。它做的事和 5.1 一模一样：</p>
-  <pre><code><span class="cmt"># golden.py（节选、简化）</span>
+  <p><code>gen_ori_kv_paged</code> 就是上面小例子的「打包」过程的真实代码。它做的事和 5.1 一模一样：</p>
+  <pre><code><span class="cmt"># 打包过程（节选、简化）</span>
 <span class="cmt"># 1) 算每条序列要几个逻辑页</span>
 per_batch_blocks = [ceil(s / block_size) for s in seqused_kv]
 
@@ -755,8 +750,8 @@ for b in range(B):
         s0, s1 = i * block_size, ...    <span class="cmt"># 这页覆盖逻辑 token [s0, s1)</span>
         pa[phys, :take] = k_bnsd[b, :, s0:s1].permute(...)</code></pre>
 
-  <p>反过来，<code>unpack_paged_kv</code>（<a class="filelink" href="sparse_attn_sharedkv_tilelang/golden.py#L247">golden.py:247</a>）是「拆包」：拿块表把散装的物理块还原成连续序列，<strong>正是 5.2 那套 <code>// block_size</code>、查表 的逻辑</strong>，用 Python 写一遍给你看：</p>
-  <pre><code><span class="cmt"># golden.py（节选）拆包：把分页 KV 还原成连续的 [B, N2, S, D]</span>
+  <p>反过来，<code>unpack_paged_kv</code> 是「拆包」：拿块表把散装的物理块还原成连续序列，<strong>正是 5.2 那套 <code>// block_size</code>、查表 的逻辑</strong>，用 Python 写一遍给你看：</p>
+  <pre><code><span class="cmt"># 拆包：把分页 KV 还原成连续的 [B, N2, S, D]</span>
 for b in range(B):
     for blk_i in range(table_len):       <span class="cmt"># 逐个逻辑页</span>
         phys = block_table[b, blk_i]     <span class="hl"># ← 查块表</span>
@@ -768,8 +763,8 @@ for b in range(B):
 
   <!-- ===================== 7 ===================== -->
   <h2 id="s7"><span class="num">7</span>取数的核心两行代码</h2>
-  <p>现在看 NPU 上真正干活的 kernel。它处理「滑动窗口」那一段时，要逐个取出窗口里 token 的 KV。取数逻辑就藏在 <a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L418">kernel.py:418–426</a>：</p>
-  <pre><code><span class="cmt"># kernel.py（节选）：把逻辑 token g_idx 解析成 (物理块, 行号)，再 DMA 那一行</span>
+  <p>现在看 NPU 上真正干活的 kernel。它处理「滑动窗口」那一段时，要逐个取出窗口里 token 的 KV。取数逻辑就藏在下面这几行：</p>
+  <pre><code><span class="cmt"># （节选）把逻辑 token g_idx 解析成 (物理块, 行号)，再 DMA 那一行</span>
 ori_blk = ori_block_table[b_i, g_idx // ori_block_size]   <span class="hl"># ← 查块表：第几个物理块</span>
 ori_row =                  g_idx %  ori_block_size        <span class="hl"># ← 取余：  块里第几行</span>
 T.copy(ori_KV[ori_blk, ori_row, 0, :], kv_ub)            <span class="ok"># ← 搬这一条 [512] KV 到片上</span></code></pre>
@@ -802,7 +797,7 @@ T.copy(ori_KV[ori_blk, ori_row, 0, :], kv_ub)            <span class="ok"># ← 
 
   <h3>8.2 <code>-1</code> 占位是干嘛的？会不会被误读？</h3>
   <p>块表是个<strong>规整的矩形</strong>张量 <code>[B, table_len]</code>，但每条序列长短不一，短序列用不满一行。空着的格子填 <code>-1</code> 当「此处无块」的旗标。</p>
-  <p>kernel 在取数前会先判断这个 token <strong>是否真实存在</strong>（在不在有效窗口/范围内）。不存在的，直接 <code>T.tile.fill(kv_ub, 0.0)</code> 填 0（<a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L428">kernel.py:428</a>），<strong>根本不会拿 <code>-1</code> 去查 KV</strong>，所以不会越界、不会读到垃圾数据。<code>-1</code> 只是「别碰这一格」的提示牌。</p>
+  <p>kernel 在取数前会先判断这个 token <strong>是否真实存在</strong>（在不在有效窗口/范围内）。不存在的，直接 <code>T.tile.fill(kv_ub, 0.0)</code> 填 0，<strong>根本不会拿 <code>-1</code> 去查 KV</strong>，所以不会越界、不会读到垃圾数据。<code>-1</code> 只是「别碰这一格」的提示牌。</p>
 
   <h3>8.3 最后一个块没装满怎么办？</h3>
   <p>像 5.1 里块 5 只装了 t8、t9，后两行是空的。没关系：</p>
@@ -840,27 +835,27 @@ T.copy(ori_KV[ori_blk, ori_row, 0, :], kv_ub)            <span class="ok"># ← 
     <figcaption>两套缓存的取数逻辑<strong>完全一样</strong>（都是第 7 节那两行），只是查不同的块表、读不同的张量。</figcaption>
   </figure>
 
-  <p>代码里 ori 段在 <a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L418">kernel.py:418</a>，cmp 段在 <a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L493">kernel.py:493</a>，长得几乎一模一样。</p>
-  <blockquote><p>顺带一提：如果只跑滑动窗口（不需要稀疏那套，即 SWA 场景），代码也不会留空指针，而是塞一个 <code>[1, 1, 1, 512]</code> 的「假」分页缓存 + 全 0 块表占位，保证 kernel 签名类型完整（见 <a class="filelink" href="sparse_attn_sharedkv_tilelang/api.py#L295">api.py:295</a>）。</p></blockquote>
+  <p>代码里取 ori 的那段和取 cmp 的那段长得几乎一模一样。</p>
+  <blockquote><p>顺带一提：如果只跑滑动窗口（不需要稀疏那套，即 SWA 场景），代码也不会留空指针，而是塞一个 <code>[1, 1, 1, 512]</code> 的「假」分页缓存 + 全 0 块表占位，保证 kernel 签名类型完整。</p></blockquote>
 
   <h3>9.2 块表解析放在「设备端」，不在主机端预先拆包</h3>
   <p>有些实现会在 CPU（主机端）上先把分页 KV 拆回连续大数组，再喂给 NPU——那等于又把「圈一大段连续房间」的浪费请回来了。</p>
   <p>本 kernel <strong>坚持在 NPU 上现查现取</strong>：块表、分页 KV 原样送进设备，由 AI Core（向量核）里的每个 lane 自己算 <code>(物理块, 行号)</code>、自己 DMA 那一行（就是第 7 节那段）。这样<strong>全程没有「拆包成连续大数组」这一步</strong>，分页省下来的显存是<strong>实打实</strong>省下来的。这与华为 Ascend C 的 <code>DataCopyPA</code> 路径一致。</p>
 
   <!-- ===================== 10 ===================== -->
-  <h2 id="s10"><span class="num">10</span>原理对回代码：行号映射</h2>
+  <h2 id="s10"><span class="num">10</span>原理对回代码</h2>
   <div class="tablewrap">
   <table>
-    <thead><tr><th>原理（本文）</th><th>代码位置</th><th>说明</th></tr></thead>
+    <thead><tr><th>原理（本文）</th><th>对应代码 / 段落</th><th>说明</th></tr></thead>
     <tbody>
-      <tr><td>KV 的分页布局 <code>[block_num, block_size, N2, D]</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L22">kernel.py:22–28</a> 模块注释</td><td>设计说明</td></tr>
-      <tr><td>造分页数据（「打包」，第 6.3 节）</td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/golden.py#L315">golden.py:315 gen_ori_kv_paged</a></td><td>含「打乱物理块」那步</td></tr>
-      <tr><td>拆分页数据（「拆包」，等价于第 5 节算术）</td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/golden.py#L247">golden.py:247 unpack_paged_kv</a></td><td>最易读的 Python 参考</td></tr>
-      <tr><td>设备端 ori 取数（两行核心 + DMA）</td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L418">kernel.py:418–426</a></td><td>第 7 节</td></tr>
-      <tr><td>设备端 cmp 取数（同样两行）</td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L493">kernel.py:493–501</a></td><td>第 9.1 节</td></tr>
-      <tr><td><code>-1</code> / 越界 → 填 0，不查表</td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L427">kernel.py:427–428</a></td><td>第 8.2 节</td></tr>
-      <tr><td>SWA 的假分页缓存占位</td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/api.py#L293">api.py:293–296</a></td><td>第 9.1 节</td></tr>
-      <tr><td>设计综述（KV gather 段）</td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/README.md#L150">README.md:150–156</a></td><td>一段话总结</td></tr>
+      <tr><td>KV 的分页布局 <code>[block_num, block_size, N2, D]</code></td><td>模块顶部的设计注释</td><td>设计说明</td></tr>
+      <tr><td>造分页数据（「打包」，第 6.3 节）</td><td><code>gen_ori_kv_paged</code></td><td>含「打乱物理块」那步</td></tr>
+      <tr><td>拆分页数据（「拆包」，等价于第 5 节算术）</td><td><code>unpack_paged_kv</code></td><td>最易读的 Python 参考</td></tr>
+      <tr><td>设备端 ori 取数（两行核心 + DMA）</td><td>滑动窗口的 KV gather 段</td><td>第 7 节</td></tr>
+      <tr><td>设备端 cmp 取数（同样两行）</td><td>稀疏 top-K 的 KV gather 段</td><td>第 9.1 节</td></tr>
+      <tr><td><code>-1</code> / 越界 → 填 0，不查表</td><td>取数前的有效性判断</td><td>第 8.2 节</td></tr>
+      <tr><td>SWA 的假分页缓存占位</td><td>host 侧构造假 KV + 全 0 块表</td><td>第 9.1 节</td></tr>
+      <tr><td>设计综述（KV gather 段）</td><td>配套设计文档的 KV gather 段</td><td>一段话总结</td></tr>
     </tbody>
   </table>
   </div>
