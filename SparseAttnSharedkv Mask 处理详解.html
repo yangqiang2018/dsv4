@@ -363,8 +363,8 @@
       <tr class="hl-row"><td class="num-cell">窗口大小</td><td>= win_left + 1（含自己）</td><td class="num-cell">8</td><td class="num-cell">128</td></tr>
       <tr><td class="num-cell">NI_ori</td><td>窗口要分成几块 = ⌈窗口/BI⌉</td><td class="num-cell">2</td><td class="num-cell">2</td></tr>
       <tr><td class="num-cell">cmp_ratio</td><td>多少个原始 token 压缩成 1 个</td><td class="num-cell">2</td><td class="num-cell">4</td></tr>
-      <tr><td class="num-cell">topk (K)</td><td>远处最多挑几个压缩 token 来看</td><td class="num-cell">8</td><td class="num-cell">512</td></tr>
-      <tr><td class="num-cell">NI_cmp</td><td>这些压缩 token 分成几块 = K/BI</td><td class="num-cell">2</td><td class="num-cell">8</td></tr>
+      <tr><td class="num-cell">topk (K)</td><td>远处一次最多看几个压缩 token（SCFA 的固定预算，<u>不是</u>实际压缩 token 数）</td><td class="num-cell">8</td><td class="num-cell">512</td></tr>
+      <tr><td class="num-cell">NI_cmp</td><td>这个 cmp 预算分成几块 = K/BI</td><td class="num-cell">2</td><td class="num-cell">8</td></tr>
       <tr><td class="num-cell">act_kv</td><td>这一条序列实际有多少个原始 token</td><td class="num-cell">8</td><td>因输入而定</td></tr>
       <tr><td class="num-cell">act_q</td><td>这次要算多少个 query</td><td class="num-cell">8</td><td>因输入而定</td></tr>
     </tbody>
@@ -701,7 +701,7 @@ T.tile.<span class="fn">compare</span>(mask_ub, idx_float,
 
   <h3>4.4 CFA 场景：编号是稠密的 0,1,2,…（演示 idx &lt; threshold）</h3>
 
-  <p>在 CFA（场景 2）里没有外部列表，算子直接用 <code>createvecindex</code> 生成<strong>稠密连号</strong> <code>0,1,2,3,…</code>，意思是"挨个看所有压缩 token"。这时"≥0"永远成立，真正发挥作用的是 <strong>threshold 因果门槛</strong>把 c3 挡掉：</p>
+  <p>在 CFA（场景 2）里没有外部列表，算子直接用 <code>createvecindex</code> 生成<strong>稠密连号</strong> <code>0,1,2,…</code>，意思是"挨个看所有压缩 token、直到门槛为止"。本例<strong>总共只有 4 个压缩 token（c0~c3）</strong>，所以只生成 <code>0,1,2,3</code> 这 4 个编号、占 <strong>1 个 cmp 块</strong>（不会冒出 c4、c5…，因为根本没有那些压缩 token）。这时"≥0"永远成立，真正发挥作用的是 <strong>threshold 因果门槛</strong>把 c3 挡掉：</p>
 
   <div class="legend">
     <span><i class="swatch sw-ok"></i> ✓ 能看（&lt; threshold=3）</span>
@@ -710,7 +710,7 @@ T.tile.<span class="fn">compare</span>(mask_ub, idx_float,
 
   <div class="chunks">
     <div class="chunk">
-      <div class="clab">cmp 第 0 块（CFA 稠密编号）</div>
+      <div class="clab">cmp 第 0 块（CFA 稠密编号 = 全部 4 个压缩 token）</div>
       <div class="toks">
         <div class="tok ok"><div class="ti">0</div><div class="tm">0&lt;3 ✓</div></div>
         <div class="tok ok"><div class="ti">1</div><div class="tm">1&lt;3 ✓</div></div>
@@ -718,18 +718,15 @@ T.tile.<span class="fn">compare</span>(mask_ub, idx_float,
         <div class="tok no"><div class="ti">3</div><div class="tm">3&lt;3? ✗</div></div>
       </div>
     </div>
-    <div class="chunk">
-      <div class="clab">cmp 第 1 块（CFA 稠密编号）</div>
-      <div class="toks">
-        <div class="tok no"><div class="ti">4</div><div class="tm">4&lt;3? ✗</div></div>
-        <div class="tok no"><div class="ti">5</div><div class="tm">5&lt;3? ✗</div></div>
-        <div class="tok no"><div class="ti">6</div><div class="tm">6&lt;3? ✗</div></div>
-        <div class="tok no"><div class="ti">7</div><div class="tm">7&lt;3? ✗</div></div>
-      </div>
-    </div>
   </div>
 
-  <p>c3（编号 3）被门槛挡掉 —— 又一次印证：query 看不到未来的原始 6、7，也就看不到概括它们的 c3。</p>
+  <p>4 个压缩 token 全摆在这一块里；c3（编号 3）被门槛挡掉 —— 又一次印证：query 看不到未来的原始 6、7，也就看不到概括它们的 c3。</p>
+
+  <div class="note"><p><strong>为什么 CFA 这里只有 1 个 cmp 块，SCFA（上一节）却有 2 个？</strong>因为两者"要看几个压缩 token"的口径不同：</p>
+  <ul style="margin:6px 0">
+    <li><strong>CFA</strong>：看<strong>全部</strong>压缩 token、直到门槛——编号个数<strong>跟着压缩 token 总数走</strong>，本例 4 个 → 1 块。</li>
+    <li><strong>SCFA</strong>：从一个<strong>固定预算 K</strong>（本例 8）里"挑"——挑不满就用 <code>−1</code> 补齐，所以即便只有 4 个压缩 token，也会铺满 2 块。多出来那块全是 <code>−1</code> 占位，<strong>并不代表真有 8 个压缩 token</strong>。</li>
+  </ul></div>
 
   <h3>对回代码：两次比较 + 一次 AND</h3>
 
