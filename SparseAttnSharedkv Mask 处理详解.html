@@ -377,6 +377,8 @@
 
   <p>这条序列有 <strong>8 个原始 token</strong>，位置编号 0~7。把每 <code>cmp_ratio = 2</code> 个原始 token 打包"压缩"成 1 个，就得到 <strong>4 个压缩 token</strong>（编号 0~3）：压缩 token 0 概括原始 [0,1]，压缩 token 1 概括 [2,3]，依此类推。</p>
 
+  <p class="sub" style="font-size:14.5px">⚠ 先剧透一句（§4 会展开）：压缩分支覆盖的是<strong>从 0 到当前的整段</strong>历史，和滑窗在位置上其实是<strong>重叠</strong>的。"近处滑窗、远处压缩"是<strong>设计意图</strong>，不是 mask 切出来的边界。本例历史太短（只有 0–5）恰好整段落在窗口里，所以两者看起来完全重合。</p>
+
   <p>我们全程盯着<strong>位置 5 的那个 query</strong>（记 <code>s = 5</code>）。它是一个还在句子<strong>中间</strong>的词 —— 这样才能同时看到「因为是中间，所以右边有东西要遮」的效果。</p>
 
   <figure>
@@ -614,6 +616,36 @@ T.tile.<span class="fn">compare</span>(mask_ub, idx_float,
   <h2 id="s4"><span class="num">4</span>第二种 mask：压缩稀疏的双重遮挡（cmp pass）</h2>
 
   <p><span class="pass cmp">cmp pass</span> 负责"远处大意"。它不看原始 token，而看<strong>压缩 token</strong>：每 <code>cmp_ratio = 2</code> 个原始 token 概括成 1 个压缩 token。本例 8 个原始 → 4 个压缩（c0~c3）。</p>
+
+  <div class="warn">
+    <p><strong>⚠ 最容易误解的一点：压缩分支覆盖「从 0 到当前」的整段历史，<u>不是</u>「窗口之前那一段」。</strong></p>
+    <p>很自然会以为：滑窗管近处原始 token，压缩只管<strong>窗口再往前</strong>的远处 token，两边各管一段、互不重叠。<strong>但这个 kernel 的 mask 并不这样切。</strong>压缩分支的因果门槛是 <code>threshold = (s_global+1) // cmp_ratio</code>，它从<strong>压缩编号 0（序列最开头）</strong>一路算到当前，<strong>没有减去窗口长度</strong>。所以压缩覆盖的原始范围是 <code>[0, 当前]</code> 全程，<strong>和滑窗的 <code>[当前−127, 当前]</code> 在位置上是重叠的</strong>。</p>
+    <div style="background:#fff; border:1px solid #f3d27a; border-radius:10px; padding:14px 14px 10px; margin:14px 0">
+      <svg viewBox="0 0 820 184" role="img" aria-label="真实长序列下压缩覆盖全程并与滑窗重叠">
+        <text x="410" y="20" text-anchor="middle" font-size="13" font-weight="700" fill="#334155">真实场景：序列很长，窗口 128 远小于历史</text>
+        <!-- compressed full-span bar -->
+        <rect x="70" y="42" width="700" height="32" rx="7" fill="#dbeafe" stroke="#3b82f6"/>
+        <g stroke="#93c5fd" stroke-width="1">
+          <line x1="157.5" y1="42" x2="157.5" y2="74"/><line x1="245" y1="42" x2="245" y2="74"/>
+          <line x1="332.5" y1="42" x2="332.5" y2="74"/><line x1="420" y1="42" x2="420" y2="74"/>
+          <line x1="507.5" y1="42" x2="507.5" y2="74"/><line x1="595" y1="42" x2="595" y2="74"/>
+          <line x1="682.5" y1="42" x2="682.5" y2="74"/>
+        </g>
+        <text x="78" y="63" font-size="11.5" fill="#1e40af" font-weight="700">压缩分支：编号 0,1,2,… 覆盖 [0, 当前] 全程（粗摘要）</text>
+        <!-- window bar -->
+        <rect x="595" y="90" width="175" height="32" rx="7" fill="#fef3c7" stroke="#f59e0b"/>
+        <text x="682" y="111" text-anchor="middle" font-size="11.5" fill="#92400e" font-weight="700">滑窗：最近 128（细）</text>
+        <!-- divider -->
+        <line x1="595" y1="36" x2="595" y2="146" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="4 3"/>
+        <text x="70" y="138" text-anchor="middle" font-size="11" fill="#64748b">位置 0</text>
+        <text x="770" y="138" text-anchor="middle" font-size="11" fill="#64748b">当前 s</text>
+        <text x="332" y="166" text-anchor="middle" font-size="12" fill="#1e40af" font-weight="700">远处：只有压缩看得到</text>
+        <text x="682" y="166" text-anchor="middle" font-size="12" fill="#b45309" font-weight="700">近处：压缩 + 滑窗 重叠</text>
+      </svg>
+      <div style="text-align:center; font-size:12.5px; color:#7a4d09; margin-top:6px">压缩"粗看全程"，滑窗"细看近处"；右侧一段两者重叠。</div>
+    </div>
+    <p>那「近处滑窗 / 远处压缩」错了吗？<strong>没错，那是设计意图，但由上游数据保证、不由 mask 强加</strong>：① <code>cmp_kv</code> 是上游 Compressor 算子产出的<strong>粗摘要向量</strong>，跟原始 token 是<strong>不同的向量</strong>，所以"位置重叠"≠"同一个东西算两遍"；② SCFA 的 top-K 列表通常会把真正重要的<strong>远处</strong>块挑出来。本文的小例子里历史只有 0–5、整段都落在窗口内，于是压缩和滑窗<strong>恰好完全重合</strong>——这不影响你学 mask 规则，但要知道真实长序列下两者是"<strong>压缩粗看全程 + 滑窗细看近处</strong>"的分工。</p>
+  </div>
 
   <h3>4.1 压缩空间里的"不能看未来"：threshold</h3>
 
