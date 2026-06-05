@@ -231,8 +231,6 @@
   .vscard .val{font-family:var(--mono); font-size:22px; font-weight:700; color:#0b3d91;}
   .vsmid{font-size:26px; color:var(--green); font-weight:700;}
 
-  .filelink{font-family:var(--mono); font-size:.86em;}
-
   /* side nav (table of contents) */
   .sidenav{display:none;}
   @media (min-width:1180px){
@@ -312,8 +310,7 @@
 <div class="wrap">
 
   <div class="note">
-    <p><strong>本文配套代码：</strong><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py">sparse_attn_sharedkv_tilelang/kernel.py</a>
-    里 <code>T.Scope("V")</code> 段（第 380–677 行）实现的在线 softmax。</p>
+    <p><strong>本文配套代码：</strong>kernel 里 <code>T.Scope("V")</code> 段实现的在线 softmax。</p>
     <p><strong>目标读者：高中生也能读懂。</strong>只需要你会这几样东西：</p>
     <ul style="margin:4px 0">
       <li>加减乘除、求最大值、求和；</li>
@@ -335,7 +332,7 @@
       <li><span class="ix">5.</span> <a href="#s5">注意力不止要概率，还要加权求和 V</a></li>
       <li><span class="ix">6.</span> <a href="#s6">这个 kernel 的特别之处：sink 种子</a></li>
       <li><span class="ix">7.</span> <a href="#s7">顺手的副产品：LSE（log-sum-exp）</a></li>
-      <li><span class="ix">8.</span> <a href="#s8">原理对回代码：kernel.py 行号映射</a></li>
+      <li><span class="ix">8.</span> <a href="#s8">原理对回代码：变量映射</a></li>
       <li><span class="ix">9.</span> <a href="#s9">一页速查：完整伪代码 + 总结</a></li>
     </ol>
   </nav>
@@ -639,7 +636,7 @@
   <p>可是在真实硬件上（比如这个 kernel 跑的昇腾 NPU），事情是这样的：</p>
   <ul>
     <li>序列很长，几千个键的分数<strong>一次性放不进</strong>芯片里那块又小又快的内存（UB / L1）；</li>
-    <li>所以分数是<strong>一块一块（chunk by chunk）</strong>算出来的。在 <a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py">kernel.py</a> 里，每块是 <code>block_I = 64</code> 个键（见第 126 行 <code>BI = block_I</code>，第 390 行 <code>for chunk in range(NI_total)</code> 的分块循环）。</li>
+    <li>所以分数是<strong>一块一块（chunk by chunk）</strong>算出来的。每块是 <code>block_I = 64</code> 个键（代码里 <code>BI = block_I</code>，分块主循环 <code>for chunk in range(NI_total)</code>）。</li>
   </ul>
 
   <figure>
@@ -1017,7 +1014,7 @@
 
   <!-- ===================== 6 ===================== -->
   <h2 id="s6"><span class="num">6</span>这个 kernel 的特别之处：sink 种子</h2>
-  <p>前面为了好懂，我们把 <code>m, d, O</code> 初始化成 <code>−∞, 0, 0</code>。但你去看 <a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py">kernel.py</a> 第 380–388 行，它的初始化<strong>不太一样</strong>：</p>
+  <p>前面为了好懂，我们把 <code>m, d, O</code> 初始化成 <code>−∞, 0, 0</code>。但 kernel 里的初始化<strong>不太一样</strong>：</p>
 
   <pre><code><span class="cmt"># Seed online softmax from sinks.</span>
 T.copy(Sinks[...], m_i)     <span class="cmt"># m 初始化为 sink 的分数（不是 −∞）</span>
@@ -1136,7 +1133,7 @@ T.tile.fill(sumexp, <span class="hl">1.0</span>)    <span class="cmt"># d 初始
 
   <!-- ===================== 7 ===================== -->
   <h2 id="s7"><span class="num">7</span>顺手的副产品：LSE（log-sum-exp）</h2>
-  <p>kernel 在最后还会多输出一个东西，叫 <strong>LSE</strong>（<a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py">kernel.py</a> 第 654–677 行）：</p>
+  <p>kernel 在最后还会多输出一个东西，叫 <strong>LSE</strong>：</p>
 
   <pre><code>T.tile.ln(lse_ub, sumexp)       <span class="cmt"># lse = ln(d)</span>
 T.tile.add(lse_ub, lse_ub, m_i) <span class="cmt"># lse = ln(d) + m</span></code></pre>
@@ -1175,31 +1172,31 @@ T.tile.add(lse_ub, lse_ub, m_i) <span class="cmt"># lse = ln(d) + m</span></code
   <p>所以这个 kernel <strong>总是</strong>把 LSE 算出来（代码注释里写它 "essentially free"，几乎零成本）。</p>
 
   <!-- ===================== 8 ===================== -->
-  <h2 id="s8"><span class="num">8</span>原理对回代码：kernel.py 行号映射</h2>
-  <p>下面把第 4–7 节的每一个概念，对应到 <a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py">kernel.py</a> 里的变量和行号。（kernel 里把「最大值的修正」用变量 <code>m_i_prev</code> 来承载，下面会标出来。）</p>
+  <h2 id="s8"><span class="num">8</span>原理对回代码：变量映射</h2>
+  <p>下面把第 4–7 节的每一个概念，对应到代码里的变量。（kernel 里把「最大值的修正」用变量 <code>m_i_prev</code> 来承载，下面会标出来。）</p>
 
   <div class="tablewrap">
   <table>
-    <thead><tr><th>概念（本文）</th><th>代码变量</th><th>行号</th><th>说明</th></tr></thead>
+    <thead><tr><th>概念（本文）</th><th>代码变量</th><th>说明</th></tr></thead>
     <tbody>
-      <tr><td>运行最大值 <code>m</code>，种子 = sink</td><td><code>m_i</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L382">382–385</a></td><td>从 <code>Sinks</code> 拷入，而非 −∞</td></tr>
-      <tr><td>运行输出 <code>O</code>，种子 = 0</td><td><code>acc_o</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L386">386</a></td><td><code>T.tile.fill(acc_o, 0.0)</code></td></tr>
-      <tr><td>运行分母 <code>d</code>，种子 = 1.0</td><td><code>sumexp</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L387">387</a></td><td>1.0 = sink 那一项 <code>exp(0)</code></td></tr>
-      <tr><td>分块主循环</td><td><code>for chunk …</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L390">390</a></td><td><code>NI_total</code> 块，每块 <code>BI=64</code> 键</td></tr>
-      <tr><td>被 mask 的位置设为 −∞</td><td><code>acc_s_ub</code> + <code>select</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L512">512–522</a></td><td>滑窗/稀疏掩码，<code>exp(−∞)=0</code> 不贡献</td></tr>
-      <tr><td>取分数、乘缩放系数</td><td><code>add</code> / <code>mul</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L539">539–549</a></td><td><code>分数 = QKᵀ × softmax_scale</code></td></tr>
-      <tr><td>把旧 <code>m</code> 存起来</td><td><code>m_i_prev = m_i</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L524">524</a></td><td>即本文的 <code>m_旧</code></td></tr>
-      <tr><td>本块局部最大值</td><td><code>reduce_max → m_i</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L552">552</a></td><td><code>m_块</code></td></tr>
-      <tr><td>更新 <code>m = max(m_旧, m_块)</code></td><td><code>T.tile.max</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L563">563</a></td><td>注释专门强调 dst 必须放最后</td></tr>
-      <tr><td>修正因子 <code>exp(m_旧 − m_新)</code></td><td><code>m_i_prev</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L565">565–567</a></td><td>先 <code>sub</code> 再 <code>exp</code>，结果存回 <code>m_i_prev</code></td></tr>
-      <tr><td>本块权重 <code>exp(分数 − m_新)</code></td><td><code>acc_s_ub</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L570">570–578</a></td><td>逐头减最大值后 <code>exp</code></td></tr>
-      <tr><td>本块的和</td><td><code>reduce_sum → sumexp_i_ub</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L580">580–584</a></td><td><code>这块的和</code></td></tr>
-      <tr><td><code>d = d × 修正 + 本块和</code></td><td><code>mul</code> 然后 <code>add</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L586">586–592</a></td><td>先打折扣，再累加</td></tr>
-      <tr><td><code>O = O × 修正</code></td><td><code>mul acc_o</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L595">595–601</a></td><td>旧输出同样打折扣</td></tr>
-      <tr><td><code>O += 本块的 P@V</code></td><td><code>add acc_o</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L619">619–630</a></td><td>P@V 由 cube 核算好后传回</td></tr>
-      <tr><td>收尾归一化 <code>O / d</code></td><td><code>T.tile.div</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L635">635–641</a></td><td>整个循环结束后<strong>只做一次</strong></td></tr>
-      <tr><td>写回输出</td><td><code>T.copy → Output</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L643">643–652</a></td><td></td></tr>
-      <tr><td><code>LSE = m + ln(d)</code></td><td><code>ln</code> 然后 <code>add</code></td><td><a class="filelink" href="sparse_attn_sharedkv_tilelang/kernel.py#L667">667–669</a></td><td>白送的副产品</td></tr>
+      <tr><td>运行最大值 <code>m</code>，种子 = sink</td><td><code>m_i</code></td><td>从 <code>Sinks</code> 拷入，而非 −∞</td></tr>
+      <tr><td>运行输出 <code>O</code>，种子 = 0</td><td><code>acc_o</code></td><td><code>T.tile.fill(acc_o, 0.0)</code></td></tr>
+      <tr><td>运行分母 <code>d</code>，种子 = 1.0</td><td><code>sumexp</code></td><td>1.0 = sink 那一项 <code>exp(0)</code></td></tr>
+      <tr><td>分块主循环</td><td><code>for chunk …</code></td><td><code>NI_total</code> 块，每块 <code>BI=64</code> 键</td></tr>
+      <tr><td>被 mask 的位置设为 −∞</td><td><code>acc_s_ub</code> + <code>select</code></td><td>滑窗/稀疏掩码，<code>exp(−∞)=0</code> 不贡献</td></tr>
+      <tr><td>取分数、乘缩放系数</td><td><code>add</code> / <code>mul</code></td><td><code>分数 = QKᵀ × softmax_scale</code></td></tr>
+      <tr><td>把旧 <code>m</code> 存起来</td><td><code>m_i_prev = m_i</code></td><td>即本文的 <code>m_旧</code></td></tr>
+      <tr><td>本块局部最大值</td><td><code>reduce_max → m_i</code></td><td><code>m_块</code></td></tr>
+      <tr><td>更新 <code>m = max(m_旧, m_块)</code></td><td><code>T.tile.max</code></td><td>注释专门强调 dst 必须放最后</td></tr>
+      <tr><td>修正因子 <code>exp(m_旧 − m_新)</code></td><td><code>m_i_prev</code></td><td>先 <code>sub</code> 再 <code>exp</code>，结果存回 <code>m_i_prev</code></td></tr>
+      <tr><td>本块权重 <code>exp(分数 − m_新)</code></td><td><code>acc_s_ub</code></td><td>逐头减最大值后 <code>exp</code></td></tr>
+      <tr><td>本块的和</td><td><code>reduce_sum → sumexp_i_ub</code></td><td><code>这块的和</code></td></tr>
+      <tr><td><code>d = d × 修正 + 本块和</code></td><td><code>mul</code> 然后 <code>add</code></td><td>先打折扣，再累加</td></tr>
+      <tr><td><code>O = O × 修正</code></td><td><code>mul acc_o</code></td><td>旧输出同样打折扣</td></tr>
+      <tr><td><code>O += 本块的 P@V</code></td><td><code>add acc_o</code></td><td>P@V 由 cube 核算好后传回</td></tr>
+      <tr><td>收尾归一化 <code>O / d</code></td><td><code>T.tile.div</code></td><td>整个循环结束后<strong>只做一次</strong></td></tr>
+      <tr><td>写回输出</td><td><code>T.copy → Output</code></td><td>—</td></tr>
+      <tr><td><code>LSE = m + ln(d)</code></td><td><code>ln</code> 然后 <code>add</code></td><td>白送的副产品</td></tr>
     </tbody>
   </table>
   </div>
