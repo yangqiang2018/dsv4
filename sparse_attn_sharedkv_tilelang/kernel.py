@@ -144,6 +144,13 @@ def build_sparse_attn_sharedkv(
     NI_ori = (ori_window_max + BI - 1) // BI  # 1 for BI=128
     NI_cmp = topk_cmp // BI  # 4 for topk=512, BI=128
     NI_total = NI_ori + NI_cmp
+    # gemm K-split halves. These MUST be closure constants (computed here,
+    # outside the prim_func body). Assigning them inside the body makes
+    # TVMScript treat them as runtime Vars, and then the slice ``0:_dh``
+    # can't build a constant-lane Ramp ("int() argument ... not 'Var'").
+    # Each sub-gemm's kv L0B tile is 64KB; see the cube scope.
+    D_half = D // 2  # 256: QK^T splits the D contraction
+    BI_half = BI // 2  # 64: P@V splits the KV(BI) contraction
     # CFA: the cmp indices are the dense range [0, topk_cmp); the kernel
     # generates them per chunk with createvecindex instead of reading a
     # host-synthesized cmp_indices array (mirrors the Ascend C CFA path).
@@ -372,17 +379,16 @@ def build_sparse_attn_sharedkv(
                                     # sub-gemm's kv tile is [128, 256] = 64KB.
                                     # init=False accumulates the partial dot
                                     # products. Mirrors Ascend C's D_SPLIT.
-                                    _dh = D // 2
                                     T.gemm_v0(
-                                        q_l1[:, 0:_dh],
-                                        kv_l1[:, 0:_dh],
+                                        q_l1[:, 0:D_half],
+                                        kv_l1[:, 0:D_half],
                                         acc_s_l0c,
                                         transpose_B=True,
                                         init=True,
                                     )
                                     T.gemm_v0(
-                                        q_l1[:, _dh:D],
-                                        kv_l1[:, _dh:D],
+                                        q_l1[:, D_half:D],
+                                        kv_l1[:, D_half:D],
                                         acc_s_l0c,
                                         transpose_B=True,
                                         init=False,
@@ -408,16 +414,15 @@ def build_sparse_attn_sharedkv(
                                     # v tile is [64, 512] = 64KB. init=False
                                     # accumulates over the two KV halves (the
                                     # standard flash-attention KV reduction).
-                                    _bh = BI // 2
                                     T.gemm_v0(
-                                        p_l1[:, 0:_bh],
-                                        kv_l1[0:_bh, :],
+                                        p_l1[:, 0:BI_half],
+                                        kv_l1[0:BI_half, :],
                                         acc_o_l0c,
                                         init=True,
                                     )
                                     T.gemm_v0(
-                                        p_l1[:, _bh:BI],
-                                        kv_l1[_bh:BI, :],
+                                        p_l1[:, BI_half:BI],
+                                        kv_l1[BI_half:BI, :],
                                         acc_o_l0c,
                                         init=False,
                                     )
