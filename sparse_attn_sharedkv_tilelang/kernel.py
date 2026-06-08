@@ -174,7 +174,6 @@ def build_sparse_attn_sharedkv(
         "lse_ub": 84 * KB + 640,
         "idx_int": 84 * KB + 768,
         "idx_float": 84 * KB + 1024,
-        "kv_ub": 84 * KB + 1280,
         "mask_ub": 84 * KB + 2304,
         "mask_ub_2": 84 * KB + 2336,
         "acc_o_ub": 88 * KB,
@@ -235,7 +234,17 @@ def build_sparse_attn_sharedkv(
                 acc_s_half = T.alloc_ub([v_block, BI], dtype)
                 idx_int = T.alloc_ub([BI], indices_dtype)
                 idx_float = T.alloc_ub([BI], accum_dtype)
-                kv_ub = T.alloc_ub([D], dtype)
+                # Multi-row gather staging buffer. Each AIV DMAs its BI//2 KV
+                # rows into distinct rows here with NO per-row barrier (the
+                # DMAs target disjoint rows, so MTE2 pipelines them), then a
+                # single barrier_all + one batched UB->workspace write. This
+                # replaces the old single-row kv_ub, whose write-after-read
+                # hazard forced a barrier per row. Aliases acc_o_ub's address
+                # (gather runs at the chunk head; acc_o_ub's P@V merge at the
+                # chunk tail -- disjoint phases, and the chunk-head mask
+                # barrier separates the previous chunk's merge from this
+                # chunk's gather), so the UB peak is unchanged.
+                kv_ub_multi = T.alloc_ub([BI // 2, D], dtype)
                 mask_ub = T.alloc_ub([BI // 8], "uint8")
                 mask_ub_2 = T.alloc_ub([BI // 8], "uint8")
 
@@ -258,7 +267,9 @@ def build_sparse_attn_sharedkv(
                         lse_ub: ub_addr["lse_ub"],
                         idx_int: ub_addr["idx_int"],
                         idx_float: ub_addr["idx_float"],
-                        kv_ub: ub_addr["kv_ub"],
+                        # kv_ub_multi aliases acc_o_ub (disjoint phases:
+                        # chunk-head gather vs chunk-tail P@V merge).
+                        kv_ub_multi: ub_addr["acc_o_ub"],
                         mask_ub: ub_addr["mask_ub"],
                         mask_ub_2: ub_addr["mask_ub_2"],
                         acc_o_ub: ub_addr["acc_o_ub"],
@@ -406,32 +417,42 @@ def build_sparse_attn_sharedkv(
                                             "LE",
                                         )
                                         T.barrier_all()
+                                        # Batched gather: issue all BI//2 row
+                                        # DMAs into distinct rows of
+                                        # kv_ub_multi with NO per-row barrier
+                                        # (disjoint dst rows -> MTE2 pipelines
+                                        # them), then one barrier + one
+                                        # batched write-out. Out-of-window
+                                        # tokens (g_idx > ori_right) are
+                                        # gathered too: the window is a prefix
+                                        # of a valid causal range (g_idx <=
+                                        # s_global < act_kv) so the block-table
+                                        # entry is always valid, and the
+                                        # additive score mask sets their
+                                        # column to -inf -- the gathered value
+                                        # never contributes.
                                         for bi_i in range(BI // 2):
                                             lane = bi_i + vid * (BI // 2)
                                             g_idx = chunk_start + lane
-                                            T.barrier_all()
-                                            if g_idx <= ori_right:
-                                                # Resolve the paged block
-                                                # table on the vector core:
-                                                # logical token g_idx ->
-                                                # (physical block, row).
-                                                ori_blk = ori_block_table[
-                                                    b_i, g_idx // ori_block_size
-                                                ]
-                                                ori_row = g_idx % ori_block_size
-                                                T.barrier_all()
-                                                T.copy(
-                                                    ori_KV[ori_blk, ori_row, 0, :],
-                                                    kv_ub,
-                                                )
-                                            else:
-                                                T.tile.fill(kv_ub, 0.0)
-                                            T.barrier_all()
+                                            ori_blk = ori_block_table[
+                                                b_i, g_idx // ori_block_size
+                                            ]
+                                            ori_row = g_idx % ori_block_size
                                             T.copy(
-                                                kv_ub,
-                                                ws_kv[cid, lane, :],
+                                                ori_KV[ori_blk, ori_row, 0, :],
+                                                kv_ub_multi[bi_i, :],
                                             )
-                                            T.barrier_all()
+                                        T.barrier_all()
+                                        T.copy(
+                                            kv_ub_multi[0 : BI // 2, :],
+                                            ws_kv[
+                                                cid,
+                                                vid * (BI // 2) : vid * (BI // 2)
+                                                + BI // 2,
+                                                :,
+                                            ],
+                                        )
+                                        T.barrier_all()
                                     else:
                                         if is_cfa:
                                             # CFA: this chunk's compressed
@@ -482,31 +503,44 @@ def build_sparse_attn_sharedkv(
                                             mask_ub_2,
                                         )
                                         T.barrier_all()
+                                        # Batched sparse gather. cmp indices
+                                        # are arbitrary (different blocks) so
+                                        # the DMAs stay per-row, but they land
+                                        # in distinct rows of kv_ub_multi with
+                                        # no per-row barrier (MTE2 pipelines
+                                        # them) + one batched write-out.
+                                        # Invalid (-1 padding) indices are
+                                        # clamped to 0 so the block-table
+                                        # lookup stays in range; the score
+                                        # mask (idx >= 0) zeroes their
+                                        # contribution, so reading token 0's
+                                        # KV is harmless (matches the old
+                                        # fill-0 path numerically).
                                         for bi_i in range(BI // 2):
                                             lane = bi_i + vid * (BI // 2)
                                             cmp_idx = idx_int[lane]
-                                            T.barrier_all()
-                                            if cmp_idx >= 0:
-                                                # Paged gather: resolve
-                                                # cmp_block_table on the vector
-                                                # core, then DMA the [D] row.
-                                                cmp_blk = cmp_block_table[
-                                                    b_i, cmp_idx // cmp_block_size
-                                                ]
-                                                cmp_row = cmp_idx % cmp_block_size
-                                                T.barrier_all()
-                                                T.copy(
-                                                    cmp_KV[cmp_blk, cmp_row, 0, :],
-                                                    kv_ub,
-                                                )
-                                            else:
-                                                T.tile.fill(kv_ub, 0.0)
-                                            T.barrier_all()
-                                            T.copy(
-                                                kv_ub,
-                                                ws_kv[cid, lane, :],
+                                            safe_idx = T.if_then_else(
+                                                cmp_idx < 0, 0, cmp_idx
                                             )
-                                            T.barrier_all()
+                                            cmp_blk = cmp_block_table[
+                                                b_i, safe_idx // cmp_block_size
+                                            ]
+                                            cmp_row = safe_idx % cmp_block_size
+                                            T.copy(
+                                                cmp_KV[cmp_blk, cmp_row, 0, :],
+                                                kv_ub_multi[bi_i, :],
+                                            )
+                                        T.barrier_all()
+                                        T.copy(
+                                            kv_ub_multi[0 : BI // 2, :],
+                                            ws_kv[
+                                                cid,
+                                                vid * (BI // 2) : vid * (BI // 2)
+                                                + BI // 2,
+                                                :,
+                                            ],
+                                        )
+                                        T.barrier_all()
                                     T.set_cross_flag("MTE3", _FLAG_KV_READY)
 
                                     # ---- additive mask (0 / -inf) ----
