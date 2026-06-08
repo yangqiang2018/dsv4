@@ -193,7 +193,7 @@ def build_sparse_attn_sharedkv(
     @tilelang.jit(out_idx=[11, 12], workspace_idx=[13, 14, 15, 16])
     def _make():
         @T.prim_func
-        def main(
+        def sparse_attn_sharedkv(
             Q: T.Tensor(q_shape, dtype),  # type: ignore[valid-type]
             ori_KV: T.Tensor(ori_kv_shape, dtype),  # type: ignore[valid-type]
             ori_block_table: T.Tensor(ori_bt_shape, indices_dtype),  # type: ignore[valid-type]
@@ -676,6 +676,6 @@ def build_sparse_attn_sharedkv(
                                     ],
                                 )
 
-        return main
+        return sparse_attn_sharedkv
 
     return _make()
