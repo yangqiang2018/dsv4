@@ -144,13 +144,12 @@ def build_sparse_attn_sharedkv(
     NI_ori = (ori_window_max + BI - 1) // BI  # 1 for BI=128
     NI_cmp = topk_cmp // BI  # 4 for topk=512, BI=128
     NI_total = NI_ori + NI_cmp
-    # gemm K-split halves. These MUST be closure constants (computed here,
-    # outside the prim_func body). Assigning them inside the body makes
-    # TVMScript treat them as runtime Vars, and then the slice ``0:_dh``
-    # can't build a constant-lane Ramp ("int() argument ... not 'Var'").
-    # Each sub-gemm's kv L0B tile is 64KB; see the cube scope.
-    D_half = D // 2  # 256: QK^T splits the D contraction
-    BI_half = BI // 2  # 64: P@V splits the KV(BI) contraction
+    # KV-half width. MUST be a closure constant (computed here, outside the
+    # prim_func body): a body-level assignment becomes a runtime Var, and
+    # then GM slices like ws_kv[cid, 0:BI_half] can't build a constant-lane
+    # Ramp ("int() argument ... not 'Var'"). Each cube gemm processes one
+    # [BI_half, D] = 64KB KV half so the operand fits the 64KB L0B.
+    BI_half = BI // 2  # 64
     # CFA: the cmp indices are the dense range [0, topk_cmp); the kernel
     # generates them per chunk with createvecindex instead of reading a
     # host-synthesized cmp_indices array (mirrors the Ascend C CFA path).
@@ -173,9 +172,18 @@ def build_sparse_attn_sharedkv(
 
     # ---- Manual address maps (bytes). Sized for BI=128. ----
     KB = 1024
-    # L1 (>=208KB): q_l1 [64,512]bf16=64KB @0..64; kv_l1 [128,512]bf16=128KB
-    # @64..192; p_l1 [64,128]bf16=16KB @192..208.
-    l1_addr = {"q_l1": 0, "kv_l1": 64 * KB, "p_l1": 192 * KB}
+    # L1 (>=208KB). gemm_v0 needs each operand to fit the 64KB L0B as a
+    # whole buffer (it neither slices operands nor auto-tiles to L0), so the
+    # BI=128 kv is two physical [64,512]=64KB halves (kv_lo/kv_hi) and p is
+    # two [64,64] halves (p_lo/p_hi): q 64KB @0; kv_lo @64; kv_hi @128;
+    # p_lo 8KB @192; p_hi 8KB @200 -> 208KB.
+    l1_addr = {
+        "q_l1": 0,
+        "kv_lo": 64 * KB,
+        "kv_hi": 128 * KB,
+        "p_lo": 192 * KB,
+        "p_hi": 200 * KB,
+    }
     l0c_addr = {"acc_s_l0c": 0, "acc_o_l0c": 0}  # disjoint phases ⇒ alias
     # UB (192KB). acc_s_* are [32,128] now (double the BI=64 size), so
     # everything below them shifts up. acc_o_ub / acc_o_half / kv_ub_multi
@@ -235,9 +243,13 @@ def build_sparse_attn_sharedkv(
             with T.Kernel(core_num, is_npu=True) as (cid, vid):
                 # ---- L1 / L0 (cube). ----
                 q_l1 = T.alloc_L1([H_per_block, D], dtype)
-                kv_l1 = T.alloc_L1([BI, D], dtype)
-                p_l1 = T.alloc_L1([H_per_block, BI], dtype)
-                acc_s_l0c = T.alloc_L0C([H_per_block, BI], accum_dtype)
+                # kv / p are split into two physical halves so each gemm_v0
+                # operand fits the 64KB L0B as a whole buffer.
+                kv_lo = T.alloc_L1([BI_half, D], dtype)
+                kv_hi = T.alloc_L1([BI_half, D], dtype)
+                p_lo = T.alloc_L1([H_per_block, BI_half], dtype)
+                p_hi = T.alloc_L1([H_per_block, BI_half], dtype)
+                acc_s_l0c = T.alloc_L0C([H_per_block, BI_half], accum_dtype)
                 acc_o_l0c = T.alloc_L0C([H_per_block, D], accum_dtype)
 
                 # ---- UB (vector). ----
@@ -272,8 +284,10 @@ def build_sparse_attn_sharedkv(
                 T.annotate_address(
                     {
                         q_l1: l1_addr["q_l1"],
-                        kv_l1: l1_addr["kv_l1"],
-                        p_l1: l1_addr["p_l1"],
+                        kv_lo: l1_addr["kv_lo"],
+                        kv_hi: l1_addr["kv_hi"],
+                        p_lo: l1_addr["p_lo"],
+                        p_hi: l1_addr["p_hi"],
                         acc_s_l0c: l0c_addr["acc_s_l0c"],
                         acc_o_l0c: l0c_addr["acc_o_l0c"],
                         acc_o: ub_addr["acc_o"],
@@ -369,63 +383,70 @@ def build_sparse_attn_sharedkv(
                                 for _ in T.serial(NI_total):
                                     T.wait_cross_flag(_FLAG_KV_READY)
                                     T.barrier_all()
-                                    T.copy(ws_kv[cid, 0:BI, 0:D], kv_l1)
+                                    # Load the gathered KV (ws_kv[BI, D]) as
+                                    # two [BI_half, D] = 64KB halves into
+                                    # separate L1 buffers. gemm_v0 takes whole
+                                    # buffers that must each fit the 64KB L0B
+                                    # (it neither slices operands nor auto-tiles
+                                    # to L0), so BI=128's [128,512] kv must be
+                                    # two physical [64,512] buffers -- the same
+                                    # manual L0 tiling Ascend C does.
+                                    T.copy(ws_kv[cid, 0:BI_half, 0:D], kv_lo)
                                     T.barrier_all()
-                                    # QK^T contracts over D. The full kv_l1
-                                    # [BI=128, D=512] tile is 128KB and would
-                                    # overflow the 64KB L0B on the MTE1 load
-                                    # (gemm_v0 loads the whole operand, no
-                                    # auto-tile), so split D in two: each
-                                    # sub-gemm's kv tile is [128, 256] = 64KB.
-                                    # init=False accumulates the partial dot
-                                    # products. Mirrors Ascend C's D_SPLIT.
+                                    T.copy(ws_kv[cid, BI_half:BI, 0:D], kv_hi)
+                                    T.barrier_all()
+                                    # QK^T over each KV half. Every sub-gemm is
+                                    # the proven [64,512]-operand form, writing
+                                    # the full acc_s_l0c[H, BI_half], copied to
+                                    # its half of ws_score.
                                     T.gemm_v0(
-                                        q_l1[:, 0:D_half],
-                                        kv_l1[:, 0:D_half],
+                                        q_l1,
+                                        kv_lo,
                                         acc_s_l0c,
                                         transpose_B=True,
                                         init=True,
                                     )
+                                    T.barrier_all()
+                                    T.copy(
+                                        acc_s_l0c,
+                                        ws_score[cid, 0:H_per_block, 0:BI_half],
+                                    )
+                                    T.barrier_all()
                                     T.gemm_v0(
-                                        q_l1[:, D_half:D],
-                                        kv_l1[:, D_half:D],
+                                        q_l1,
+                                        kv_hi,
                                         acc_s_l0c,
                                         transpose_B=True,
-                                        init=False,
+                                        init=True,
                                     )
                                     T.barrier_all()
                                     T.copy(
                                         acc_s_l0c,
-                                        ws_score[cid, 0:H_per_block, 0:BI],
+                                        ws_score[cid, 0:H_per_block, BI_half:BI],
                                     )
                                     T.barrier_all()
                                     T.set_cross_flag("FIX", _FLAG_SCORE_READY)
 
                                     T.wait_cross_flag(_FLAG_P_READY)
                                     T.barrier_all()
+                                    # Load P as two [H, BI_half] halves matching
+                                    # the KV split.
                                     T.copy(
-                                        ws_p[cid, 0:H_per_block, 0:BI],
-                                        p_l1,
+                                        ws_p[cid, 0:H_per_block, 0:BI_half],
+                                        p_lo,
                                     )
                                     T.barrier_all()
-                                    # P@V contracts over KV (=BI). The full
-                                    # kv_l1 [BI=128, D=512] tile is 128KB in
-                                    # L0B, so split BI in two: each sub-gemm's
-                                    # v tile is [64, 512] = 64KB. init=False
-                                    # accumulates over the two KV halves (the
-                                    # standard flash-attention KV reduction).
-                                    T.gemm_v0(
-                                        p_l1[:, 0:BI_half],
-                                        kv_l1[0:BI_half, :],
-                                        acc_o_l0c,
-                                        init=True,
+                                    T.copy(
+                                        ws_p[cid, 0:H_per_block, BI_half:BI],
+                                        p_hi,
                                     )
-                                    T.gemm_v0(
-                                        p_l1[:, BI_half:BI],
-                                        kv_l1[BI_half:BI, :],
-                                        acc_o_l0c,
-                                        init=False,
-                                    )
+                                    T.barrier_all()
+                                    # P@V = sum over the two KV halves; init=False
+                                    # accumulates the second half into acc_o_l0c
+                                    # (the standard flash-attn KV reduction).
+                                    T.gemm_v0(p_lo, kv_lo, acc_o_l0c, init=True)
+                                    T.barrier_all()
+                                    T.gemm_v0(p_hi, kv_hi, acc_o_l0c, init=False)
                                     T.barrier_all()
                                     T.copy(
                                         acc_o_l0c,
