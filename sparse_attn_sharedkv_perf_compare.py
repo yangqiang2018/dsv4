@@ -17,13 +17,15 @@ is invoked first, and its output is fed into the sharedkv op as the
 for Ascend C and ``sparse_attn_sharedkv_tilelang/
 test_sparse_attn_sharedkv.py::_call_metadata_then_sharedkv`` for TileLang).
 
-For each scenario the script reports three ratios -- always
-``TileLang_time / AscendC_time`` (i.e. "TileLang is N.NNx the latency
-of Ascend C"):
+For each scenario the script reports TileLang's performance as a
+*percentage* of Ascend C -- ``AscendC_latency / TileLang_latency * 100%``.
+Performance is the inverse of latency, so this is NOT the two run times
+divided directly; a value < 100% means TileLang is slower, > 100% means
+TileLang is faster:
 
-    * metadata  op : its own ratio
-    * sharedkv  op : its own ratio
-    * overall (md + sk together) : combined ratio
+    * metadata  op : its own percentage
+    * sharedkv  op : its own percentage
+    * overall (md + sk together) : combined percentage
 
 Plus a grand summary aggregated across all scenarios run.
 
@@ -41,8 +43,8 @@ Methodology notes
   CPU (a device kernel), whereas the TileLang ``metadata`` is a host-side
   Python port of that scheduler. Their wall-clock comparison is therefore
   host-vs-device in nature -- we report it because it is part of the call
-  chain, but read the metadata ratio with that asymmetry in mind. The
-  sharedkv ratio is the apples-to-apples kernel comparison.
+  chain, but read the metadata percentage with that asymmetry in mind.
+  The sharedkv percentage is the apples-to-apples kernel comparison.
 """
 
 from __future__ import annotations
@@ -581,15 +583,19 @@ def stats(ts):
     return dict(median=median, mean=sum(a) / n, min=a[0], max=a[-1])
 
 
-def _ratio(tl, ac):
-    return float("inf") if ac <= 0 else tl / ac
+def _perf_pct(ac_ms, tl_ms):
+    # Performance is the inverse of latency, so TileLang's performance as a
+    # percentage of Ascend C is (AscendC_latency / TileLang_latency) * 100,
+    # NOT a raw division of the two run times. <100% => TileLang is slower
+    # than Ascend C; >100% => TileLang is faster.
+    return float("inf") if tl_ms <= 0 else ac_ms / tl_ms * 100.0
 
 
 def _fmt_line(label, ac_ms, tl_ms):
-    r = _ratio(tl_ms, ac_ms)
+    pct = _perf_pct(ac_ms, tl_ms)
     return (
         f"  {label:<10}  AscendC={ac_ms:9.4f} ms   TileLang={tl_ms:9.4f} ms"
-        f"   TileLang/AscendC = {r:6.2f}x"
+        f"   TileLang perf = {pct:6.1f}% of Ascend C"
     )
 
 
@@ -621,7 +627,10 @@ def run_scenario(name, dtype, warmup, iters, only, stride_pad):
     if "ac_md" in result and "tl_md" in result:
         ac_md_m, ac_sk_m = result["ac_md"]["median"], result["ac_sk"]["median"]
         tl_md_m, tl_sk_m = result["tl_md"]["median"], result["tl_sk"]["median"]
-        print("  -- median latency (lower is better), ratio = TileLang / AscendC --")
+        print(
+            "  -- median latency (lower=better); "
+            "TileLang perf = AscendC / TileLang x 100% --"
+        )
         print(_fmt_line("metadata", ac_md_m, tl_md_m))
         print(_fmt_line("sharedkv", ac_sk_m, tl_sk_m))
         print(_fmt_line("overall", ac_md_m + ac_sk_m, tl_md_m + tl_sk_m))
@@ -642,15 +651,15 @@ def run_scenario(name, dtype, warmup, iters, only, stride_pad):
 
 def print_summary(results, only):
     if only != "both":
-        print("\n(only one implementation was run; no ratios computed)")
+        print("\n(only one implementation was run; no percentages computed)")
         return
     ok = [r for r in results if "ac_md" in r and "tl_md" in r]
     if not ok:
         return
-    print("\n================ GRAND SUMMARY (median latency) ================")
+    print("\n========== GRAND SUMMARY (TileLang perf as % of Ascend C) ==========")
     print(
         f"{'scenario':<14}{'metadata':>12}{'sharedkv':>12}{'overall':>12}"
-        "   (each = TileLang / AscendC)"
+        "   (perf% = AscendC / TileLang)"
     )
     sum_ac_md = sum_ac_sk = sum_tl_md = sum_tl_sk = 0.0
     for r in ok:
@@ -661,24 +670,25 @@ def print_summary(results, only):
         sum_tl_md += tl_md
         sum_tl_sk += tl_sk
         print(
-            f"{r['name']:<14}{_ratio(tl_md, ac_md):>11.2f}x"
-            f"{_ratio(tl_sk, ac_sk):>11.2f}x"
-            f"{_ratio(tl_md + tl_sk, ac_md + ac_sk):>11.2f}x"
+            f"{r['name']:<14}{_perf_pct(ac_md, tl_md):>11.1f}%"
+            f"{_perf_pct(ac_sk, tl_sk):>11.1f}%"
+            f"{_perf_pct(ac_md + ac_sk, tl_md + tl_sk):>11.1f}%"
         )
     print("-" * 62)
     print(
         f"{'TOTAL (sum)':<14}"
-        f"{_ratio(sum_tl_md, sum_ac_md):>11.2f}x"
-        f"{_ratio(sum_tl_sk, sum_ac_sk):>11.2f}x"
-        f"{_ratio(sum_tl_md + sum_tl_sk, sum_ac_md + sum_ac_sk):>11.2f}x"
+        f"{_perf_pct(sum_ac_md, sum_tl_md):>11.1f}%"
+        f"{_perf_pct(sum_ac_sk, sum_tl_sk):>11.1f}%"
+        f"{_perf_pct(sum_ac_md + sum_ac_sk, sum_tl_md + sum_tl_sk):>11.1f}%"
     )
     print(
-        "\nInterpretation: a value of N.NNx means the TileLang op takes "
-        "N.NN times\nthe latency of the Ascend C op (so >1 => TileLang is "
-        "slower, <1 => faster)."
+        "\nInterpretation: each value is TileLang performance as a percent of "
+        "Ascend C,\n  perf% = AscendC_latency / TileLang_latency x 100  "
+        "(the inverse of a raw time ratio).\n  <100% => TileLang is slower "
+        "than Ascend C; >100% => TileLang is faster."
     )
     print(
-        "Note: the metadata ratio compares a host-side Python port "
+        "Note: the metadata percentage compares a host-side Python port "
         "(TileLang) against\nan on-device AI CPU kernel (Ascend C) -- "
         "read it with that asymmetry in mind."
     )
@@ -706,7 +716,7 @@ def main():
         "--only",
         default="both",
         choices=["both", "tilelang", "ascendc"],
-        help="run a single implementation (skips ratio reporting)",
+        help="run a single implementation (skips percentage reporting)",
     )
     ap.add_argument(
         "--no-stride-pad",
