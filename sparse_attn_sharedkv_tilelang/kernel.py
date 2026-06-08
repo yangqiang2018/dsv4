@@ -54,9 +54,11 @@ DEFAULT_CORE_NUM = 24
 # chunk processes. 128 matches the Ascend C kernel's N_SPLIT_SIZE=128.
 # Larger BI => fewer chunks => less per-chunk handshake / scalar / barrier
 # overhead and better cube utilization. Must divide topk_cmp and
-# ori_block_size; the gemm operand tile (kv [BI, D]) is K/N-split by
-# gemm_v0 to fit the 64KB L0A/L0B. api.py imports this to size the
-# scenario-specific cmp_indices placeholders consistently.
+# ori_block_size; at BI=128 the kv operand tile [BI, D] is 128KB, so the
+# two cube gemms are manually K-split in the cube scope (gemm_v0 does NOT
+# auto-tile to L0 -- it loads the whole operand, so the full tile would
+# overflow the 64KB L0B) so each sub-gemm's L0B tile is 64KB. api.py
+# imports this to size the scenario-specific cmp_indices placeholders.
 DEFAULT_BLOCK_I = 128
 
 # ---- SasMetaData layout mirroring sparse_attn_sharedkv_metadata.h. ----
@@ -362,12 +364,28 @@ def build_sparse_attn_sharedkv(
                                     T.barrier_all()
                                     T.copy(ws_kv[cid, 0:BI, 0:D], kv_l1)
                                     T.barrier_all()
+                                    # QK^T contracts over D. The full kv_l1
+                                    # [BI=128, D=512] tile is 128KB and would
+                                    # overflow the 64KB L0B on the MTE1 load
+                                    # (gemm_v0 loads the whole operand, no
+                                    # auto-tile), so split D in two: each
+                                    # sub-gemm's kv tile is [128, 256] = 64KB.
+                                    # init=False accumulates the partial dot
+                                    # products. Mirrors Ascend C's D_SPLIT.
+                                    _dh = D // 2
                                     T.gemm_v0(
-                                        q_l1,
-                                        kv_l1,
+                                        q_l1[:, 0:_dh],
+                                        kv_l1[:, 0:_dh],
                                         acc_s_l0c,
                                         transpose_B=True,
                                         init=True,
+                                    )
+                                    T.gemm_v0(
+                                        q_l1[:, _dh:D],
+                                        kv_l1[:, _dh:D],
+                                        acc_s_l0c,
+                                        transpose_B=True,
+                                        init=False,
                                     )
                                     T.barrier_all()
                                     T.copy(
@@ -384,11 +402,24 @@ def build_sparse_attn_sharedkv(
                                         p_l1,
                                     )
                                     T.barrier_all()
+                                    # P@V contracts over KV (=BI). The full
+                                    # kv_l1 [BI=128, D=512] tile is 128KB in
+                                    # L0B, so split BI in two: each sub-gemm's
+                                    # v tile is [64, 512] = 64KB. init=False
+                                    # accumulates over the two KV halves (the
+                                    # standard flash-attention KV reduction).
+                                    _bh = BI // 2
                                     T.gemm_v0(
-                                        p_l1,
-                                        kv_l1,
+                                        p_l1[:, 0:_bh],
+                                        kv_l1[0:_bh, :],
                                         acc_o_l0c,
                                         init=True,
+                                    )
+                                    T.gemm_v0(
+                                        p_l1[:, _bh:BI],
+                                        kv_l1[_bh:BI, :],
+                                        acc_o_l0c,
+                                        init=False,
                                     )
                                     T.barrier_all()
                                     T.copy(
