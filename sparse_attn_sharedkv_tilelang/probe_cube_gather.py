@@ -34,8 +34,6 @@ Run on an Ascend NPU host:
     python probe_cube_gather.py
 """
 
-from __future__ import annotations
-
 import sys
 
 import torch
