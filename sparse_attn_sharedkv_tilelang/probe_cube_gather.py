@@ -1,34 +1,22 @@
-"""Minimal probe: can the CUBE core do a two-step paged indirect gather
-into L1?
+"""Cube-side paged-gather probe -- now with an isolation control.
 
-This is the single risk gate for the "move KV gather to the cube side"
-rewrite (so the vector core stops doing the gather + the ws_kv GM
-round-trip, mirroring Ascend C's DataCopyPA). The main kernel -- and the
-canonical example_sparse_flash_attn_mask_pa.py it is based on -- both do
-the paged gather on the VECTOR core (GM->UB, then UB->GM workspace, then
-cube reads the workspace). No example does it on the cube core, so this
-is genuinely uncharted; the probe isolates exactly that one question.
+First run: cube indirect gather compiled + ran (no crash) but the output
+was ~zero (max_diff = 1.0). That could mean the indirect gather didn't
+actually fill kv_l1, OR the "extract L1 back to GM" path (identity gemm,
+the only route since L1->GM copy is unsupported) is itself broken. The
+two were coupled, so we isolate.
 
-Flow (cube-only, no vector, no cross-flag):
-  1. for each i: logical = indices[0, i];
-     phys = block_table[0, logical // block_size]; row = logical % block_size;
-     copy KV[phys, row, 0, :] -> kv_l1[i, :]        <-- THE PROBE
-  2. gemm(identity, kv_l1) -> acc_l0c               (I @ kv = kv; the only
-     way to get L1 contents back to GM is via L0C / fixpipe, and it also
-     proves the gathered data can feed a gemm -- what B actually needs)
-  3. copy acc_l0c -> Output
+Two modes, same extraction chain (ident @ kv_l1 -> L0C -> GM):
+  - mode "block":  fill kv_l1 with a plain block copy KV[0, 0:N, 0, :]
+                   (the example's proven GM->L1 form). Control.
+  - mode "gather": fill kv_l1 with the two-step paged indirect gather.
 
-Scattered indices + a permuted block table make this the hard (cmp-like)
-case, not the trivial block_table==0 one the examples used.
-
-PASS  = compiles, runs, Output matches the host gather (max_abs_diff ~ 0)
-       -> cube-side paged gather is viable, the B rewrite can proceed.
-FAIL  = compile error / aicore exception / wrong output
-       -> cube can't do it, fall back to the cube<->vector overlap (A).
-
-Structure mirrors example_sparse_flash_attn_mask_pa.py exactly: @tilelang.jit
-on the outer builder (compile-time params), prim_func inside, shapes
-pre-bound to variables, dtypes as variables (never inline string literals).
+Read-out:
+  - block PASS, gather FAIL -> extraction chain is fine; the indirect
+    gather is the (fixable) bug.
+  - block FAIL              -> the extraction chain (identity gemm /
+    ident copy / L0C->GM) is the bug; the gather may well be fine and we
+    need a different verification.
 
 Run on an Ascend NPU host:
     python probe_cube_gather.py
@@ -46,7 +34,7 @@ tilelang.cache.clear_cache()
 
 
 @tilelang.jit(out_idx=[4])
-def build_probe(block_num, block_size, N, D, table_len, dtype="bfloat16"):
+def build_probe(block_num, block_size, N, D, table_len, mode, dtype="bfloat16"):
     indices_dtype = "int32"
     accum_dtype = "float"
     elem = 2  # bf16 / fp16 bytes
@@ -58,8 +46,38 @@ def build_probe(block_num, block_size, N, D, table_len, dtype="bfloat16"):
     l1_kv = 0
     l1_ident = N * D * elem  # kv_l1 [N, D] then ident_l1 [N, N]
 
+    # NOTE: `mode` is branched at the Python level (outside @T.prim_func) --
+    # a body-level `if mode ==` would become a TIR If, not a compile-time
+    # specialization. So define one prim_func per mode.
+    if mode == "block":
+
+        @T.prim_func
+        def probe(
+            KV: T.Tensor(kv_shape, dtype),  # type: ignore
+            block_table: T.Tensor(bt_shape, indices_dtype),  # type: ignore
+            indices: T.Tensor(idx_shape, indices_dtype),  # type: ignore
+            ident: T.Tensor(ident_shape, dtype),  # type: ignore
+            Output: T.Tensor(out_shape, dtype),  # type: ignore
+        ):
+            with T.Kernel(1, is_npu=True) as (cid, vid):
+                kv_l1 = T.alloc_L1([N, D], dtype)
+                ident_l1 = T.alloc_L1([N, N], dtype)
+                acc = T.alloc_L0C([N, D], accum_dtype)
+                T.annotate_address({kv_l1: l1_kv, ident_l1: l1_ident, acc: 0})
+                with T.Scope("C"):
+                    # Control: proven GM->L1 block copy (one whole block).
+                    T.copy(KV[0, 0:N, 0, :], kv_l1)
+                    T.barrier_all()
+                    T.copy(ident, ident_l1)
+                    T.barrier_all()
+                    T.gemm_v0(ident_l1, kv_l1, acc, init=True)
+                    T.barrier_all()
+                    T.copy(acc, Output)
+
+        return probe
+
     @T.prim_func
-    def cube_gather_probe(
+    def probe(
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         block_table: T.Tensor(bt_shape, indices_dtype),  # type: ignore
         indices: T.Tensor(idx_shape, indices_dtype),  # type: ignore
@@ -72,22 +90,43 @@ def build_probe(block_num, block_size, N, D, table_len, dtype="bfloat16"):
             acc = T.alloc_L0C([N, D], accum_dtype)
             T.annotate_address({kv_l1: l1_kv, ident_l1: l1_ident, acc: 0})
             with T.Scope("C"):
-                # --- THE PROBE: two-step paged gather, on the cube core. ---
+                # Test: two-step paged indirect gather, per row, on the cube.
                 for i in range(N):
                     logical = indices[0, i]
                     phys = block_table[0, logical // block_size]
                     row = logical % block_size
                     T.copy(KV[phys, row, 0, :], kv_l1[i, :])
                 T.barrier_all()
-                # --- extract L1 -> GM via I @ kv = kv (and prove the gathered
-                #     data is gemm-able, which B needs). ---
                 T.copy(ident, ident_l1)
                 T.barrier_all()
                 T.gemm_v0(ident_l1, kv_l1, acc, init=True)
                 T.barrier_all()
                 T.copy(acc, Output)
 
-    return cube_gather_probe
+    return probe
+
+
+def _run(mode, block_num, block_size, N, D, table_len, KV, block_table, indices, ident):
+    if mode == "block":
+        golden = KV[0, 0:N, 0, :].to(torch.float32)
+    else:
+        golden = torch.zeros(N, D, dtype=torch.bfloat16)
+        for i in range(N):
+            logical = int(indices[0, i])
+            phys = int(block_table[0, logical // block_size])
+            row = logical % block_size
+            golden[i] = KV[phys, row, 0, :]
+        golden = golden.to(torch.float32)
+
+    kernel = build_probe(block_num, block_size, N, D, table_len, mode)
+    with torch.device("npu"):
+        out = kernel(KV.npu(), block_table.npu(), indices.npu(), ident.npu())
+        torch.npu.synchronize()
+    out_cpu = out.cpu().to(torch.float32)
+    max_diff = (out_cpu - golden).abs().max().item()
+    ok = torch.allclose(out_cpu, golden, rtol=1e-2, atol=1e-2)
+    print(f"[{mode:6}] max_abs_diff = {max_diff:.6f}  {'PASS' if ok else 'FAIL'}")
+    return ok
 
 
 def main():
@@ -106,36 +145,35 @@ def main():
     block_num, block_size, N, D, table_len = 8, 64, 64, 512, 4
 
     KV = (torch.rand(block_num, block_size, 1, D) * 2 - 1).to(torch.bfloat16)
-    # Permuted (non-trivial) block table: logical block b -> physical perm[b].
     perm = torch.randperm(block_num)[:table_len].to(torch.int32)
     block_table = perm.reshape(1, table_len)
-    # Scattered logical token ids over the valid range (cmp-like gather).
     indices = torch.randint(0, table_len * block_size, (1, N), dtype=torch.int32)
     ident = torch.eye(N, dtype=torch.bfloat16)
 
-    # Host golden: Output[i] = KV[block_table[0, idx//bs], idx % bs, 0, :].
-    golden = torch.zeros(N, D, dtype=torch.bfloat16)
-    for i in range(N):
-        logical = int(indices[0, i])
-        phys = int(block_table[0, logical // block_size])
-        row = logical % block_size
-        golden[i] = KV[phys, row, 0, :]
+    block_ok = _run(
+        "block", block_num, block_size, N, D, table_len, KV, block_table, indices, ident
+    )
+    gather_ok = _run(
+        "gather",
+        block_num,
+        block_size,
+        N,
+        D,
+        table_len,
+        KV,
+        block_table,
+        indices,
+        ident,
+    )
 
-    kernel = build_probe(block_num, block_size, N, D, table_len)
-    with torch.device("npu"):
-        out = kernel(KV.npu(), block_table.npu(), indices.npu(), ident.npu())
-        torch.npu.synchronize()
-
-    out_cpu = out.cpu().to(torch.float32)
-    golden_f = golden.to(torch.float32)
-    max_diff = (out_cpu - golden_f).abs().max().item()
-    ok = torch.allclose(out_cpu, golden_f, rtol=1e-2, atol=1e-2)
-    print(f"max_abs_diff = {max_diff:.6f}")
-    if ok:
-        print("PROBE PASS - cube-side paged gather works; the B rewrite can proceed.")
-        return 0
-    print("PROBE FAIL - output mismatch; cube gather is wrong (see diff).")
-    return 1
+    print("-" * 56)
+    if block_ok and gather_ok:
+        print("cube indirect gather works -- B can proceed.")
+    elif block_ok and not gather_ok:
+        print("extraction chain OK; the INDIRECT GATHER is the bug (fixable).")
+    else:
+        print("extraction chain (identity gemm path) is broken; gather not yet judged.")
+    return 0
 
 
 if __name__ == "__main__":
