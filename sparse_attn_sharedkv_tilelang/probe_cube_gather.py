@@ -76,6 +76,34 @@ def build_probe(block_num, block_size, N, D, table_len, mode, dtype="bfloat16"):
 
         return probe
 
+    if mode == "loop_direct":
+
+        @T.prim_func
+        def probe(
+            KV: T.Tensor(kv_shape, dtype),  # type: ignore
+            block_table: T.Tensor(bt_shape, indices_dtype),  # type: ignore
+            indices: T.Tensor(idx_shape, indices_dtype),  # type: ignore
+            ident: T.Tensor(ident_shape, dtype),  # type: ignore
+            Output: T.Tensor(out_shape, dtype),  # type: ignore
+        ):
+            with T.Kernel(1, is_npu=True) as (cid, vid):
+                kv_l1 = T.alloc_L1([N, D], dtype)
+                ident_l1 = T.alloc_L1([N, N], dtype)
+                acc = T.alloc_L0C([N, D], accum_dtype)
+                T.annotate_address({kv_l1: l1_kv, ident_l1: l1_ident, acc: 0})
+                with T.Scope("C"):
+                    # Per-row, single-row dst, but FIXED block (no indirection).
+                    for i in range(N):
+                        T.copy(KV[0, i, 0, :], kv_l1[i, :])
+                    T.barrier_all()
+                    T.copy(ident, ident_l1)
+                    T.barrier_all()
+                    T.gemm_v0(ident_l1, kv_l1, acc, init=True)
+                    T.barrier_all()
+                    T.copy(acc, Output)
+
+        return probe
+
     @T.prim_func
     def probe(
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
@@ -107,7 +135,7 @@ def build_probe(block_num, block_size, N, D, table_len, mode, dtype="bfloat16"):
 
 
 def _run(mode, block_num, block_size, N, D, table_len, KV, block_table, indices, ident):
-    if mode == "block":
+    if mode in ("block", "loop_direct"):
         golden = KV[0, 0:N, 0, :].to(torch.float32)
     else:
         golden = torch.zeros(N, D, dtype=torch.bfloat16)
@@ -150,29 +178,26 @@ def main():
     indices = torch.randint(0, table_len * block_size, (1, N), dtype=torch.int32)
     ident = torch.eye(N, dtype=torch.bfloat16)
 
-    block_ok = _run(
-        "block", block_num, block_size, N, D, table_len, KV, block_table, indices, ident
-    )
-    gather_ok = _run(
-        "gather",
-        block_num,
-        block_size,
-        N,
-        D,
-        table_len,
-        KV,
-        block_table,
-        indices,
-        ident,
-    )
+    args = (block_num, block_size, N, D, table_len, KV, block_table, indices, ident)
+    block_ok = _run("block", *args)
+    direct_ok = _run("loop_direct", *args)
+    gather_ok = _run("gather", *args)
 
     print("-" * 56)
-    if block_ok and gather_ok:
+    if gather_ok:
         print("cube indirect gather works -- B can proceed.")
-    elif block_ok and not gather_ok:
-        print("extraction chain OK; the INDIRECT GATHER is the bug (fixable).")
+    elif not block_ok:
+        print("extraction chain itself is broken; ignore the rest.")
+    elif not direct_ok:
+        print(
+            "per-row single-row L1 write fails on cube -> the gather needs 2D "
+            "slices, or route via UB->L1."
+        )
     else:
-        print("extraction chain (identity gemm path) is broken; gather not yet judged.")
+        print(
+            "per-row L1 write is OK -> the INDIRECT addressing (KV[phys,row], "
+            "runtime scalars on cube) is the bug."
+        )
     return 0
 
 
