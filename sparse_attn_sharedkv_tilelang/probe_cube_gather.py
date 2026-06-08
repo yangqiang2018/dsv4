@@ -92,9 +92,9 @@ def build_probe(block_num, block_size, N, D, table_len, mode, dtype="bfloat16"):
                 acc = T.alloc_L0C([N, D], accum_dtype)
                 T.annotate_address({kv_l1: l1_kv, ident_l1: l1_ident, acc: 0})
                 with T.Scope("C"):
-                    # Per-row, single-row dst, but FIXED block (no indirection).
+                    # Per-row, 2D single-row slices, FIXED block (no indirection).
                     for i in range(N):
-                        T.copy(KV[0, i, 0, :], kv_l1[i, :])
+                        T.copy(KV[0, i : i + 1, 0, :], kv_l1[i : i + 1, :])
                     T.barrier_all()
                     T.copy(ident, ident_l1)
                     T.barrier_all()
@@ -123,7 +123,7 @@ def build_probe(block_num, block_size, N, D, table_len, mode, dtype="bfloat16"):
                     logical = indices[0, i]
                     phys = block_table[0, logical // block_size]
                     row = logical % block_size
-                    T.copy(KV[phys, row, 0, :], kv_l1[i, :])
+                    T.copy(KV[phys, row : row + 1, 0, :], kv_l1[i : i + 1, :])
                 T.barrier_all()
                 T.copy(ident, ident_l1)
                 T.barrier_all()
@@ -190,12 +190,12 @@ def main():
         print("extraction chain itself is broken; ignore the rest.")
     elif not direct_ok:
         print(
-            "per-row single-row L1 write fails on cube -> the gather needs 2D "
-            "slices, or route via UB->L1."
+            "even 2D per-row L1 write fails on cube -> no per-row cube->L1 path; "
+            "route via vector gather -> UB -> L1 instead."
         )
     else:
         print(
-            "per-row L1 write is OK -> the INDIRECT addressing (KV[phys,row], "
+            "2D per-row L1 write is OK -> the INDIRECT addressing (KV[phys,row], "
             "runtime scalars on cube) is the bug."
         )
     return 0
