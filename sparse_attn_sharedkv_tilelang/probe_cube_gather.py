@@ -50,6 +50,11 @@ tilelang.cache.clear_cache()
 
 def build_probe(block_num, block_size, N, D, table_len, dtype):
     elem = 2  # bf16 / fp16 bytes
+    # dtypes MUST be variables, not string literals inline in T.Tensor(...):
+    # TVMScript evaluates a literal-string annotation down a path that fails
+    # with "expected Object but got str". Matches the examples / main kernel.
+    indices_dtype = "int32"
+    accum_dtype = "float"
     # L1: kv_l1 [N, D] then ident_l1 [N, N]. L0C: acc [N, D] at 0.
     l1_addr = {"kv_l1": 0, "ident_l1": N * D * elem}
 
@@ -58,15 +63,15 @@ def build_probe(block_num, block_size, N, D, table_len, dtype):
         @T.prim_func
         def cube_gather_probe(
             KV: T.Tensor([block_num, block_size, 1, D], dtype),  # type: ignore[valid-type]
-            block_table: T.Tensor([1, table_len], "int32"),  # type: ignore[valid-type]
-            indices: T.Tensor([1, N], "int32"),  # type: ignore[valid-type]
+            block_table: T.Tensor([1, table_len], indices_dtype),  # type: ignore[valid-type]
+            indices: T.Tensor([1, N], indices_dtype),  # type: ignore[valid-type]
             ident: T.Tensor([N, N], dtype),  # type: ignore[valid-type]
             out: T.Tensor([N, D], dtype),  # type: ignore[valid-type]
         ):
             with T.Kernel(1, is_npu=True) as (cid, vid):
                 kv_l1 = T.alloc_L1([N, D], dtype)
                 ident_l1 = T.alloc_L1([N, N], dtype)
-                acc = T.alloc_L0C([N, D], "float")
+                acc = T.alloc_L0C([N, D], accum_dtype)
                 T.annotate_address(
                     {
                         kv_l1: l1_addr["kv_l1"],
