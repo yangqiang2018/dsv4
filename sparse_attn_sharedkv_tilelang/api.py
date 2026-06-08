@@ -41,7 +41,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from kernel import build_sparse_attn_sharedkv, DEFAULT_CORE_NUM
+from kernel import build_sparse_attn_sharedkv, DEFAULT_BLOCK_I, DEFAULT_CORE_NUM
 from metadata import sparse_attn_sharedkv_metadata, SAS_META_SIZE
 
 # Module-level kernel cache: key is the tuple of compile-time params.
@@ -258,7 +258,11 @@ def sparse_attn_sharedkv(
         # generates the dense [0, K) indices on-device, so cmp_indices
         # is an unused placeholder here.
         max_cmp = int(seqused_kv.max().item()) // cmp_ratio
-        K = max(64, ((max_cmp + 63) // 64) * 64)
+        # Round up to a multiple of the kernel's KV tile (BI). CFA's dense
+        # [0, K) indices over-cover; the extra tail (>= cmp threshold) is
+        # masked out, so over-rounding only adds masked work, not error.
+        _bi = DEFAULT_BLOCK_I
+        K = max(_bi, ((max_cmp + _bi - 1) // _bi) * _bi)
         cmp_indices_dev = torch.zeros(
             (total_tokens, N2, K), dtype=torch.int32, device=q.device
         )
@@ -267,8 +271,9 @@ def sparse_attn_sharedkv(
         K = 0
         # SWA has no cmp pass; the kernel never reads cmp_indices. Pass a
         # minimal one-chunk dummy so the kernel argument stays well-typed.
+        # Last dim must match the kernel's indices_shape (max(NI_cmp,1)*BI).
         cmp_indices_dev = torch.zeros(
-            (total_tokens, N2, 64), dtype=torch.int32, device=q.device
+            (total_tokens, N2, DEFAULT_BLOCK_I), dtype=torch.int32, device=q.device
         )
 
     if N1 != 64 or N2 != 1 or D != 512:

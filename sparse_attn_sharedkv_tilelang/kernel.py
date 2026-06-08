@@ -50,6 +50,15 @@ tilelang.cache.clear_cache()
 # Atlas A3 cube/vector pair count.
 DEFAULT_CORE_NUM = 24
 
+# KV tile (cube N-split): how many KV tokens one cube gemm + one gather
+# chunk processes. 128 matches the Ascend C kernel's N_SPLIT_SIZE=128.
+# Larger BI => fewer chunks => less per-chunk handshake / scalar / barrier
+# overhead and better cube utilization. Must divide topk_cmp and
+# ori_block_size; the gemm operand tile (kv [BI, D]) is K/N-split by
+# gemm_v0 to fit the 64KB L0A/L0B. api.py imports this to size the
+# scenario-specific cmp_indices placeholders consistently.
+DEFAULT_BLOCK_I = 128
+
 # ---- SasMetaData layout mirroring sparse_attn_sharedkv_metadata.h. ----
 # faMetadata[AIC_CORE_NUM][FA_METADATA_SIZE] is laid out first inside
 # the flat int32[SAS_META_SIZE] metadata tensor produced by the Ascend C
@@ -99,7 +108,7 @@ def build_sparse_attn_sharedkv(
     ori_win_left: int = 127,
     softmax_scale: float = 0.04419417,
     dtype: str = "bfloat16",
-    block_I: int = 64,
+    block_I: int = DEFAULT_BLOCK_I,
     core_num: int = DEFAULT_CORE_NUM,
 ):
     """Build a JIT-compiled TileLang kernel for SparseAttnSharedKV.
@@ -123,15 +132,15 @@ def build_sparse_attn_sharedkv(
     assert cmp_block_num > 0 and cmp_block_size > 0 and cmp_table_len > 0
 
     gqa_group = n_heads // n_kv_heads  # 64
-    BI = block_I  # 64
+    BI = block_I  # 128
     D = head_dim  # 512
     accum_dtype = "float"
     indices_dtype = "int32"
 
     # Sliding window: q-token attends to [s - win_left, s] (closed).
     ori_window_max = ori_win_left + 1  # 128
-    NI_ori = (ori_window_max + BI - 1) // BI  # 2
-    NI_cmp = topk_cmp // BI  # 8 for topk=512
+    NI_ori = (ori_window_max + BI - 1) // BI  # 1 for BI=128
+    NI_cmp = topk_cmp // BI  # 4 for topk=512, BI=128
     NI_total = NI_ori + NI_cmp
     # CFA: the cmp indices are the dense range [0, topk_cmp); the kernel
     # generates them per chunk with createvecindex instead of reading a
@@ -153,31 +162,34 @@ def build_sparse_attn_sharedkv(
     # SWA has no cmp pass, so its dummy is a single BI-wide slot.
     indices_shape = [total_tokens, n_kv_heads, max(NI_cmp, 1) * BI]
 
-    # ---- Manual address maps (bytes). ----
+    # ---- Manual address maps (bytes). Sized for BI=128. ----
     KB = 1024
-    l1_addr = {"q_l1": 0, "kv_l1": 64 * KB, "p_l1": 128 * KB}
+    # L1 (>=208KB): q_l1 [64,512]bf16=64KB @0..64; kv_l1 [128,512]bf16=128KB
+    # @64..192; p_l1 [64,128]bf16=16KB @192..208.
+    l1_addr = {"q_l1": 0, "kv_l1": 64 * KB, "p_l1": 192 * KB}
     l0c_addr = {"acc_s_l0c": 0, "acc_o_l0c": 0}  # disjoint phases ⇒ alias
+    # UB (192KB). acc_s_* are [32,128] now (double the BI=64 size), so
+    # everything below them shifts up. acc_o_ub / acc_o_half / kv_ub_multi
+    # alias one 64KB region (disjoint phases). Peak = 176KB (16KB margin).
     ub_addr = {
-        "acc_o": 0,
-        "acc_s_ub": 64 * KB,
-        "acc_s_ub_": 72 * KB,
-        "acc_s_half": 80 * KB,
-        "m_i": 84 * KB,
-        "m_i_prev": 84 * KB + 128,
-        "sumexp": 84 * KB + 256,
-        "sumexp_i_ub": 84 * KB + 384,
-        "sinks_ub": 84 * KB + 512,
-        # lse_ub holds the per-head LogSumExp result before the GM
-        # write-back. ub_len * sizeof(fp32) = 32 * 4 = 128 bytes; fits in
-        # the 128-byte gap between sinks_ub (128 bytes used out of the
-        # 256-byte slot) and idx_int.
-        "lse_ub": 84 * KB + 640,
-        "idx_int": 84 * KB + 768,
-        "idx_float": 84 * KB + 1024,
-        "mask_ub": 84 * KB + 2304,
-        "mask_ub_2": 84 * KB + 2336,
-        "acc_o_ub": 88 * KB,
-        "acc_o_half": 88 * KB,  # aliases acc_o_ub (disjoint phases)
+        "acc_o": 0,  # [32,512]fp32 = 64KB -> 0..64KB
+        "acc_s_ub": 64 * KB,  # [32,128]fp32 = 16KB -> 64..80KB
+        "acc_s_ub_": 80 * KB,  # [32,128]fp32 = 16KB -> 80..96KB
+        "acc_s_half": 96 * KB,  # [32,128]bf16 = 8KB -> 96..104KB
+        # Per-row scalar vectors + index/mask scratch, packed from 104KB.
+        "m_i": 104 * KB,
+        "m_i_prev": 104 * KB + 128,
+        "sumexp": 104 * KB + 256,
+        "sumexp_i_ub": 104 * KB + 384,
+        "sinks_ub": 104 * KB + 512,
+        "lse_ub": 104 * KB + 640,
+        "idx_int": 104 * KB + 768,  # [128]int32 = 512B
+        "idx_float": 104 * KB + 1280,  # [128]fp32 = 512B
+        "mask_ub": 104 * KB + 1792,
+        "mask_ub_2": 104 * KB + 1856,
+        "acc_o_ub": 112 * KB,  # [32,512]fp32 = 64KB -> 112..176KB
+        "acc_o_half": 112 * KB,  # aliases acc_o_ub (disjoint phases)
+        # kv_ub_multi [64,512]bf16=64KB also aliases acc_o_ub @112KB.
     }
 
     # Output 0: attn_out [total_tokens, n_heads, D] (dtype)
