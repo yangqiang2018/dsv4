@@ -248,7 +248,9 @@ AscendC 的核内重叠靠 `SetFlag/WaitFlag<HardEvent::V_MTE2>(eid)` + ping-pon
 - score load `acc_s_ub_`、ws_o load `acc_o_ub` 要开 ×2(`acc_s_ub_` 16K→32K、`acc_o_ub` 32K→64K),否则 V1(t)/V2(t) 的 MTE2 load 会和 V1(t-1)/V2(t-2) 的 VEC 抢 buffer。⚠️ 这会顶 UB 墙(acc_o_ub ×2 = 64K),需要重新核 170K 预算——可能 score 或 ws_o load 只 ×2 一个、或 acc_o_ub 维持单缓冲(merge 的 load∥compute 不重叠,只保跨相位重叠)。**实施前先把 ping-pong 深度和 UB 预算重算清楚**。
 
 **增量子步**(每步 NPU 验证):
-- **S2b.1a**:只让 **V0(gather-MTE2) ∥ V1(softmax-VEC)** 重叠——去掉 V0↔V1 之间 + 各自内部 barrier、补上面的 flag,V2 仍 `barrier_all` 隔离。验对 + 看 `aiv_time` 是否开始掉(gather 7.1ms 藏到 softmax 后)。这是最小的"有收益"步。
-- **S2b.1b**:把 V2 纳入重叠(去 V1↔V2 barrier + V2 内 flag)。
-- **S2b.1c**:相位间 + 跨 chunk 全打通 + ping-pong 调深。
+- **S2b.1·smoke**(`ec9b282`,✅ **decode+prefill 已验证**):gather(MTE2)→写 ws_kv(MTE3) 的 barrier 换一对配平 `set_flag/wait_flag`(写后 barrier 保留 → 零竞态)。**验通了 pipe-flag 原语在本 kernel 能 lower + 跑对 + 不死锁**——后面所有去 barrier 的地基。
+- **⚠️ 阻塞点(做真跨相位前必须先解决)**:**V1 里同 dtype `T.copy(UB,UB)`(`mask_ub→mask_sel`、`m_i→m_i_prev`、`m_i_prev→alpha`)走哪条 pipe?** 决定去 barrier 后给不给它补 flag、补哪条(set_flag 需要 src pipe)。codegen 的 `copy_ub_to_ub` 那张表是 extra-args 数、不是 pipe,没查到。解决:读非-pto codegen 对 `copy_ub_to_ub` 发的 AscendC API 看它落哪个 pipe,或一个"漏 flag 就死锁/错"的最小 NPU 探针。(`acc_s_ub→acc_s_half` 是 fp32→bf16 cast = VEC vconv,这个确定。)
+- **S2b.1a(真跨相位,下一刀)**:解决阻塞点后,去 V0↔V1 之间 + 各自内部 barrier、补 flag,让 **V0 gather-MTE2 ∥ V1 softmax-VEC** 重叠(V2 仍隔离)。这才是吃 gap 的真收益(gather 7.1ms 藏到 softmax 的 12ms VEC+scalar 后)。
+- **S2b.1b/c**:纳入 V2、跨 chunk 全打通 + ping-pong 调深(上面 UB 预算告警)。
+- **备选小刀(不阻塞,ROI 低)**:V0 内部 ping-pong(gather[gp+1] ∥ write[gp],要 forward+back flag + 平衡 drain)——只藏 V0 的写 ~1ms,复杂度不值,除非想先单独把 back-flag/平衡机制验掉。
 - 回退点:tag `s2a-forward-verified` 或 S2b.0 的 `0fe56b7`。
