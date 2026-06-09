@@ -228,7 +228,27 @@ AscendC 的核内重叠靠 `SetFlag/WaitFlag<HardEvent::V_MTE2>(eid)` + ping-pon
 
 ### 9.3 增量步骤（每步独立 NPU 验证:先正确性后 profile;回退点 tag `s2a-forward-verified`）
 
-- **S2b.0 — UB sub-tile,barrier 全保留**:gather 改 4×16 行、merge 改 2×16 头 + 新布局。**行为不变、最易验对**,把"布局正确性"和"去 barrier 竞态"解耦(同 S1/S2a 渐进打法)。perf 应持平。
-- **S2b.1 — vector 去核内 barrier**:V0/V1/V2 之间 + pipe-stage 之间换 `set_flag/wait_flag` + ping-pong,V 内连续算用 `pipe_barrier("v")`。验对 + 看 `aiv_time` 是否朝 pipe-max(~7ms)掉。
+- **S2b.0 — UB sub-tile,barrier 全保留**:gather 改 4×16 行(`cff7e59`)、merge 改 2×16 头 + un-alias(`0fe56b7`)。**✅ decode+prefill 已验证**,布局对、行为不变。把"布局正确性"和"去 barrier 竞态"解耦(同 S1/S2a 渐进打法)。
+- **S2b.1 — vector 去核内 barrier**(下一刀,最难):V0/V1/V2 之间 + pipe-stage 之间换 `set_flag/wait_flag` + ping-pong,V 内连续算用 `pipe_barrier("v")`。验对 + 看 `aiv_time` 是否朝 pipe-max(~7ms)掉。
 - **S2b.2 — cube 去核内 barrier**:MM1/MM2 同理。
 - 风险:竞态/死锁(flag 配对、ping-pong 深度);按经验大概率要逐步闯。每步只改一小撮、必过 NPU 再推下一步。
+
+### 9.4 S2b.1 怎么拆（设计要点,实施前定稿）
+
+**核心原则**:去掉 vector scope 的 `barrier_all`(全 pipe drain)。**同一 pipe 上的操作硬件自动 in-order,不需任何同步**;只在**跨 pipe 的真依赖**之间补 `set_flag(src,dst,eid)`/`wait_flag(src,dst,eid)`。没数据依赖的跨 pipe 操作(如 V0(t) 的 gather-MTE2 与 V1(t-1) 的 softmax-VEC,不同 chunk/不同 buffer)就让它们并行——这正是 gap 的来源。
+
+**去 barrier 后要补的跨 pipe flag**(每相位内):
+- V0 gather:每趟 16 行 gather(MTE2) → 写 ws_kv(MTE3):`set_flag("mte2","mte3")` / wait。
+- V1 softmax:load ws_score(MTE2) → 算(VEC):`set_flag("mte2","v")`;算完 → 写 ws_p(MTE3):`set_flag("v","mte3")`。VEC 串内部用 `pipe_barrier("v")`。
+- V2 merge:load ws_o(MTE2) → rescale+add(VEC):`set_flag("mte2","v")`。
+- 跨核 4 forward cross-flag 不变。⚠️ `wait_flag(src,dst,e)` 跑在 **dst** pipe 上。
+
+**还需的 ping-pong**(让下一 chunk 的 load overlap 当前 chunk 的 compute,复刻 AscendC `inputBuff1` 32K×2):
+- gather `kv_ub_multi` 已是 `[2*16]` ping-pong ✓。
+- score load `acc_s_ub_`、ws_o load `acc_o_ub` 要开 ×2(`acc_s_ub_` 16K→32K、`acc_o_ub` 32K→64K),否则 V1(t)/V2(t) 的 MTE2 load 会和 V1(t-1)/V2(t-2) 的 VEC 抢 buffer。⚠️ 这会顶 UB 墙(acc_o_ub ×2 = 64K),需要重新核 170K 预算——可能 score 或 ws_o load 只 ×2 一个、或 acc_o_ub 维持单缓冲(merge 的 load∥compute 不重叠,只保跨相位重叠)。**实施前先把 ping-pong 深度和 UB 预算重算清楚**。
+
+**增量子步**(每步 NPU 验证):
+- **S2b.1a**:只让 **V0(gather-MTE2) ∥ V1(softmax-VEC)** 重叠——去掉 V0↔V1 之间 + 各自内部 barrier、补上面的 flag,V2 仍 `barrier_all` 隔离。验对 + 看 `aiv_time` 是否开始掉(gather 7.1ms 藏到 softmax 后)。这是最小的"有收益"步。
+- **S2b.1b**:把 V2 纳入重叠(去 V1↔V2 barrier + V2 内 flag)。
+- **S2b.1c**:相位间 + 跨 chunk 全打通 + ping-pong 调深。
+- 回退点:tag `s2a-forward-verified` 或 S2b.0 的 `0fe56b7`。
