@@ -694,15 +694,16 @@ def build_sparse_attn_sharedkv(
                                         sumexp_i_ub,
                                     )
                                     T.barrier_all()
-
-                                    for h_i in range(v_block):
-                                        T.barrier_all()
-                                        T.tile.mul(
-                                            acc_o[h_i, :],
-                                            acc_o[h_i, :],
-                                            m_i_prev[h_i],
-                                        )
-                                        T.barrier_all()
+                                    # NOTE: the acc_o rescale (acc_o *= alpha)
+                                    # that used to live here moved into V2 (the
+                                    # P@V merge), fused with the add as
+                                    # acc_o = alpha*acc_o + O. alpha == m_i_prev
+                                    # (= exp(m_prev - m_new)) stays live until V2
+                                    # consumes it, so V1 no longer touches acc_o
+                                    # -- the precondition for pipelining V1/V2
+                                    # (mirrors Ascend C DealBmm2ResBaseBlock,
+                                    # which does the whole output recurrence in
+                                    # the V2 phase). See PIPELINE_DESIGN.md S2.
 
                                     # ---- cast P, publish for cube ----
                                     T.copy(acc_s_ub, acc_s_half)
@@ -730,6 +731,23 @@ def build_sparse_attn_sharedkv(
                                         acc_o_ub,
                                     )
                                     T.barrier_all()
+                                    # Output recurrence acc_o = alpha*acc_o + O,
+                                    # fused here (relocated out of V1). alpha is
+                                    # m_i_prev = exp(m_prev - m_new) computed in
+                                    # V1 and still live (nothing writes it
+                                    # between V1 and here). The rescale MUST
+                                    # precede the add. For chunk 0 acc_o is 0 so
+                                    # the rescale is a no-op -> acc_o = O_0, same
+                                    # as before. Behaviour-preserving vs the old
+                                    # "rescale in V1, add in V2" split.
+                                    for h_i in range(v_block):
+                                        T.barrier_all()
+                                        T.tile.mul(
+                                            acc_o[h_i, :],
+                                            acc_o[h_i, :],
+                                            m_i_prev[h_i],
+                                        )
+                                        T.barrier_all()
                                     T.tile.add(acc_o, acc_o, acc_o_ub)
                                     T.barrier_all()
                                     T.set_cross_flag("V", _FLAG_ITER_DONE)
