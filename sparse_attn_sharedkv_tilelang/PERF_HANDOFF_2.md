@@ -10,7 +10,7 @@
 - **S1 已验证**（commit `cc6ee1c`）:把 online-softmax 的输出 rescale 从 V1 挪进 V2。decode+prefill 都过,数值对。
 - **S2a 软件流水**:把每 chunk 串行重排成错位流水(cube `MM1(t)∥MM2(t-1)`,vector `V0(t)∥V1(t-1)∥V2(t-2)`)。
   - **reverse 版已验证 + profile**（commit `1c52835`）:单缓冲、相位倒序,**Duration 48.8ms→41.5ms(14.1%→16.6%)**,但 gap 还剩 14.4ms。这是**已知能跑的退路**。
-  - **forward 版 decode 已验证**（HEAD `91d42f7`）:正序(= Ascend C 的 PreloadPipeline,重叠更紧)+ parity 双缓冲,scfa/swa/cfa decode 全过、数值对。闯过三层 **device 端**坑(都不是 parse 错):①mask parity 行 16B 未对齐→pad 到 `[2,32]`;②`for…in range()` 是 TIR loop、parity 是 Var(不能用 Python tuple 选 buffer);③`tile` 标量第三参 2D `alpha[pv,h]` 丢 `h`、每头读成 `alpha.flat[pv]`→alpha 改扁平 1D。三坑+operand 类型规则已记进 `tilelang-pitfalls` skill。**待 prefill 正确性 + profile**。
+  - **forward 版 decode 已验证**（HEAD `91d42f7`）:正序(= Ascend C 的 PreloadPipeline,重叠更紧)+ parity 双缓冲,scfa/swa/cfa decode 全过、数值对。闯过三层 **device 端**坑(都不是 parse 错):①mask parity 行 16B 未对齐→pad 到 `[2,32]`;②`for…in range()` 是 TIR loop、parity 是 Var(不能用 Python tuple 选 buffer);③`tile` 标量第三参 2D `alpha[pv,h]` 丢 `h`、每头读成 `alpha.flat[pv]`→alpha 改扁平 1D。三坑+operand 类型规则已记进 `tilelang-pitfalls` skill。**prefill 已过 + profile**（`91d42f7`,8K scfa_prefill 稳态）:**Duration 41.5ms→36.3ms(16.6%→18.9%)**。但 **gap 仍 ~15ms 没动**(reverse 14.4 → forward 15.0):forward 正序+双缓冲只削了**单核**时间(cube/vector 各 27→21ms,L1 双缓冲让 load 藏到 compute 后),**没吃跨核 gap**。原因:核内 `barrier_all` 仍把 pipe 抽干,每核还是**串行 sum**(vector 21ms,pipe-max 只 ~7ms;cube 21ms,pipe-max ~6ms)。→ 真正的大头是 **§4 的 S2b(去核内 barrier、pipe 级 flag,让 mte2∥vec∥mte3 并行)**:乐观把两核压到 ~7ms、Duration 朝 ~10ms(~60%+)。forward 双缓冲是 S2b 的前置(已就位)。
 
 **性能口径**:`性能% = AscendC(6.87ms) ÷ TileLang Duration × 100%`。
 
