@@ -18,18 +18,14 @@
 
 ## 1. ⭐ 立刻要做的（接手第一件事）
 
-forward decode 已验证(`91d42f7`)。**下一步:prefill 正确性 + profile**,对比 reverse 版的 41.5ms / gap 14.4ms。在 NPU 服务器(`/sdb/yq/dsv4`):
+forward decode+prefill 已验证、profiled(41.5→36.3ms/18.9%,`91d42f7`)。**S2b.0 (UB sub-tile + un-alias) 也已 decode+prefill 验证**(`0fe56b7`)。**下一步:实施 `§9.4` 的 S2b.1a** —— 去 V0↔V1 核内 barrier、补 pipe flag,让 **V0 gather-MTE2 ∥ V1 softmax-VEC** 重叠(V2 仍 `barrier_all` 隔离)。这是吃 ~15ms gap 的第一刀,也是竞态最隐蔽的一刀,**小步走、每步 NPU 验**。
 
-```bash
-git pull   # 确认到 91d42f7 或更新
-pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill" --runslow
-msprof --output=./prof_fwd --aic-metrics=PipeUtilization \
-  --application="python sparse_attn_sharedkv_perf_compare.py --scenarios scfa_prefill --only tilelang --warmup 5 --iters 3"
-```
+- 完整 S2b 方案/UB 数字/增量子步:`PIPELINE_DESIGN.md §9`(§9.1 pipe-flag+ping-pong 机制、§9.2 UB 预算、§9.4 S2b.1 拆法 + 待补的 per-phase flag 清单)。
+- 回退点:tag `s2a-forward-verified`(36.3ms) 或 S2b.0 `0fe56b7`。
+- ⚠️ S2b.1c 要 ping-pong `acc_s_ub_`/`acc_o_ub`(×2),会顶 UB 墙,**实施前先重算 170K 预算**(§9.4 末尾)。
 
-forward 顺序应把 gap 往 0 压、Duration 朝两核的 ~27ms 靠(~25%)。prefill 过 + profile 看完,就进 **§4 的 S2b**(更大头)。
-
-> decode 闯关史已解决(知识进了 `tilelang-pitfalls` skill,§3 表也同步更新)。当时的 (A)/(B)/(C) 分支已不适用:报错根本不在 parse,而是三个 device 端 bug —— 详见 §0 forward 那条。最后一刀是 V2 逐头 rescale 的 `tile.mul(..., alpha[pv2, h_i])`:2D 标量第三参被 `binary_op` 只取 `indices[0]`、丢了 `h_i`,每头都乘成 `alpha.flat[pv2]`。修法是 alpha 改扁平 1D `[2*ub_len]`、读 `alpha[pv2*ub_len+h_i]`(commit `91d42f7`)。
+> S2b.0 闯关史:gather sub-tile(`cff7e59`)→ merge sub-tile + un-alias(`0fe56b7`),全用已验证的 Var 偏移切片 / scalar-row 写法,barrier 全保留(行为不变)。
+> decode 闯关史(更早)已解决,知识进了 `tilelang-pitfalls` skill(§3 表同步)。最后一刀:V2 逐头 rescale 的 2D 标量 `alpha[pv2, h_i]` 被 `binary_op` 只取 `indices[0]`、丢 `h_i` → alpha 改扁平 1D(`91d42f7`)。
 
 ---
 
