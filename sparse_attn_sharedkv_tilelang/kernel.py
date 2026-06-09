@@ -623,10 +623,19 @@ def build_sparse_attn_sharedkv(
                                             # column to -inf -- the gathered value
                                             # never contributes.
                                             for gp in range(N_GATHER_PASS):
-                                                gh = (gp % 2) * GATHER_ROWS
+                                                pp = gp % 2
+                                                gh = pp * GATHER_ROWS
                                                 kv_row0 = (
                                                     vid * (BI // 2) + gp * GATHER_ROWS
                                                 )
+                                                # S2b.1b: ping-pong the gather UB half
+                                                # so gather[gp] (MTE2 into half pp)
+                                                # overlaps write[gp-1] (MTE3 from the
+                                                # other half). WAR: half pp was last
+                                                # read by write[gp-2], so wait its
+                                                # back-flag before overwriting it.
+                                                if gp >= 2:
+                                                    T.wait_flag("mte3", "mte2", pp)
                                                 for r in range(GATHER_ROWS):
                                                     g_idx = chunk_start + kv_row0 + r
                                                     ori_blk = ori_block_table[
@@ -637,17 +646,9 @@ def build_sparse_attn_sharedkv(
                                                         ori_KV[ori_blk, ori_row, 0, :],
                                                         kv_ub_multi[gh + r, :],
                                                     )
-                                                # S2b.1a: order gather(MTE2) ->
-                                                # ws_kv write(MTE3) with a pipe flag,
-                                                # not a full barrier_all (mechanism
-                                                # smoke test -- the post-write barrier
-                                                # still serializes passes, so it stays
-                                                # race-free). set+wait are balanced
-                                                # within the pass; eventId 0 is unused
-                                                # elsewhere (cross-flags are a separate
-                                                # id space).
-                                                T.set_flag("mte2", "mte3", 0)
-                                                T.wait_flag("mte2", "mte3", 0)
+                                                # gather[gp](MTE2) -> write[gp](MTE3)
+                                                T.set_flag("mte2", "mte3", pp)
+                                                T.wait_flag("mte2", "mte3", pp)
                                                 T.copy(
                                                     kv_ub_multi[
                                                         gh : gh + GATHER_ROWS, :
@@ -659,7 +660,8 @@ def build_sparse_attn_sharedkv(
                                                         :,
                                                     ],
                                                 )
-                                                T.barrier_all()
+                                                # write[gp] done -> half pp free (gp+2)
+                                                T.set_flag("mte3", "mte2", pp)
                                         else:
                                             if is_cfa:
                                                 # CFA: this chunk's compressed
@@ -724,10 +726,16 @@ def build_sparse_attn_sharedkv(
                                             # KV is harmless (matches the old
                                             # fill-0 path numerically).
                                             for gp in range(N_GATHER_PASS):
-                                                gh = (gp % 2) * GATHER_ROWS
+                                                pp = gp % 2
+                                                gh = pp * GATHER_ROWS
                                                 kv_row0 = (
                                                     vid * (BI // 2) + gp * GATHER_ROWS
                                                 )
+                                                # S2b.1b ping-pong (see ori branch):
+                                                # gather[gp](MTE2,half pp) overlaps
+                                                # write[gp-1](MTE3); WAR back-flag.
+                                                if gp >= 2:
+                                                    T.wait_flag("mte3", "mte2", pp)
                                                 for r in range(GATHER_ROWS):
                                                     cmp_idx = idx_int[kv_row0 + r]
                                                     safe_idx = T.if_then_else(
@@ -741,17 +749,9 @@ def build_sparse_attn_sharedkv(
                                                         cmp_KV[cmp_blk, cmp_row, 0, :],
                                                         kv_ub_multi[gh + r, :],
                                                     )
-                                                # S2b.1a: order gather(MTE2) ->
-                                                # ws_kv write(MTE3) with a pipe flag,
-                                                # not a full barrier_all (mechanism
-                                                # smoke test -- the post-write barrier
-                                                # still serializes passes, so it stays
-                                                # race-free). set+wait are balanced
-                                                # within the pass; eventId 0 is unused
-                                                # elsewhere (cross-flags are a separate
-                                                # id space).
-                                                T.set_flag("mte2", "mte3", 0)
-                                                T.wait_flag("mte2", "mte3", 0)
+                                                # gather[gp](MTE2) -> write[gp](MTE3)
+                                                T.set_flag("mte2", "mte3", pp)
+                                                T.wait_flag("mte2", "mte3", pp)
                                                 T.copy(
                                                     kv_ub_multi[
                                                         gh : gh + GATHER_ROWS, :
@@ -763,7 +763,16 @@ def build_sparse_attn_sharedkv(
                                                         :,
                                                     ],
                                                 )
-                                                T.barrier_all()
+                                                # write[gp] done -> half pp free (gp+2)
+                                                T.set_flag("mte3", "mte2", pp)
+                                        # S2b.1b: drain the 2 dangling back-flags (the
+                                        # last two passes set mte3->mte2 with no
+                                        # in-loop waiter), then a barrier to keep V0
+                                        # isolated from V1 (gather||V1 overlap is the
+                                        # next step, S2b.1c).
+                                        T.wait_flag("mte3", "mte2", 0)
+                                        T.wait_flag("mte3", "mte2", 1)
+                                        T.barrier_all()
                                         T.set_cross_flag("MTE3", _FLAG_KV_READY)
                                     # ---- V1(t-1): online softmax of chunk t-1 ----
                                     if t >= 1:

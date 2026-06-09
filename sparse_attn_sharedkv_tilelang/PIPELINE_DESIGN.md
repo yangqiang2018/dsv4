@@ -242,6 +242,7 @@ AscendC 的核内重叠靠 `SetFlag/WaitFlag<HardEvent::V_MTE2>(eid)` + ping-pon
 - V1 softmax:load ws_score(MTE2) → 算(VEC):`set_flag("mte2","v")`;算完 → 写 ws_p(MTE3):`set_flag("v","mte3")`。VEC 串内部用 `pipe_barrier("v")`。
 - V2 merge:load ws_o(MTE2) → rescale+add(VEC):`set_flag("mte2","v")`。
 - 跨核 4 forward cross-flag 不变。⚠️ `wait_flag(src,dst,e)` 跑在 **dst** pipe 上。
+- ✅ **阻塞点已解(关键)**:`copy_ub_to_ub` = **VEC pipe**(源码:`transform/common/operation_config.h` 标 `"PIPE_V"`、`ascend_combinecv.cc` 标 `"vec"`)。⇒ V1 里所有同 dtype `T.copy(UB,UB)`(`mask→mask_sel`、`m_i→m_i_prev`、`m_i_prev→alpha`)和所有 `tile.*` 全在 VEC、硬件自动 in-order ⇒ **去 barrier 后它们之间零 flag**。V1 真正跨 pipe 只有两处:`ws_score load(MTE2)→VEC`、`cast(VEC)→ws_p write(MTE3)`。V0 cmp 另有一处 `idx load(MTE2)→idx_float copy(VEC)`。(`acc_s_ub→acc_s_half` 是 fp32→bf16 cast,也在 VEC。)
 
 **还需的 ping-pong**(让下一 chunk 的 load overlap 当前 chunk 的 compute,复刻 AscendC `inputBuff1` 32K×2):
 - gather `kv_ub_multi` 已是 `[2*16]` ping-pong ✓。
