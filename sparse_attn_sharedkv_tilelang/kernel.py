@@ -217,7 +217,8 @@ def build_sparse_attn_sharedkv(
         # alpha[2,ub_len]fp32 = 256B: the V1->V2 rescale-factor handoff,
         # double-buffered so V2(t-2) reads alpha[(t-2)%2] while V1(t-1)
         # writes alpha[(t-1)%2] in the same pipeline step.
-        "alpha": 104 * KB + 2048,
+        "alpha": 104 * KB + 2048,  # [2,ub_len]fp32 = 256B -> ..2304
+        "mask_sel": 104 * KB + 2304,  # [16]uint8 whole buffer for select's selMask
         "acc_o_ub": 112 * KB,  # [32,512]fp32 = 64KB -> 112..176KB
         "acc_o_half": 112 * KB,  # aliases acc_o_ub (disjoint phases)
         # kv_ub_multi [64,512]bf16=64KB also aliases acc_o_ub @112KB.
@@ -310,6 +311,10 @@ def build_sparse_attn_sharedkv(
                 # [2,..] (only the pv0 slot used; V0-internal scratch) so the
                 # bitwise_and operands are all same-rank [.., BI//8] regions.
                 mask_ub_2 = T.alloc_ub([2, BI // 8], "uint8")
+                # Whole-buffer mask for tile.select (its selMask arg calls
+                # .access_ptr directly, which a parity BufferRegion lacks); V1
+                # copies the current chunk's mask_ub slot into this each step.
+                mask_sel = T.alloc_ub([BI // 8], "uint8")
 
                 T.annotate_address(
                     {
@@ -341,6 +346,7 @@ def build_sparse_attn_sharedkv(
                         kv_ub_multi: ub_addr["acc_o_ub"],
                         mask_ub: ub_addr["mask_ub"],
                         mask_ub_2: ub_addr["mask_ub_2"],
+                        mask_sel: ub_addr["mask_sel"],
                         acc_o_ub: ub_addr["acc_o_ub"],
                         acc_o_half: ub_addr["acc_o_half"],
                     }
@@ -689,10 +695,17 @@ def build_sparse_attn_sharedkv(
                                             # ---- additive mask (0 / -inf) ----
                                             T.tile.fill(acc_s_ub_, 0.0)
                                             T.barrier_all()
+                                            # select's selMask needs a whole Buffer
+                                            # (it calls .access_ptr directly, which
+                                            # a [2,..] parity BufferRegion lacks),
+                                            # so copy chunk t-1's mask into the
+                                            # whole mask_sel scratch first.
+                                            T.copy(mask_ub[pv1, :], mask_sel)
+                                            T.barrier_all()
                                             for h_i in T.serial(v_block):
                                                 T.tile.select(
                                                     acc_s_ub[h_i, :],
-                                                    mask_ub[pv1, :],
+                                                    mask_sel,
                                                     acc_s_ub_[h_i, :],
                                                     -T.infinity(accum_dtype),
                                                     "VSEL_TENSOR_SCALAR_MODE",
