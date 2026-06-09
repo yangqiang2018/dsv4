@@ -637,7 +637,17 @@ def build_sparse_attn_sharedkv(
                                                         ori_KV[ori_blk, ori_row, 0, :],
                                                         kv_ub_multi[gh + r, :],
                                                     )
-                                                T.barrier_all()
+                                                # S2b.1a: order gather(MTE2) ->
+                                                # ws_kv write(MTE3) with a pipe flag,
+                                                # not a full barrier_all (mechanism
+                                                # smoke test -- the post-write barrier
+                                                # still serializes passes, so it stays
+                                                # race-free). set+wait are balanced
+                                                # within the pass; eventId 0 is unused
+                                                # elsewhere (cross-flags are a separate
+                                                # id space).
+                                                T.set_flag("mte2", "mte3", 0)
+                                                T.wait_flag("mte2", "mte3", 0)
                                                 T.copy(
                                                     kv_ub_multi[
                                                         gh : gh + GATHER_ROWS, :
@@ -731,7 +741,17 @@ def build_sparse_attn_sharedkv(
                                                         cmp_KV[cmp_blk, cmp_row, 0, :],
                                                         kv_ub_multi[gh + r, :],
                                                     )
-                                                T.barrier_all()
+                                                # S2b.1a: order gather(MTE2) ->
+                                                # ws_kv write(MTE3) with a pipe flag,
+                                                # not a full barrier_all (mechanism
+                                                # smoke test -- the post-write barrier
+                                                # still serializes passes, so it stays
+                                                # race-free). set+wait are balanced
+                                                # within the pass; eventId 0 is unused
+                                                # elsewhere (cross-flags are a separate
+                                                # id space).
+                                                T.set_flag("mte2", "mte3", 0)
+                                                T.wait_flag("mte2", "mte3", 0)
                                                 T.copy(
                                                     kv_ub_multi[
                                                         gh : gh + GATHER_ROWS, :
