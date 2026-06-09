@@ -262,13 +262,16 @@ def build_sparse_attn_sharedkv(
                 q_l1 = T.alloc_L1([H_per_block, D], dtype)
                 # kv / p are split into two physical halves so each gemm_v0
                 # operand fits the 64KB L0B as a whole buffer. kv is also
-                # double-buffered as [2, BI_half, D] indexed by chunk parity:
-                # the pipelined cube reads chunk t-1's KV (for P@V) from
-                # kv_lo[(t-1)%2] while chunk t's KV (for Q@K^T) lands in
-                # kv_lo[t%2]. gemm_v0 takes the [BI_half, D] sub-region
-                # kv_lo[parity] (a BufferRegion, which it accepts).
-                kv_lo = T.alloc_L1([2, BI_half, D], dtype)
-                kv_hi = T.alloc_L1([2, BI_half, D], dtype)
+                # double-buffered by chunk parity, but as a FLAT [2*BI_half, D]
+                # buffer (not [2, BI_half, D]): the gemm operand is the parity
+                # slice kv_lo[pa*BI_half : pa*BI_half+BI_half, 0:D], a width-
+                # BI_half (=64) BufferRegion. A [2,..]-buffer parity slice
+                # kv_lo[pa:pa+1, ...] collapses the width-1 dim to a scalar ->
+                # BufferLoad, which gemm_v0 rejects; the width-64 slice stays a
+                # BufferRegion. MM2(t-1) reads the (t-1)%2 half while MM1(t)
+                # writes the t%2 half.
+                kv_lo = T.alloc_L1([2 * BI_half, D], dtype)
+                kv_hi = T.alloc_L1([2 * BI_half, D], dtype)
                 p_lo = T.alloc_L1([H_per_block, BI_half], dtype)
                 p_hi = T.alloc_L1([H_per_block, BI_half], dtype)
                 acc_s_l0c = T.alloc_L0C([H_per_block, BI_half], accum_dtype)
@@ -435,22 +438,30 @@ def build_sparse_attn_sharedkv(
                                         T.wait_cross_flag(_FLAG_KV_READY)
                                         T.barrier_all()
                                         # Load gathered KV as two [BI_half,D]=64KB
-                                        # halves into the t%2 L1 sub-buffers
-                                        # kv_lo[pa, 0:BI_half, 0:D]/kv_hi[pa, 0:BI_half, 0:D] (BufferRegion
-                                        # operands -- gemm_v0 accepts these).
+                                        # halves into the t%2 parity slice (rows
+                                        # pa*BI_half ..) of the flat kv_lo/kv_hi.
                                         T.copy(
                                             ws_kv[cid, pa, 0:BI_half, 0:D],
-                                            kv_lo[pa, 0:BI_half, 0:D],
+                                            kv_lo[
+                                                pa * BI_half : pa * BI_half + BI_half,
+                                                0:D,
+                                            ],
                                         )
                                         T.barrier_all()
                                         T.copy(
                                             ws_kv[cid, pa, BI_half:BI, 0:D],
-                                            kv_hi[pa, 0:BI_half, 0:D],
+                                            kv_hi[
+                                                pa * BI_half : pa * BI_half + BI_half,
+                                                0:D,
+                                            ],
                                         )
                                         T.barrier_all()
                                         T.gemm_v0(
                                             q_l1,
-                                            kv_lo[pa : pa + 1, 0:BI_half, 0:D],
+                                            kv_lo[
+                                                pa * BI_half : pa * BI_half + BI_half,
+                                                0:D,
+                                            ],
                                             acc_s_l0c,
                                             transpose_B=True,
                                             init=True,
@@ -463,7 +474,10 @@ def build_sparse_attn_sharedkv(
                                         T.barrier_all()
                                         T.gemm_v0(
                                             q_l1,
-                                            kv_hi[pa : pa + 1, 0:BI_half, 0:D],
+                                            kv_hi[
+                                                pa * BI_half : pa * BI_half + BI_half,
+                                                0:D,
+                                            ],
                                             acc_s_l0c,
                                             transpose_B=True,
                                             init=True,
@@ -502,14 +516,20 @@ def build_sparse_attn_sharedkv(
                                         # init=False accumulates the second half.
                                         T.gemm_v0(
                                             p_lo,
-                                            kv_lo[pb : pb + 1, 0:BI_half, 0:D],
+                                            kv_lo[
+                                                pb * BI_half : pb * BI_half + BI_half,
+                                                0:D,
+                                            ],
                                             acc_o_l0c,
                                             init=True,
                                         )
                                         T.barrier_all()
                                         T.gemm_v0(
                                             p_hi,
-                                            kv_hi[pb : pb + 1, 0:BI_half, 0:D],
+                                            kv_hi[
+                                                pb * BI_half : pb * BI_half + BI_half,
+                                                0:D,
+                                            ],
                                             acc_o_l0c,
                                             init=False,
                                         )
