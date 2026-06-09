@@ -178,6 +178,12 @@ def build_sparse_attn_sharedkv(
     GATHER_ROWS = 16
     assert (BI // 2) % GATHER_ROWS == 0, "BI//2 must be a multiple of GATHER_ROWS"
     N_GATHER_PASS = (BI // 2) // GATHER_ROWS  # 4 for BI=128
+    # S2b.0 V2 merge sub-tile: rescale+add MERGE_HEADS heads per pass so the P@V
+    # load buffer acc_o_ub shrinks to [16, D] = 32KB ([16,512]fp32), matching the
+    # 32KB gather tile so the two fit un-aliased. v_block must be a multiple.
+    MERGE_HEADS = 16
+    assert v_block % MERGE_HEADS == 0, "v_block must be a multiple of MERGE_HEADS"
+    N_MERGE_PASS = v_block // MERGE_HEADS  # 2 for v_block=32
 
     q_shape = [total_tokens, n_heads, D]
     out_shape = [total_tokens, n_heads, D]
@@ -210,9 +216,11 @@ def build_sparse_attn_sharedkv(
         "p_hi": 328 * KB,
     }
     l0c_addr = {"acc_s_l0c": 0, "acc_o_l0c": 0}  # disjoint phases ⇒ alias
-    # UB (192KB). acc_s_* are [32,128] now (double the BI=64 size), so
-    # everything below them shifts up. acc_o_ub / acc_o_half / kv_ub_multi
-    # alias one 64KB region (disjoint phases). Peak = 176KB (16KB margin).
+    # UB (192KB). acc_s_* are [32,128]. S2b.0b sub-tiles the two 64KB chunk
+    # buffers into 32KB tiles: kv_ub_multi (gather) and acc_o_ub (P@V merge)
+    # are now SEPARATE 32KB buffers (un-aliased, so S2b.1 can keep both live
+    # without barriers); acc_o_half (epilogue cast) aliases kv_ub_multi.
+    # Peak = 176KB (16KB margin).
     ub_addr = {
         "acc_o": 0,  # [32,512]fp32 = 64KB -> 0..64KB
         "acc_s_ub": 64 * KB,  # [32,128]fp32 = 16KB -> 64..80KB
@@ -245,9 +253,9 @@ def build_sparse_attn_sharedkv(
         # every head. A single flat index keeps the whole offset in indices[0].
         "alpha": 104 * KB + 2048,  # [2*ub_len]fp32 = 256B -> ..2304
         "mask_sel": 104 * KB + 2304,  # [32]uint8 whole buffer for select selMask
-        "acc_o_ub": 112 * KB,  # [32,512]fp32 = 64KB -> 112..176KB
-        "acc_o_half": 112 * KB,  # aliases acc_o_ub (disjoint phases)
-        # kv_ub_multi [64,512]bf16=64KB also aliases acc_o_ub @112KB.
+        "kv_ub_multi": 112 * KB,  # [2*16,512]bf16 = 32KB -> 112..144KB
+        "acc_o_ub": 144 * KB,  # [16,512]fp32 = 32KB -> 144..176KB
+        "acc_o_half": 112 * KB,  # [32,512]bf16 = 32KB, aliases kv_ub_multi (epilogue)
     }
 
     # Output 0: attn_out [total_tokens, n_heads, D] (dtype)
@@ -303,7 +311,9 @@ def build_sparse_attn_sharedkv(
 
                 # ---- UB (vector). ----
                 acc_o = T.alloc_ub([v_block, D], accum_dtype)
-                acc_o_ub = T.alloc_ub([v_block, D], accum_dtype)
+                # P@V merge load buffer, sub-tiled (S2b.0) to MERGE_HEADS heads =
+                # [16, D] = 32KB; V2 merges v_block heads in N_MERGE_PASS passes.
+                acc_o_ub = T.alloc_ub([MERGE_HEADS, D], accum_dtype)
                 acc_o_half = T.alloc_ub([v_block, D], dtype)
                 m_i = T.alloc_ub([ub_len], accum_dtype)
                 m_i_prev = T.alloc_ub([ub_len], accum_dtype)
@@ -377,12 +387,10 @@ def build_sparse_attn_sharedkv(
                         idx_int: ub_addr["idx_int"],
                         idx_float: ub_addr["idx_float"],
                         alpha: ub_addr["alpha"],
-                        # kv_ub_multi aliases acc_o_ub. In S2a the intra-vector
-                        # barriers keep V0 gather and V2 merge serialized within
-                        # a pipeline step, so they are still disjoint in time and
-                        # the alias holds. (S2b will remove those barriers and
-                        # must sub-tile / un-alias these two 64KB buffers.)
-                        kv_ub_multi: ub_addr["acc_o_ub"],
+                        # S2b.0b: kv_ub_multi (gather, 32KB) and acc_o_ub (merge,
+                        # 32KB) are now separate buffers -- un-aliased so S2b.1 can
+                        # keep both live without the within-core barriers.
+                        kv_ub_multi: ub_addr["kv_ub_multi"],
                         mask_ub: ub_addr["mask_ub"],
                         mask_ub_2: ub_addr["mask_ub_2"],
                         mask_sel: ub_addr["mask_sel"],
@@ -872,35 +880,45 @@ def build_sparse_attn_sharedkv(
                                         # ---- wait P@V (chunk c2), merge output ----
                                         T.wait_cross_flag(_FLAG_PV_READY)
                                         T.barrier_all()
-                                        T.copy(
-                                            ws_o[
-                                                cid,
-                                                pv2,
-                                                vid * v_block : vid * v_block + v_block,
-                                                :,
-                                            ],
-                                            acc_o_ub,
-                                        )
-                                        T.barrier_all()
                                         # Output recurrence acc_o = alpha*acc_o + O,
-                                        # fused here. alpha = exp(m_prev - m_new) was
-                                        # stashed by V1(c2) into the pv2 half of the flat
-                                        # alpha buffer; the slot survives the 2-step
-                                        # pipeline latency. Per-head scalar read uses a
-                                        # FLAT index alpha[pv2*ub_len + h_i] -- a 2D
-                                        # alpha[pv2, h_i] would lose h_i (binary_op scalar
-                                        # path keeps only indices[0]). Rescale MUST precede
-                                        # the add. Chunk 0 has acc_o = 0 so it is a no-op.
-                                        for h_i in range(v_block):
-                                            T.barrier_all()
-                                            T.tile.mul(
-                                                acc_o[h_i, :],
-                                                acc_o[h_i, :],
-                                                alpha[pv2 * ub_len + h_i],
+                                        # sub-tiled (S2b.0) into N_MERGE_PASS passes of
+                                        # MERGE_HEADS heads so the P@V load fits the 32KB
+                                        # acc_o_ub. alpha = exp(m_prev-m_new) was stashed by
+                                        # V1(c2) into the pv2 half of the flat alpha buffer;
+                                        # per-head SCALAR alpha[pv2*ub_len+h] (a 2D
+                                        # alpha[pv2,h] would lose h -- binary_op keeps only
+                                        # indices[0]). Rescale precedes add; chunk 0 has
+                                        # acc_o=0 so it is a no-op. mul+add use scalar-row
+                                        # acc_o[hbase+h_i] (no Var-offset range slice).
+                                        for mp in range(N_MERGE_PASS):
+                                            hbase = mp * MERGE_HEADS
+                                            T.copy(
+                                                ws_o[
+                                                    cid,
+                                                    pv2,
+                                                    vid * v_block + hbase : vid
+                                                    * v_block
+                                                    + hbase
+                                                    + MERGE_HEADS,
+                                                    :,
+                                                ],
+                                                acc_o_ub,
                                             )
                                             T.barrier_all()
-                                        T.tile.add(acc_o, acc_o, acc_o_ub)
-                                        T.barrier_all()
+                                            for h_i in range(MERGE_HEADS):
+                                                T.barrier_all()
+                                                T.tile.mul(
+                                                    acc_o[hbase + h_i, :],
+                                                    acc_o[hbase + h_i, :],
+                                                    alpha[pv2 * ub_len + hbase + h_i],
+                                                )
+                                                T.barrier_all()
+                                                T.tile.add(
+                                                    acc_o[hbase + h_i, :],
+                                                    acc_o[hbase + h_i, :],
+                                                    acc_o_ub[h_i, :],
+                                                )
+                                                T.barrier_all()
 
                                 # ---- normalize and write back ----
                                 for h_i in range(v_block):
