@@ -168,6 +168,16 @@ def build_sparse_attn_sharedkv(
     # unaligned. Pad each parity row to mask_w (round BI//8 up to 32B) so both
     # rows start on a 32B boundary; only the low BI//8 bytes carry the mask.
     mask_w = ((BI // 8 + 31) // 32) * 32  # 32 for BI=128
+    # S2b.0 gather sub-tile: instead of staging all BI//2 (=64) gathered KV rows
+    # in one 64KB UB buffer, gather GATHER_ROWS rows per pass into a ping-pong
+    # half and write that half to ws_kv, N_GATHER_PASS passes. 16 rows = a 16KB
+    # bf16 tile (matches the Ascend C kvMerg 16K ping-pong) and shrinks the
+    # gather UB to [2*16, D] = 32KB, which (with the 16-head V2 merge tile) lets
+    # S2b.1 un-alias the buffers and drop the within-core barriers. BI//2 must be
+    # a multiple of GATHER_ROWS.
+    GATHER_ROWS = 16
+    assert (BI // 2) % GATHER_ROWS == 0, "BI//2 must be a multiple of GATHER_ROWS"
+    N_GATHER_PASS = (BI // 2) // GATHER_ROWS  # 4 for BI=128
 
     q_shape = [total_tokens, n_heads, D]
     out_shape = [total_tokens, n_heads, D]
@@ -315,17 +325,17 @@ def build_sparse_attn_sharedkv(
                 acc_s_half = T.alloc_ub([v_block, BI], dtype)
                 idx_int = T.alloc_ub([BI], indices_dtype)
                 idx_float = T.alloc_ub([BI], accum_dtype)
-                # Multi-row gather staging buffer. Each AIV DMAs its BI//2 KV
-                # rows into distinct rows here with NO per-row barrier (the
-                # DMAs target disjoint rows, so MTE2 pipelines them), then a
-                # single barrier_all + one batched UB->workspace write. This
-                # replaces the old single-row kv_ub, whose write-after-read
-                # hazard forced a barrier per row. Aliases acc_o_ub's address
-                # (gather runs at the chunk head; acc_o_ub's P@V merge at the
-                # chunk tail -- disjoint phases, and the chunk-head mask
-                # barrier separates the previous chunk's merge from this
-                # chunk's gather), so the UB peak is unchanged.
-                kv_ub_multi = T.alloc_ub([BI // 2, D], dtype)
+                # Multi-row gather staging buffer, sub-tiled (S2b.0) into a
+                # [2*GATHER_ROWS, D] = 32KB ping-pong: pass gp gathers GATHER_ROWS
+                # KV rows into half (gp%2) with NO per-row barrier (disjoint dst
+                # rows -> MTE2 pipelines them), then one barrier + one batched
+                # write of that half to ws_kv. N_GATHER_PASS passes cover all
+                # BI//2 rows. Still aliases acc_o_ub's address (gather at the
+                # chunk head, P@V merge at the tail -- disjoint phases under the
+                # S2a barriers); S2b.1 will un-alias once the merge tile shrinks
+                # too. The ping-pong halves are rows [0,GATHER_ROWS) and
+                # [GATHER_ROWS, 2*GATHER_ROWS).
+                kv_ub_multi = T.alloc_ub([2 * GATHER_ROWS, D], dtype)
                 # Mask double buffer [2, mask_w]: V0(t) writes parity t%2 while
                 # V1(t-1) reads parity (t-1)%2 in the same step. The row is
                 # padded to mask_w (32B) so both parity rows are 32B aligned; a
@@ -604,29 +614,34 @@ def build_sparse_attn_sharedkv(
                                             # additive score mask sets their
                                             # column to -inf -- the gathered value
                                             # never contributes.
-                                            for bi_i in range(BI // 2):
-                                                lane = bi_i + vid * (BI // 2)
-                                                g_idx = chunk_start + lane
-                                                ori_blk = ori_block_table[
-                                                    b_i, g_idx // ori_block_size
-                                                ]
-                                                ori_row = g_idx % ori_block_size
-                                                T.copy(
-                                                    ori_KV[ori_blk, ori_row, 0, :],
-                                                    kv_ub_multi[bi_i, :],
+                                            for gp in range(N_GATHER_PASS):
+                                                gh = (gp % 2) * GATHER_ROWS
+                                                kv_row0 = (
+                                                    vid * (BI // 2) + gp * GATHER_ROWS
                                                 )
-                                            T.barrier_all()
-                                            T.copy(
-                                                kv_ub_multi[0 : BI // 2, :],
-                                                ws_kv[
-                                                    cid,
-                                                    pv0,
-                                                    vid * (BI // 2) : vid * (BI // 2)
-                                                    + BI // 2,
-                                                    :,
-                                                ],
-                                            )
-                                            T.barrier_all()
+                                                for r in range(GATHER_ROWS):
+                                                    g_idx = chunk_start + kv_row0 + r
+                                                    ori_blk = ori_block_table[
+                                                        b_i, g_idx // ori_block_size
+                                                    ]
+                                                    ori_row = g_idx % ori_block_size
+                                                    T.copy(
+                                                        ori_KV[ori_blk, ori_row, 0, :],
+                                                        kv_ub_multi[gh + r, :],
+                                                    )
+                                                T.barrier_all()
+                                                T.copy(
+                                                    kv_ub_multi[
+                                                        gh : gh + GATHER_ROWS, :
+                                                    ],
+                                                    ws_kv[
+                                                        cid,
+                                                        pv0,
+                                                        kv_row0 : kv_row0 + GATHER_ROWS,
+                                                        :,
+                                                    ],
+                                                )
+                                                T.barrier_all()
                                         else:
                                             if is_cfa:
                                                 # CFA: this chunk's compressed
@@ -690,32 +705,37 @@ def build_sparse_attn_sharedkv(
                                             # contribution, so reading token 0's
                                             # KV is harmless (matches the old
                                             # fill-0 path numerically).
-                                            for bi_i in range(BI // 2):
-                                                lane = bi_i + vid * (BI // 2)
-                                                cmp_idx = idx_int[lane]
-                                                safe_idx = T.if_then_else(
-                                                    cmp_idx < 0, 0, cmp_idx
+                                            for gp in range(N_GATHER_PASS):
+                                                gh = (gp % 2) * GATHER_ROWS
+                                                kv_row0 = (
+                                                    vid * (BI // 2) + gp * GATHER_ROWS
                                                 )
-                                                cmp_blk = cmp_block_table[
-                                                    b_i, safe_idx // cmp_block_size
-                                                ]
-                                                cmp_row = safe_idx % cmp_block_size
+                                                for r in range(GATHER_ROWS):
+                                                    cmp_idx = idx_int[kv_row0 + r]
+                                                    safe_idx = T.if_then_else(
+                                                        cmp_idx < 0, 0, cmp_idx
+                                                    )
+                                                    cmp_blk = cmp_block_table[
+                                                        b_i, safe_idx // cmp_block_size
+                                                    ]
+                                                    cmp_row = safe_idx % cmp_block_size
+                                                    T.copy(
+                                                        cmp_KV[cmp_blk, cmp_row, 0, :],
+                                                        kv_ub_multi[gh + r, :],
+                                                    )
+                                                T.barrier_all()
                                                 T.copy(
-                                                    cmp_KV[cmp_blk, cmp_row, 0, :],
-                                                    kv_ub_multi[bi_i, :],
+                                                    kv_ub_multi[
+                                                        gh : gh + GATHER_ROWS, :
+                                                    ],
+                                                    ws_kv[
+                                                        cid,
+                                                        pv0,
+                                                        kv_row0 : kv_row0 + GATHER_ROWS,
+                                                        :,
+                                                    ],
                                                 )
-                                            T.barrier_all()
-                                            T.copy(
-                                                kv_ub_multi[0 : BI // 2, :],
-                                                ws_kv[
-                                                    cid,
-                                                    pv0,
-                                                    vid * (BI // 2) : vid * (BI // 2)
-                                                    + BI // 2,
-                                                    :,
-                                                ],
-                                            )
-                                            T.barrier_all()
+                                                T.barrier_all()
                                         T.set_cross_flag("MTE3", _FLAG_KV_READY)
                                     # ---- V1(t-1): online softmax of chunk t-1 ----
                                     if t >= 1:
