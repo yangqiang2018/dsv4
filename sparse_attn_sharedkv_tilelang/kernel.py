@@ -226,10 +226,14 @@ def build_sparse_attn_sharedkv(
         # the low BI//8 bytes of each row carry the mask.
         "mask_ub": 104 * KB + 1792,  # [2,32]uint8 = 64B, rows 32B aligned
         "mask_ub_2": 104 * KB + 1856,  # [2,32]uint8 = 64B (V0 AND scratch)
-        # alpha[2,ub_len]fp32 = 256B: the V1->V2 rescale-factor handoff,
-        # double-buffered so V2(t-2) reads alpha[(t-2)%2] while V1(t-1)
-        # writes alpha[(t-1)%2]. Row stride 128B is already 32B aligned.
-        "alpha": 104 * KB + 2048,  # [2,ub_len]fp32 = 256B -> ..2304
+        # alpha[2*ub_len]fp32 = 256B: the V1->V2 rescale-factor handoff, double
+        # buffered by chunk parity -- V2(t-2) reads slot (t-2)%2 while V1(t-1)
+        # writes slot (t-1)%2. FLAT 1D (not [2,ub_len]): the per-head rescale is
+        # read as a SCALAR alpha[pv*ub_len + h_i] in T.tile.mul, and tile's
+        # binary_op scalar path forwards only indices[0] to the intrinsic -- a
+        # 2D alpha[pv, h_i] would silently drop h_i and read alpha.flat[pv] for
+        # every head. A single flat index keeps the whole offset in indices[0].
+        "alpha": 104 * KB + 2048,  # [2*ub_len]fp32 = 256B -> ..2304
         "mask_sel": 104 * KB + 2304,  # [32]uint8 whole buffer for select selMask
         "acc_o_ub": 112 * KB,  # [32,512]fp32 = 64KB -> 112..176KB
         "acc_o_half": 112 * KB,  # aliases acc_o_ub (disjoint phases)
@@ -297,10 +301,15 @@ def build_sparse_attn_sharedkv(
                 sumexp_i_ub = T.alloc_ub([ub_len], accum_dtype)
                 sinks_ub = T.alloc_ub([ub_len], accum_dtype)
                 lse_ub = T.alloc_ub([ub_len], accum_dtype)
-                # alpha[2,ub_len]: rescale factor exp(m_prev-m_new) handed from
-                # V1(chunk) to V2(chunk), double-buffered by chunk parity so the
-                # pipelined V1(t-1) and V2(t-2) use distinct slots in one step.
-                alpha = T.alloc_ub([2, ub_len], accum_dtype)
+                # alpha: rescale factor exp(m_prev-m_new) handed from V1(chunk)
+                # to V2(chunk), double-buffered by chunk parity so the pipelined
+                # V1(t-1) and V2(t-2) use distinct halves in one step. FLAT 1D
+                # [2*ub_len] (parity p occupies [p*ub_len, (p+1)*ub_len)): V2
+                # reads it as a per-head SCALAR alpha[pv*ub_len + h_i], and the
+                # tile binary_op scalar path forwards only indices[0], so a 2D
+                # alpha[pv, h_i] would drop h_i and rescale every head by
+                # alpha.flat[pv]. The flat index keeps the offset in indices[0].
+                alpha = T.alloc_ub([2 * ub_len], accum_dtype)
                 acc_s_ub = T.alloc_ub([v_block, BI], accum_dtype)
                 acc_s_ub_ = T.alloc_ub([v_block, BI], accum_dtype)
                 acc_s_half = T.alloc_ub([v_block, BI], dtype)
@@ -779,11 +788,18 @@ def build_sparse_attn_sharedkv(
                                             T.tile.exp(m_i_prev, m_i_prev)
                                             T.barrier_all()
                                             # Stash the rescale factor alpha = exp(m_prev
-                                            # - m_new) into this chunk's parity slot so
-                                            # V2 of the same chunk (which runs 2 pipeline
-                                            # steps later) applies it; m_i_prev itself is
-                                            # overwritten by the next chunk's V1.
-                                            T.copy(m_i_prev, alpha[pv1, :])
+                                            # - m_new) into this chunk's parity HALF of the
+                                            # flat alpha buffer so V2 of the same chunk
+                                            # (which runs 2 pipeline steps later) applies
+                                            # it; m_i_prev itself is overwritten by the
+                                            # next chunk's V1. Var-offset 1D slice (same
+                                            # form as the gather's ws_kv vid-slice write).
+                                            T.copy(
+                                                m_i_prev,
+                                                alpha[
+                                                    pv1 * ub_len : pv1 * ub_len + ub_len
+                                                ],
+                                            )
                                             T.barrier_all()
 
                                             for h_i in range(v_block):
@@ -848,16 +864,19 @@ def build_sparse_attn_sharedkv(
                                         T.barrier_all()
                                         # Output recurrence acc_o = alpha*acc_o + O,
                                         # fused here. alpha = exp(m_prev - m_new) was
-                                        # stashed by V1(c2) into alpha[pv2]; the parity
-                                        # slot survives the 2-step pipeline latency.
-                                        # Rescale MUST precede the add. Chunk 0 has
-                                        # acc_o = 0 so the rescale is a no-op.
+                                        # stashed by V1(c2) into the pv2 half of the flat
+                                        # alpha buffer; the slot survives the 2-step
+                                        # pipeline latency. Per-head scalar read uses a
+                                        # FLAT index alpha[pv2*ub_len + h_i] -- a 2D
+                                        # alpha[pv2, h_i] would lose h_i (binary_op scalar
+                                        # path keeps only indices[0]). Rescale MUST precede
+                                        # the add. Chunk 0 has acc_o = 0 so it is a no-op.
                                         for h_i in range(v_block):
                                             T.barrier_all()
                                             T.tile.mul(
                                                 acc_o[h_i, :],
                                                 acc_o[h_i, :],
-                                                alpha[pv2, h_i],
+                                                alpha[pv2 * ub_len + h_i],
                                             )
                                             T.barrier_all()
                                         T.tile.add(acc_o, acc_o, acc_o_ub)
