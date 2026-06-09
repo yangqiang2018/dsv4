@@ -450,7 +450,7 @@ def build_sparse_attn_sharedkv(
                                         T.barrier_all()
                                         T.gemm_v0(
                                             q_l1,
-                                            kv_lo[pa, 0:BI_half, 0:D],
+                                            kv_lo[pa : pa + 1, 0:BI_half, 0:D],
                                             acc_s_l0c,
                                             transpose_B=True,
                                             init=True,
@@ -463,7 +463,7 @@ def build_sparse_attn_sharedkv(
                                         T.barrier_all()
                                         T.gemm_v0(
                                             q_l1,
-                                            kv_hi[pa, 0:BI_half, 0:D],
+                                            kv_hi[pa : pa + 1, 0:BI_half, 0:D],
                                             acc_s_l0c,
                                             transpose_B=True,
                                             init=True,
@@ -502,14 +502,14 @@ def build_sparse_attn_sharedkv(
                                         # init=False accumulates the second half.
                                         T.gemm_v0(
                                             p_lo,
-                                            kv_lo[pb, 0:BI_half, 0:D],
+                                            kv_lo[pb : pb + 1, 0:BI_half, 0:D],
                                             acc_o_l0c,
                                             init=True,
                                         )
                                         T.barrier_all()
                                         T.gemm_v0(
                                             p_hi,
-                                            kv_hi[pb, 0:BI_half, 0:D],
+                                            kv_hi[pb : pb + 1, 0:BI_half, 0:D],
                                             acc_o_l0c,
                                             init=False,
                                         )
