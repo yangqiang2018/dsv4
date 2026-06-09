@@ -202,3 +202,33 @@ inner pipeline 已经拿到 V0∥V1∥V2 + MM1∥MM2 的主要重叠收益。
    历史上 online-softmax 跨 chunk 出过 bug)。
 3. **prologue/epilogue 的相位守卫**:前 1–2 拍 V1/V2/MM2 要 skip(`if t>=1/2`),forward flag 计数要全程平衡,
    否则死锁,易错,需仔细对 §3 的计数表。
+
+---
+
+## 9. S2b 具体落地方案（读 AscendC PreloadPipeline / scfa_block_vector 后定稿）
+
+> 前置:S2a forward 双缓冲已验证(tag `s2a-forward-verified`,41.5→36.3ms/18.9%)。profile 显示
+> **gap ~15ms 是核内 `barrier_all` 抽干 pipe 造成**:每核串行 pipe-sum ~21ms,pipe-max 只 ~6-7ms。
+> S2b 目标:让核内 MTE2∥VEC∥MTE3 真并行 → 每核朝 ~7ms、两核 Duration 朝 ~10ms(~60%+)。
+
+### 9.1 within-core 重叠 = 显式 pipe flag + ping-pong（AscendC 不是自动的,是手搓的）
+
+AscendC 的核内重叠靠 `SetFlag/WaitFlag<HardEvent::V_MTE2>(eid)` + ping-pong buffer,不是 TQue 魔法:
+- buffer 开 2 份:scores `inputBuff1`=32K×2、kv gather `inputBuff2`=16K×2(`scfa_block_vector.h:207-208`)。
+- 模式(`:461-484`):`ub = buf[ping*OFFSET]; WaitFlag<V_MTE2>(FLAG+ping); <MTE2 load> <VEC compute>; SetFlag<V_MTE2>(FLAG+ping); ping^=1`。→ MTE2 把 half B 载入的同时 VEC 在算 half A。
+- **TileLang 对应**:`T.set_flag("v","mte2",eid)`(V 产完)/ `T.wait_flag("v","mte2",eid)`(MTE2 重载前等),buffer `[2,…]` 用 `t%2` 选 half。`_pipe∈{fix,mte1,mte2,mte3,m,v}`。跨核仍 `set_cross_flag/wait_cross_flag`(保持 §1 的 4 forward+1 边界)。
+- ⚠️ `wait_flag(src,dst,e)` 跑在 **dst** pipe 上(见 tilelang-pitfalls)。
+
+### 9.2 UB 192KB 墙 → 16-row/16-head sub-tile（复刻 AscendC，附数字）
+
+去 barrier 后同时活:`acc_o`(64K) + `acc_s_ub/ub_/half`(40K) + gather + `acc_o_ub`。全 64K 粒度 = 234K 爆墙。
+- **gather**:`kv_ub_multi [64,512]bf16=64K` → `[16,512]bf16=16K ×2 ping-pong`(32K)。每趟 gather 16 行 + 写 ws_kv,4 趟。
+- **V2 merge**:`acc_o_ub [32,512]f32=64K` → `[16,512]f32=32K`。每趟 merge 16 头进 `acc_o`(`acc_o` 整块 64K 不动),2 趟。
+- 新峰值 ≈ 64+40+32+32+2 = **170K < 192K**(22K 余量)。`acc_o` 是全 32 头输出累加器,不能拆。
+
+### 9.3 增量步骤（每步独立 NPU 验证:先正确性后 profile;回退点 tag `s2a-forward-verified`）
+
+- **S2b.0 — UB sub-tile,barrier 全保留**:gather 改 4×16 行、merge 改 2×16 头 + 新布局。**行为不变、最易验对**,把"布局正确性"和"去 barrier 竞态"解耦(同 S1/S2a 渐进打法)。perf 应持平。
+- **S2b.1 — vector 去核内 barrier**:V0/V1/V2 之间 + pipe-stage 之间换 `set_flag/wait_flag` + ping-pong,V 内连续算用 `pipe_barrier("v")`。验对 + 看 `aiv_time` 是否朝 pipe-max(~7ms)掉。
+- **S2b.2 — cube 去核内 barrier**:MM1/MM2 同理。
+- 风险:竞态/死锁(flag 配对、ping-pong 深度);按经验大概率要逐步闯。每步只改一小撮、必过 NPU 再推下一步。
