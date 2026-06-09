@@ -10,7 +10,7 @@
 - **S1 已验证**（commit `cc6ee1c`）:把 online-softmax 的输出 rescale 从 V1 挪进 V2。decode+prefill 都过,数值对。
 - **S2a 软件流水**:把每 chunk 串行重排成错位流水(cube `MM1(t)∥MM2(t-1)`,vector `V0(t)∥V1(t-1)∥V2(t-2)`)。
   - **reverse 版已验证 + profile**（commit `1c52835`）:单缓冲、相位倒序,**Duration 48.8ms→41.5ms(14.1%→16.6%)**,但 gap 还剩 14.4ms。这是**已知能跑的退路**。
-  - **forward 版进行中**（HEAD `800808c`）:正序(= Ascend C 的 PreloadPipeline,重叠更紧)+ parity 双缓冲。**正在逐个 op 闯 TVMScript parse 关**:gemm✓、select✓ 已过,待 NPU 验 decode。
+  - **forward 版 decode 已验证**（HEAD `91d42f7`）:正序(= Ascend C 的 PreloadPipeline,重叠更紧)+ parity 双缓冲,scfa/swa/cfa decode 全过、数值对。闯过三层 **device 端**坑(都不是 parse 错):①mask parity 行 16B 未对齐→pad 到 `[2,32]`;②`for…in range()` 是 TIR loop、parity 是 Var(不能用 Python tuple 选 buffer);③`tile` 标量第三参 2D `alpha[pv,h]` 丢 `h`、每头读成 `alpha.flat[pv]`→alpha 改扁平 1D。三坑+operand 类型规则已记进 `tilelang-pitfalls` skill。**待 prefill 正确性 + profile**。
 
 **性能口径**:`性能% = AscendC(6.87ms) ÷ TileLang Duration × 100%`。
 
@@ -18,26 +18,18 @@
 
 ## 1. ⭐ 立刻要做的（接手第一件事）
 
-在 NPU 服务器(`/sdb/yq/dsv4`)上:
+forward decode 已验证(`91d42f7`)。**下一步:prefill 正确性 + profile**,对比 reverse 版的 41.5ms / gap 14.4ms。在 NPU 服务器(`/sdb/yq/dsv4`):
 
 ```bash
-git pull   # 确认到 800808c 或更新
-pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "decode"
-```
-
-**三种结果分支:**
-
-**(A) decode 过了** → 跑 prefill 正确性 + profile,对比 reverse 版的 41.5ms / gap 14.4ms:
-```bash
+git pull   # 确认到 91d42f7 或更新
 pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill" --runslow
 msprof --output=./prof_fwd --aic-metrics=PipeUtilization \
   --application="python sparse_attn_sharedkv_perf_compare.py --scenarios scfa_prefill --only tilelang --warmup 5 --iters 3"
 ```
-forward 顺序应把 gap 往 0 压、Duration 朝两核的 ~27ms 靠(~25%)。过了就进 **§4 的 S2b**(更大头)。
 
-**(B) decode 还报 parse 错(大概率在 `alpha`:V1 的 `T.copy(m_i_prev, alpha[pv1, :])` 或 V2 的 `tile.mul(..., alpha[pv2, h_i])`)** → 按 §3 的"operand 类型规则"对症修那一个 op,再推。剩的 parity 访问只有这俩,改完应该就过。
+forward 顺序应把 gap 往 0 压、Duration 朝两核的 ~27ms 靠(~25%)。prefill 过 + profile 看完,就进 **§4 的 S2b**(更大头)。
 
-**(C) 如果 op-by-op 还在反复挂** → 直接切 §5 的**兜底方案(分开整 buffer + 运行时 if)**,一劳永逸,别再逐个试。
+> decode 闯关史已解决(知识进了 `tilelang-pitfalls` skill,§3 表也同步更新)。当时的 (A)/(B)/(C) 分支已不适用:报错根本不在 parse,而是三个 device 端 bug —— 详见 §0 forward 那条。最后一刀是 V2 逐头 rescale 的 `tile.mul(..., alpha[pv2, h_i])`:2D 标量第三参被 `binary_op` 只取 `indices[0]`、丢了 `h_i`,每头都乘成 `alpha.flat[pv2]`。修法是 alpha 改扁平 1D `[2*ub_len]`、读 `alpha[pv2*ub_len+h_i]`(commit `91d42f7`)。
 
 ---
 
@@ -114,8 +106,11 @@ reverse 版 profile（41.5ms,8K scfa_prefill,稳态）:
 
 - `cc6ee1c` **S1**(rescale V1→V2)。✅ 已验证(decode+prefill)。**最稳的回退点**。
 - `1c52835` **S2a reverse**(单缓冲倒序)。✅ 已验证 + profile **41.5ms/16.6%**。**能跑的次稳回退点**(但做不了 S2b)。
-- `800808c` **S2a forward**(HEAD,双缓冲正序)。⏳ parse 闯到 select 已过,待 NPU 验 decode。
-- 中间那串 `e18711d/643cdfa/079bacd/9070daa/ba0af97/369c026` 都是 forward 双缓冲的失败/中间态(每个修一层 parse 坑),不用回去看,知识已汇总到 §3。
+- `800808c` **S2a forward**(双缓冲正序)。parse 过但 decode 数值错(下面三个 device bug 当时还没修)。
+- `5628788`→`71e71bb` **mask 对齐修**:parity mask 行 16B 未对齐→AIV fault;先误用 Python tuple 选 buffer(parity 是 TIR Var,parse 错),再改 `[2,32]` padding。
+- `91d42f7` **alpha 扁平 1D 修**(HEAD)。✅ **decode 已验证**(scfa/swa/cfa)。V2 逐头 rescale 的 2D 标量 `alpha[pv,h]` 被 `binary_op` 丢掉 `h`→改扁平 1D。**当前最新可用点**,下一步 prefill+profile。
+- 中间那串 `e18711d/643cdfa/079bacd/9070daa/ba0af97/369c026` 都是 forward 双缓冲的 parse 中间态,不用回去看,知识已汇总到 §3 + `tilelang-pitfalls` skill。
+- 诊断分支 `origin/exp/reverse-alpha`:把 alpha 机制单独嫁接到 reverse 上复现了 bug 的 bisection 记录(not for merge,可删)。
 
 ---
 
