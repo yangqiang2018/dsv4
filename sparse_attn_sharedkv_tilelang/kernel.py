@@ -163,6 +163,11 @@ def build_sparse_attn_sharedkv(
     H_per_block = gqa_group  # 64
     v_block = H_per_block // 2  # 32 -- each AIV handles half the heads
     ub_len = max(32 // 4, v_block)  # 32-byte UB alignment for fp32 scalars
+    # Mask is BI bits = BI//8 (=16) bytes. VEC ops require a 32-byte-aligned UB
+    # operand, so a [2, BI//8] parity buffer's odd row (stride 16B) would be
+    # unaligned. Pad each parity row to mask_w (round BI//8 up to 32B) so both
+    # rows start on a 32B boundary; only the low BI//8 bytes carry the mask.
+    mask_w = ((BI // 8 + 31) // 32) * 32  # 32 for BI=128
 
     q_shape = [total_tokens, n_heads, D]
     out_shape = [total_tokens, n_heads, D]
@@ -212,21 +217,20 @@ def build_sparse_attn_sharedkv(
         "lse_ub": 104 * KB + 640,
         "idx_int": 104 * KB + 768,  # [128]int32 = 512B
         "idx_float": 104 * KB + 1280,  # [128]fp32 = 512B
-        # Mask buffers are SEPARATE whole [BI//8] uint8 buffers, one per chunk
-        # parity, each on its own 32-byte boundary. A [2, BI//8] parity buffer
-        # puts the odd row at a +BI//8 (=16B) offset that is NOT 32B aligned,
-        # faulting the VEC compare/and on odd chunks ("UB address accessed by
-        # the VEC instruction is not aligned" on device). mask_ub_2 is
-        # V0-internal AND scratch (no cross-phase reader) so it stays single.
-        # mask_sel is gone: select takes the whole-Buffer mask_dbuf[pv1]
-        # directly as its selMask.
-        "mask_ub0": 104 * KB + 1792,  # [16]uint8, 32B-aligned
-        "mask_ub1": 104 * KB + 1824,  # [16]uint8, +32 (32B-aligned)
-        "mask_ub_2": 104 * KB + 1856,  # [16]uint8, +32 (32B-aligned)
+        # Mask double buffer [2, mask_w]: row padded to mask_w (=32B) so BOTH
+        # parity rows are 32B aligned. A [2, BI//8] buffer's row stride is 16B,
+        # so the odd-parity row mask_ub[1,:] starts at +16B -- not 32B aligned
+        # -- and the VEC compare/and on odd chunks faults ("UB address accessed
+        # by the VEC instruction is not aligned" on device). parity = chunk % 2
+        # is a TIR Var (real TIR loop), so the row is picked by Var index, only
+        # the low BI//8 bytes of each row carry the mask.
+        "mask_ub": 104 * KB + 1792,  # [2,32]uint8 = 64B, rows 32B aligned
+        "mask_ub_2": 104 * KB + 1856,  # [2,32]uint8 = 64B (V0 AND scratch)
         # alpha[2,ub_len]fp32 = 256B: the V1->V2 rescale-factor handoff,
         # double-buffered so V2(t-2) reads alpha[(t-2)%2] while V1(t-1)
         # writes alpha[(t-1)%2]. Row stride 128B is already 32B aligned.
         "alpha": 104 * KB + 2048,  # [2,ub_len]fp32 = 256B -> ..2304
+        "mask_sel": 104 * KB + 2304,  # [32]uint8 whole buffer for select selMask
         "acc_o_ub": 112 * KB,  # [32,512]fp32 = 64KB -> 112..176KB
         "acc_o_half": 112 * KB,  # aliases acc_o_ub (disjoint phases)
         # kv_ub_multi [64,512]bf16=64KB also aliases acc_o_ub @112KB.
@@ -313,20 +317,24 @@ def build_sparse_attn_sharedkv(
                 # barrier separates the previous chunk's merge from this
                 # chunk's gather), so the UB peak is unchanged.
                 kv_ub_multi = T.alloc_ub([BI // 2, D], dtype)
-                # Per-chunk mask double buffer as two SEPARATE whole buffers
-                # (not a [2, BI//8] parity buffer): each gets its own 32-byte
-                # aligned base, whereas a parity buffer's odd row sits at a
-                # +BI//8 (=16B) offset that is not 32B aligned and faults the
-                # VEC compare/and on odd chunks. V0(t) writes mask_dbuf[t%2]
-                # while V1(t-1) reads mask_dbuf[(t-1)%2]; parity (t%2) is a
-                # Python int (the chunk loop is unrolled), so the tuple subscript
-                # picks the buffer at trace time -- no runtime select.
-                mask_ub0 = T.alloc_ub([BI // 8], "uint8")
-                mask_ub1 = T.alloc_ub([BI // 8], "uint8")
-                mask_dbuf = (mask_ub0, mask_ub1)
-                # V0-internal AND scratch: written and consumed within one V0,
-                # never read by V1/V2, so it needs no double buffer.
-                mask_ub_2 = T.alloc_ub([BI // 8], "uint8")
+                # Mask double buffer [2, mask_w]: V0(t) writes parity t%2 while
+                # V1(t-1) reads parity (t-1)%2 in the same step. The row is
+                # padded to mask_w (32B) so both parity rows are 32B aligned; a
+                # [2, BI//8] row stride of 16B leaves the odd row unaligned and
+                # the VEC compare/and on odd chunks faults. parity is a TIR Var
+                # (the chunk loop is a real TIR loop), so rows are picked by Var
+                # index mask_ub[pv, :] -- a Python-side buffer pick would hit
+                # "tuple indices must be integers or slices, not Var".
+                mask_ub = T.alloc_ub([2, mask_w], "uint8")
+                # V0-internal AND scratch (written + consumed inside one V0);
+                # kept [2, mask_w] so the bitwise_and operands are same-rank
+                # padded rows. Only the pv0 row is ever used.
+                mask_ub_2 = T.alloc_ub([2, mask_w], "uint8")
+                # Whole-buffer mask for tile.select (selMask calls .access_ptr,
+                # which a Var-indexed parity BufferRegion lacks); V1 copies the
+                # current chunk's mask_ub row here each step. mask_w wide to
+                # match the mask_ub row copy.
+                mask_sel = T.alloc_ub([mask_w], "uint8")
 
                 T.annotate_address(
                     {
@@ -356,9 +364,9 @@ def build_sparse_attn_sharedkv(
                         # the alias holds. (S2b will remove those barriers and
                         # must sub-tile / un-alias these two 64KB buffers.)
                         kv_ub_multi: ub_addr["acc_o_ub"],
-                        mask_ub0: ub_addr["mask_ub0"],
-                        mask_ub1: ub_addr["mask_ub1"],
+                        mask_ub: ub_addr["mask_ub"],
                         mask_ub_2: ub_addr["mask_ub_2"],
+                        mask_sel: ub_addr["mask_sel"],
                         acc_o_ub: ub_addr["acc_o_ub"],
                         acc_o_half: ub_addr["acc_o_half"],
                     }
@@ -567,7 +575,7 @@ def build_sparse_attn_sharedkv(
                                             T.copy(idx_int, idx_float)
                                             T.barrier_all()
                                             T.tile.compare(
-                                                mask_dbuf[pv0],
+                                                mask_ub[pv0, :],
                                                 idx_float,
                                                 T.float32(ori_right),
                                                 "LE",
@@ -642,22 +650,22 @@ def build_sparse_attn_sharedkv(
                                             T.barrier_all()
                                             # mask = (idx >= 0) AND (idx < thr)
                                             T.tile.compare(
-                                                mask_dbuf[pv0],
+                                                mask_ub[pv0, :],
                                                 idx_float,
                                                 T.float32(-0.5),
                                                 "GT",
                                             )
                                             T.tile.compare(
-                                                mask_ub_2,
+                                                mask_ub_2[pv0, :],
                                                 idx_float,
                                                 T.float32(cmp_threshold),
                                                 "LT",
                                             )
                                             T.barrier_all()
                                             T.tile.bitwise_and(
-                                                mask_dbuf[pv0],
-                                                mask_dbuf[pv0],
-                                                mask_ub_2,
+                                                mask_ub[pv0, :],
+                                                mask_ub[pv0, :],
+                                                mask_ub_2[pv0, :],
                                             )
                                             T.barrier_all()
                                             # Batched sparse gather. cmp indices
@@ -707,15 +715,17 @@ def build_sparse_attn_sharedkv(
                                             # ---- additive mask (0 / -inf) ----
                                             T.tile.fill(acc_s_ub_, 0.0)
                                             T.barrier_all()
-                                            # mask_dbuf[pv1] is already a whole
-                                            # Buffer (separate per-parity alloc),
-                                            # so select's selMask -- which calls
-                                            # .access_ptr directly -- takes it
-                                            # as-is, no scratch copy needed.
+                                            # select's selMask needs a whole
+                                            # Buffer (it calls .access_ptr, which
+                                            # a Var-indexed parity BufferRegion
+                                            # lacks), so copy chunk t-1's mask
+                                            # row into the whole mask_sel first.
+                                            T.copy(mask_ub[pv1, :], mask_sel)
+                                            T.barrier_all()
                                             for h_i in T.serial(v_block):
                                                 T.tile.select(
                                                     acc_s_ub[h_i, :],
-                                                    mask_dbuf[pv1],
+                                                    mask_sel,
                                                     acc_s_ub_[h_i, :],
                                                     -T.infinity(accum_dtype),
                                                     "VSEL_TENSOR_SCALAR_MODE",
