@@ -59,6 +59,15 @@ def _shell(body_name: str):
                                     -1.0,
                                     "VSEL_TENSOR_SCALAR_MODE",
                                 )
+                    elif body_name == "select_fused":
+                        # whole-tile select with the 128-bit row mask cycling
+                        # over 32 rows -- correctness of the cycling must be
+                        # checked separately before kernel use.
+                        for _ in T.serial(REPS):
+                            T.tile.select(a, msk, b, -1.0, "VSEL_TENSOR_SCALAR_MODE")
+                    elif body_name == "add_fused":
+                        for _ in T.serial(REPS):
+                            T.tile.add(a, a, b)
                     elif body_name == "dma_rows":
                         for _ in T.serial(REPS):
                             for r in range(16):
@@ -87,6 +96,8 @@ CASES = [
     ("mul_split", H),
     ("mul_scalar", H),
     ("select", H),
+    ("select_fused", 1),
+    ("add_fused", 1),
     ("dma_rows", 16),
     ("dma_block", 1),
     ("flag", 1),
