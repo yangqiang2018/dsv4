@@ -41,6 +41,24 @@ padding: TND passes ``q_prefix[b] = cu_seqlens_q[b]``, BSND passes
 
 import tilelang
 from tilelang import language as T
+from tvm import ir as tvm_ir
+from tvm import tir as tvm_tir
+
+
+def _sub_tile(buf, row0, rows, cols):
+    """Explicit tvm BufferRegion for a sub-tile. The TVMScript subscript
+    acc_o[row0:row0+rows, :] collapses to BufferLoad (no access_ptr) even
+    with a constant start, so fused tile.* on sub-tiles needs the region
+    built by hand; binary_op accepts BufferRegion and computes the offset
+    from region mins (constant or Var)."""
+    return tvm_tir.BufferRegion(
+        buf,
+        [
+            tvm_ir.Range.from_min_extent(row0, rows),
+            tvm_ir.Range.from_min_extent(0, cols),
+        ],
+    )
+
 
 # Disable AND clear TileLang's on-disk kernel cache. disable_cache()
 # alone is not enough: the JIT cache key tracks the prim_func signature
@@ -1002,6 +1020,13 @@ def build_sparse_attn_sharedkv(
                                                 acc_o_ub,
                                             )
                                             T.barrier_all()
+                                            # Per-head alpha rescale stays per-row (no
+                                            # broadcast primitive), but the O-merge add
+                                            # is FUSED: one 16x512 add via an explicit
+                                            # BufferRegion sub-tile (micro-bench: 40ns
+                                            # vs 16 rows x ~16ns issue overhead; the
+                                            # subscript slice form collapses to
+                                            # BufferLoad and cannot be used).
                                             for h_i in range(MERGE_HEADS):
                                                 T.barrier_all()
                                                 T.tile.mul(
@@ -1009,13 +1034,13 @@ def build_sparse_attn_sharedkv(
                                                     acc_o[hbase + h_i, :],
                                                     alpha[pv2 * ub_len + hbase + h_i],
                                                 )
-                                                T.barrier_all()
-                                                T.tile.add(
-                                                    acc_o[hbase + h_i, :],
-                                                    acc_o[hbase + h_i, :],
-                                                    acc_o_ub[h_i, :],
-                                                )
-                                                T.barrier_all()
+                                            T.barrier_all()
+                                            T.tile.add(
+                                                _sub_tile(acc_o, hbase, MERGE_HEADS, D),
+                                                _sub_tile(acc_o, hbase, MERGE_HEADS, D),
+                                                acc_o_ub,
+                                            )
+                                            T.barrier_all()
 
                                 # 1d-beta drain: the last two selects set v->mte2
                                 # with no in-loop waiter (no prefetch in the final
