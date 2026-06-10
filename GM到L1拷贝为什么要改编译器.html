@@ -4,6 +4,12 @@
 <meta charset="utf-8">
 <title>GM→L1 拷贝为什么要改编译器</title>
 <style>
+nav#toc{position:fixed;top:90px;left:max(8px,calc(50% - 440px - 190px));width:175px;font-size:.86em;background:#f8fafc;border:1px solid #dde;border-radius:8px;padding:12px 14px;line-height:1.5}
+nav#toc b{display:block;margin-bottom:6px;color:#345}
+nav#toc a{display:block;color:#1d6fb8;text-decoration:none;padding:3px 0;border-left:3px solid transparent;padding-left:7px;margin-left:-10px}
+nav#toc a:hover{border-left-color:#4a90d9;background:#eef6ff}
+@media(max-width:1260px){nav#toc{display:none}}
+html{scroll-behavior:smooth}
 body{font-family:"PingFang SC","Microsoft YaHei",sans-serif;max-width:880px;margin:32px auto;padding:0 16px;line-height:1.75;color:#222}
 h1{font-size:1.6em;border-bottom:3px solid #4a90d9;padding-bottom:8px}
 h2{font-size:1.25em;margin-top:2em;border-left:5px solid #4a90d9;padding-left:10px}
@@ -18,11 +24,12 @@ td,th{border:1px solid #bbb;padding:6px 12px;text-align:center}
 </head>
 <body>
 
+<nav id="toc"><b>目录</b><a href="#sec1">一、两个仓库和一条搬运指令</a><a href="#sec2">二、关键：L1 的货架不是按行摆的</a><a href="#sec3">三、这条指令支持什么</a><a href="#sec4">四、出错过程</a><a href="#sec5">五、为什么 kernel 里绕不过去，要改编译器？</a><a href="#sec6">六、回到我们的场景</a></nav>
 <h1>为什么"把数据搬进车间"这一步，TileLang 改不动，必须改编译器？</h1>
 
 <p>本文用一个 <b>8 行 × 4 列</b> 的小例子，解释我们在昇腾 NPU 上遇到的一个底层限制。不需要任何神经网络或写算子的背景。</p>
 
-<h2>一、两个仓库和一条搬运指令</h2>
+<h2 id="sec1">一、两个仓库和一条搬运指令</h2>
 <p>把 NPU 想成一个工厂：</p>
 <ul>
 <li><b>GM（全局内存）</b>：城外大仓库。东西多，但离车间远。</li>
@@ -30,7 +37,7 @@ td,th{border:1px solid #bbb;padding:6px 12px;text-align:center}
 </ul>
 <p>所以每轮计算前都要"GM→L1 搬一批料"。搬运由一条指令完成——TileLang 里写 <code>T.copy(GM区, L1缓冲)</code>，编译器把它翻译成底层模板 <code>copy_gm_to_l1&lt;行数, 列数&gt;(...)</code>。</p>
 
-<h2>二、关键：L1 的货架不是按行摆的（NZ 布局）</h2>
+<h2 id="sec2">二、关键：L1 的货架不是按行摆的（NZ 布局）</h2>
 <p>GM 里数据按行排（第 1 行、第 2 行……）。但 L1 为了喂矩阵乘法器，按"竖条"摆——业内叫 <b>NZ 布局</b>。下图用 8×4 矩阵示意（数字＝第几行）：</p>
 
 <figure>
@@ -55,7 +62,7 @@ td,th{border:1px solid #bbb;padding:6px 12px;text-align:center}
 
 <p class="note">重点：<b>一个元素放在 L1 哪个角落，取决于整块的行数</b>。"第 5 行放哪"在 8 行块和 4 行块里答案不同——这就是后面一切问题的根源。</p>
 
-<h2>三、这条指令支持什么、不支持什么</h2>
+<h2 id="sec3">三、这条指令支持什么、不支持什么</h2>
 <table>
 <tr><th>用法</th><th>支持？</th><th>说明</th></tr>
 <tr><td>整块搬：GM 8行 → L1 8行缓冲</td><td>✅</td><td>最常用，没问题</td></tr>
@@ -64,7 +71,7 @@ td,th{border:1px solid #bbb;padding:6px 12px;text-align:center}
 </table>
 <p>为什么常用却没人撞坑？因为绝大多数算子一次搬满整块。我们的算子（PageAttention 取 KV）数据按"页"散落在 GM，要<b>分几次</b>往同一个 L1 块的不同段补——立刻踩中。</p>
 
-<h2>四、出错过程（4 行一段、分两次搬 8 行）</h2>
+<h2 id="sec4">四、出错过程（4 行一段、分两次搬 8 行）</h2>
 
 <figure>
 <svg width="820" height="270" viewBox="0 0 820 270" xmlns="http://www.w3.org/2000/svg" font-size="12">
@@ -88,7 +95,7 @@ td,th{border:1px solid #bbb;padding:6px 12px;text-align:center}
 <figcaption>图 2：分段搬运的实际下场。</figcaption>
 </figure>
 
-<h2>五、为什么 kernel 里绕不过去，要改编译器？</h2>
+<h2 id="sec5">五、为什么 kernel 里绕不过去，要改编译器？</h2>
 <p>因为"块形"是<b>编译期模板参数</b>：<code>copy_gm_to_l1&lt;8行,4列&gt;</code> 写死在生成的 C++ 里。kernel 作者只能给它一个起点指针，<b>没有任何参数能告诉它"这是大块中间的第 3 行"</b>。下三种绕法都被堵死：</p>
 <ul>
 <li>偏移指针 → 被当新块起点（图 2）。</li>
@@ -97,7 +104,7 @@ td,th{border:1px solid #bbb;padding:6px 12px;text-align:center}
 </ul>
 <p class="note">手写 Ascend C 没这问题：自己直接算 NZ 偏移写进去（约一行代码）。所以这不是硬件不行，是 <b>TileLang 编译器没暴露"块内偏移"这个旋钮</b>。修法约几十行：给拷贝指令加"目标块内行号"参数 + 关掉清零。</p>
 
-<h2>六、回到我们的场景</h2>
+<h2 id="sec6">六、回到我们的场景</h2>
 <p>修好之后，搬 KV 的活可由 cube 自己干，省掉一整条"vector 代搬 + 中转仓 + 等待信号"流水（华为官方算子正是如此），相应场景预计还有 2~3 倍加速。在那之前 TileLang 算子只能走中转路，性能上限即当前版本。</p>
 
 </body>
