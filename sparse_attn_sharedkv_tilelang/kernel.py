@@ -201,20 +201,19 @@ def build_sparse_attn_sharedkv(
     # gemm_v0 needs each operand to fit the 64KB L0B as a whole buffer (it
     # neither slices operands nor auto-tiles to L0), so the BI=128 kv is two
     # physical [64,512]=64KB halves and p is two [64,64] halves.
-    # L1 (>=464KB). S2c: MM2 trails MM1 by TWO steps (PreloadPipeline skew),
-    # so the KV halves are TRIPLE-buffered [3, BI_half, D]: MM2(t-2) reads
-    # kv_lo[(t-2)%3] while MM1(t) loads into kv_lo[t%3] -- depth 2 would make
-    # them the same slot. p halves are written by MM2(c) right after waiting
-    # P_READY(c) and consumed in the same call -> single per parity ([2]).
-    # Runtime-indexed BufferRegions (gemm_v0 accepts these); q 64KB @0;
-    # kv_lo[3] 192KB @64; kv_hi[3] 192KB @256; p_lo 8K @448; p_hi 8K @456
-    # -> 464KB <= 512KB.
+    # L1 (>=336KB). The KV halves are double-buffered as a [2, BI_half, D]
+    # buffer indexed by chunk parity: MM2(t-1)'s P@V reads chunk t-1's KV from
+    # kv_lo[(t-1)%2] while MM1(t)'s Q@K^T loads chunk t into kv_lo[t%2]. A
+    # runtime-indexed BufferRegion (gemm_v0 accepts these) -- not separate named
+    # buffers -- because the loop var is a TIR Var, so parity can't select a
+    # Python buffer object. q 64KB @0; kv_lo[2] 128KB @64; kv_hi[2] 128KB @192;
+    # p_lo 8KB @320; p_hi 8KB @328 -> 336KB <= 512KB.
     l1_addr = {
         "q_l1": 0,
         "kv_lo": 64 * KB,
-        "kv_hi": 256 * KB,
-        "p_lo": 448 * KB,
-        "p_hi": 456 * KB,
+        "kv_hi": 192 * KB,
+        "p_lo": 320 * KB,
+        "p_hi": 328 * KB,
     }
     l0c_addr = {"acc_s_l0c": 0, "acc_o_l0c": 0}  # disjoint phases ⇒ alias
     # UB (192KB). acc_s_* are [32,128]. S2b.0b sub-tiles the two 64KB chunk
@@ -260,8 +259,8 @@ def build_sparse_attn_sharedkv(
         # by the VEC instruction is not aligned" on device). parity = chunk % 2
         # is a TIR Var (real TIR loop), so the row is picked by Var index, only
         # the low BI//8 bytes of each row carry the mask.
-        "mask_ub": 176 * KB + 1792,  # [3,32]uint8 = 96B, rows 32B aligned (S2c depth 3)
-        "mask_ub_2": 176 * KB + 1888,  # [3,32]uint8 = 96B (V0 AND scratch)
+        "mask_ub": 176 * KB + 1792,  # [2,32]uint8 = 64B, rows 32B aligned
+        "mask_ub_2": 176 * KB + 1856,  # [2,32]uint8 = 64B (V0 AND scratch)
         # alpha[2*ub_len]fp32 = 256B: the V1->V2 rescale-factor handoff, double
         # buffered by chunk parity -- V2(t-2) reads slot (t-2)%2 while V1(t-1)
         # writes slot (t-1)%2. FLAT 1D (not [2,ub_len]): the per-head rescale is
@@ -300,13 +299,12 @@ def build_sparse_attn_sharedkv(
             Metadata: T.Tensor([_SAS_META_SIZE], indices_dtype),  # type: ignore[valid-type]
             Output: T.Tensor(out_shape, dtype),  # type: ignore[valid-type]
             LSE_out: T.Tensor([total_tokens, n_heads], accum_dtype),  # type: ignore[valid-type]
-            # Workspace buffering depth follows the producer->consumer skew
-            # (S2c, AscendC PreloadPipeline distances): score/p sit 2 steps
-            # between MM1(t) and V1(t-2) -> depth 3; kv (V0->MM1, same step)
-            # and o (MM2(c)->V2(c) 1 step) stay double-buffered.
+            # Workspaces are double-buffered by chunk parity (leading dim 2)
+            # so the software pipeline can have chunk i and i-1/i-2 in flight
+            # without the producer clobbering a buffer the consumer still reads.
             ws_kv: T.Tensor([core_num, 2, BI, D], dtype),  # type: ignore[valid-type]
-            ws_score: T.Tensor([core_num, 3, H_per_block, BI], accum_dtype),  # type: ignore[valid-type]
-            ws_p: T.Tensor([core_num, 3, H_per_block, BI], dtype),  # type: ignore[valid-type]
+            ws_score: T.Tensor([core_num, 2, H_per_block, BI], accum_dtype),  # type: ignore[valid-type]
+            ws_p: T.Tensor([core_num, 2, H_per_block, BI], dtype),  # type: ignore[valid-type]
             ws_o: T.Tensor([core_num, 2, H_per_block, D], accum_dtype),  # type: ignore[valid-type]
         ):
             with T.Kernel(core_num, is_npu=True) as (cid, vid):
@@ -319,8 +317,8 @@ def build_sparse_attn_sharedkv(
                 # kv_lo[(t-1)%2] while chunk t's KV (for Q@K^T) lands in
                 # kv_lo[t%2]. gemm_v0 takes the [BI_half, D] sub-region
                 # kv_lo[parity] (a BufferRegion, which it accepts).
-                kv_lo = T.alloc_L1([3, BI_half, D], dtype)
-                kv_hi = T.alloc_L1([3, BI_half, D], dtype)
+                kv_lo = T.alloc_L1([2, BI_half, D], dtype)
+                kv_hi = T.alloc_L1([2, BI_half, D], dtype)
                 p_lo = T.alloc_L1([H_per_block, BI_half], dtype)
                 p_hi = T.alloc_L1([H_per_block, BI_half], dtype)
                 acc_s_l0c = T.alloc_L0C([H_per_block, BI_half], accum_dtype)
@@ -378,11 +376,11 @@ def build_sparse_attn_sharedkv(
                 # (the chunk loop is a real TIR loop), so rows are picked by Var
                 # index mask_ub[pv, :] -- a Python-side buffer pick would hit
                 # "tuple indices must be integers or slices, not Var".
-                mask_ub = T.alloc_ub([3, mask_w], "uint8")
+                mask_ub = T.alloc_ub([2, mask_w], "uint8")
                 # V0-internal AND scratch (written + consumed inside one V0);
                 # kept [2, mask_w] so the bitwise_and operands are same-rank
                 # padded rows. Only the pv0 row is ever used.
-                mask_ub_2 = T.alloc_ub([3, mask_w], "uint8")
+                mask_ub_2 = T.alloc_ub([2, mask_w], "uint8")
                 # Whole-buffer mask for tile.select (selMask calls .access_ptr,
                 # which a Var-indexed parity BufferRegion lacks); V1 copies the
                 # current chunk's mask_ub row here each step. mask_w wide to
@@ -504,33 +502,29 @@ def build_sparse_attn_sharedkv(
                             with T.Scope("C"):
                                 T.copy(Q[t_i, 0:n_heads, 0:D], q_l1)
                                 T.barrier_all()
-                                # S2c skew: MM2 trails MM1 by 2 steps so cube never
-                                # blocks on P(t-1) while MM1(t+1)'s KV is ready --
-                                # mirrors PreloadPipeline (Mm1(loop) / Mm2(loop-2)).
-                                for t in range(NI_total + 2):
+                                for t in range(NI_total + 1):
                                     if t < NI_total:
                                         # ---- MM1(t): Q@K^T of chunk t ----
                                         pa = t % 2
-                                        pl = t % 3
                                         T.wait_cross_flag(_FLAG_KV_READY)
                                         T.barrier_all()
                                         # Load gathered KV as two [BI_half,D]=64KB
-                                        # halves into the t%3 L1 sub-buffers
-                                        # (depth 3: MM2(t-2) still reads slot
-                                        # (t-2)%3 this step).
+                                        # halves into the t%2 L1 sub-buffers
+                                        # kv_lo[pa, :, :]/kv_hi[pa, :, :] (BufferRegion
+                                        # operands -- gemm_v0 accepts these).
                                         T.copy(
                                             ws_kv[cid, pa, 0:BI_half, 0:D],
-                                            kv_lo[pl, :, :],
+                                            kv_lo[pa, :, :],
                                         )
                                         T.barrier_all()
                                         T.copy(
                                             ws_kv[cid, pa, BI_half:BI, 0:D],
-                                            kv_hi[pl, :, :],
+                                            kv_hi[pa, :, :],
                                         )
                                         T.barrier_all()
                                         T.gemm_v0(
                                             q_l1,
-                                            kv_lo[pl, :, :],
+                                            kv_lo[pa, :, :],
                                             acc_s_l0c,
                                             transpose_B=True,
                                             init=True,
@@ -538,12 +532,12 @@ def build_sparse_attn_sharedkv(
                                         T.barrier_all()
                                         T.copy(
                                             acc_s_l0c,
-                                            ws_score[cid, pl, 0:H_per_block, 0:BI_half],
+                                            ws_score[cid, pa, 0:H_per_block, 0:BI_half],
                                         )
                                         T.barrier_all()
                                         T.gemm_v0(
                                             q_l1,
-                                            kv_hi[pl, :, :],
+                                            kv_hi[pa, :, :],
                                             acc_s_l0c,
                                             transpose_B=True,
                                             init=True,
@@ -552,21 +546,20 @@ def build_sparse_attn_sharedkv(
                                         T.copy(
                                             acc_s_l0c,
                                             ws_score[
-                                                cid, pl, 0:H_per_block, BI_half:BI
+                                                cid, pa, 0:H_per_block, BI_half:BI
                                             ],
                                         )
                                         T.barrier_all()
                                         T.set_cross_flag("FIX", _FLAG_SCORE_READY)
-                                    if t >= 2:
-                                        # ---- MM2(t-2): P@V of chunk t-2 ----
+                                    if t >= 1:
+                                        # ---- MM2(t-1): P@V of chunk t-1 ----
                                         # acc_s_l0c (MM1) and acc_o_l0c (MM2) alias
                                         # at L0C 0; MM1(t) drained its score to
                                         # ws_score (barriers above) before MM2
-                                        # overwrites L0C. MM2 reads chunk t-2's KV
-                                        # from the (t-2)%3 L1 slot loaded by
-                                        # MM1(t-2) two steps ago.
-                                        pb = (t - 2) % 3
-                                        po = (t - 2) % 2
+                                        # overwrites L0C. MM2 reads chunk t-1's KV
+                                        # from the (t-1)%2 L1 buffers, loaded by
+                                        # MM1(t-1) the previous step.
+                                        pb = (t - 1) % 2
                                         T.wait_cross_flag(_FLAG_P_READY)
                                         T.barrier_all()
                                         T.copy(
@@ -591,7 +584,7 @@ def build_sparse_attn_sharedkv(
                                         T.barrier_all()
                                         T.copy(
                                             acc_o_l0c,
-                                            ws_o[cid, po, 0:H_per_block, 0:D],
+                                            ws_o[cid, pb, 0:H_per_block, 0:D],
                                         )
                                         T.barrier_all()
                                         T.set_cross_flag("FIX", _FLAG_PV_READY)
@@ -619,14 +612,11 @@ def build_sparse_attn_sharedkv(
                                 # half t%2 from step 2 on; drain after the loop).
                                 T.set_flag("v", "mte2", 0)
                                 T.set_flag("v", "mte2", 1)
-                                # S2c skew: V1 trails V0 by 2 (PreloadPipeline
-                                # Vec0(loop)/Vec1(loop-2)/Vec2(loop-3)) so the
-                                # SCORE_READY wait never fronts V1's VEC work.
-                                for t in range(NI_total + 3):
+                                for t in range(NI_total + 2):
                                     # ---- V0(t): gather chunk t + build mask ----
                                     if t < NI_total:
                                         c0 = t
-                                        pv0 = t % 3
+                                        pv0 = t % 2
                                         is_ori = c0 < NI_ori
 
                                         # ---- gather KV + build mask ----
@@ -816,12 +806,11 @@ def build_sparse_attn_sharedkv(
                                         T.wait_flag("mte3", "mte2", 0)
                                         T.wait_flag("mte3", "mte2", 1)
                                         T.set_cross_flag("MTE3", _FLAG_KV_READY)
-                                    # ---- prologue: prefetch chunk 0 score ----
-                                    # Cold start: land chunk 0 in UB half 0 so
-                                    # V1(0) finds it at t=2 (S2c skew). At t==1
-                                    # V0(1) has issued; the SCORE(0) wait only
-                                    # blocks the prefetch stream.
-                                    if t == 1:
+                                    # ---- S2b.1d-beta prologue: prefetch chunk 0 score ----
+                                    # Cold start: nothing to overlap yet, just land
+                                    # chunk 0 in half 0 so V1(0) finds it at t=1.
+                                    # Steady-state prefetch lives inside V1 below.
+                                    if t == 0:
                                         T.wait_cross_flag(_FLAG_SCORE_READY)
                                         T.wait_flag("v", "mte2", 0)
                                         T.copy(
@@ -835,10 +824,9 @@ def build_sparse_attn_sharedkv(
                                         )
                                         T.set_flag("mte2", "v", 0)
                                     # ---- V1(t-1): online softmax of chunk t-1 ----
-                                    if t >= 2:
-                                        if t <= NI_total + 1:
-                                            pv1 = (t - 2) % 2
-                                            pm1 = (t - 2) % 3
+                                    if t >= 1:
+                                        if t <= NI_total:
+                                            pv1 = (t - 1) % 2
                                             # ---- masked score (S2b.1d-beta) ----
                                             # Chunk t-1's score is ALREADY in half pv1
                                             # (prefetched last step), so the old
@@ -853,7 +841,7 @@ def build_sparse_attn_sharedkv(
                                             # a Var-indexed parity BufferRegion
                                             # lacks), so copy chunk t-1's mask
                                             # row into the whole mask_sel first.
-                                            T.copy(mask_ub[pm1, :], mask_sel)
+                                            T.copy(mask_ub[pv1, :], mask_sel)
                                             for h_i in T.serial(v_block):
                                                 T.tile.select(
                                                     acc_s_ub[h_i, :],
@@ -934,31 +922,29 @@ def build_sparse_attn_sharedkv(
                                             # the softmax would serialize MM1(t) latency
                                             # in front of the VEC work -- the gap we are
                                             # removing.
-                                            if t < NI_total + 1:
+                                            if t < NI_total:
                                                 T.wait_cross_flag(_FLAG_SCORE_READY)
-                                                # WAR (eid (t-1)%2): select(t-3) freed
-                                                # this half (pre-set covers t=2,3).
-                                                T.wait_flag("v", "mte2", (t - 1) % 2)
+                                                # WAR (eid t%2): select(t-2) freed half
+                                                # t%2 (pre-set covers steps 1..2).
+                                                T.wait_flag("v", "mte2", t % 2)
                                                 T.copy(
                                                     ws_score[
                                                         cid,
-                                                        (t - 1) % 3,
+                                                        t % 2,
                                                         vid * v_block : vid * v_block
                                                         + v_block,
                                                         :,
                                                     ],
                                                     acc_s_ub_[
-                                                        ((t - 1) % 2) * v_block : (
-                                                            (t - 1) % 2
-                                                        )
+                                                        (t % 2) * v_block : (t % 2)
                                                         * v_block
                                                         + v_block,
                                                         :,
                                                     ],
                                                 )
-                                                # RAW (eid (t-1)%2): V1(t-1) selects
-                                                # from this half next step.
-                                                T.set_flag("mte2", "v", (t - 1) % 2)
+                                                # RAW (eid t%2): V1(t) selects from this
+                                                # half next step.
+                                                T.set_flag("mte2", "v", t % 2)
 
                                             # ---- cast P, publish for cube ----
                                             T.copy(acc_s_ub, acc_s_half)
@@ -970,7 +956,7 @@ def build_sparse_attn_sharedkv(
                                                 acc_s_half,
                                                 ws_p[
                                                     cid,
-                                                    pm1,
+                                                    pv1,
                                                     vid * v_block : vid * v_block
                                                     + v_block,
                                                     :,
@@ -986,8 +972,8 @@ def build_sparse_attn_sharedkv(
                                             T.barrier_all()
                                             T.set_cross_flag("MTE3", _FLAG_P_READY)
                                     # ---- V2(t-2): merge chunk t-2 into the accumulator ----
-                                    if t >= 3:
-                                        pv2 = (t - 3) % 2
+                                    if t >= 2:
+                                        pv2 = (t - 2) % 2
                                         # ---- wait P@V (chunk c2), merge output ----
                                         T.wait_cross_flag(_FLAG_PV_READY)
                                         T.barrier_all()
