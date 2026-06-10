@@ -98,7 +98,7 @@ pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill" -
 - DMA:16×2KB = 1×32KB ≈ 166ns,**纯带宽限制,合并 DMA 无肉**(gather 碎片不亏)。
 - flag/barrier 空流水下 ≈0。
 - 每 chunk per-row 链 ≈3µs,640 chunk/核 ≈2ms 可削(V1 select 32 + V2 mul/add 64)。
-- 已加 `select_fused`(整 tile 4096 元素 + 128bit mask 周期复用) / `add_fused` case 待跑——select_fused 若 ~45ns 且 mask 周期语义正确,V1 select 32→1、V2 add 32→2,是 ~2ms 的刀;mask 周期正确性需先单测。
+- `select_fused` 19.8ns / `add_fused` 40.4ns 已实测(vs 拆行 1016/501ns)——但**两条 fused 路全死**:① select_fused 的 mask 是连续位流(4096 元素要 512B mask、非 128bit 周期),要 32 份行 mask 复制、净赚减半;② **binary_op/fill 的 dst 不收子 tile slice**——`acc_o[hbase:hbase+16,:]` 即便常量起点也塌成 BufferLoad(只有整 buffer 有 access_ptr),V2 fused add 编译挂、已回退(`4606d4a`→`b695965`)。**fused 只在整 buffer 边界可用,sharedkv 热点全是子 tile ⇒ per-row ~31ns/op 是 TileLang 语言下限。36.9ms ≈ 本算子在当前 TileLang 下的地板,优化线收官**;再往下要 tilelang-ascend 支持子 tile region operand(改编译器,非 kernel)。
 - 坑(已 push 修):JIT cache 按 AST,闭包注入 body 9 case 全跑第一个 kernel → 每 case 写显式 prim_func + 解析期常量裁剪;fill(Duplicate)不收 uint8 → mask 用 compare 生成。
 
 ---
