@@ -61,7 +61,10 @@ def _kernel(body):
                 with T.Scope("V"):
                     T.tile.fill(a, 1.0)
                     T.tile.fill(b, 2.0)
-                    T.tile.fill(msk, 255)
+                    T.barrier_all()
+                    # Duplicate (fill) rejects uint8 -- build the all-ones
+                    # mask via compare like the main kernel does.
+                    T.tile.compare(msk, b[0, :], T.float32(0.0), "GT")
                     T.barrier_all()
                     body(a, b, row, blk, msk, Src)
                     T.barrier_all()
