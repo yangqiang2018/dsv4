@@ -619,10 +619,10 @@ def build_sparse_attn_sharedkv(
                                 # half t%2 from step 2 on; drain after the loop).
                                 T.set_flag("v", "mte2", 0)
                                 T.set_flag("v", "mte2", 1)
-                                # S2c skew: V1 trails V0 by 2 (PreloadPipeline
-                                # Vec0(loop)/Vec1(loop-2)/Vec2(loop-3)) so the
-                                # SCORE_READY wait never fronts V1's VEC work.
-                                for t in range(NI_total + 3):
+                                # S2c.0: cube-only skew (MM2 at t-2). Vector keeps
+                                # the verified V1(t-1)/V2(t-2) schedule; only the
+                                # ws_score/ws_p slots follow cube's depth 3.
+                                for t in range(NI_total + 2):
                                     # ---- V0(t): gather chunk t + build mask ----
                                     if t < NI_total:
                                         c0 = t
@@ -817,11 +817,7 @@ def build_sparse_attn_sharedkv(
                                         T.wait_flag("mte3", "mte2", 1)
                                         T.set_cross_flag("MTE3", _FLAG_KV_READY)
                                     # ---- prologue: prefetch chunk 0 score ----
-                                    # Cold start: land chunk 0 in UB half 0 so
-                                    # V1(0) finds it at t=2 (S2c skew). At t==1
-                                    # V0(1) has issued; the SCORE(0) wait only
-                                    # blocks the prefetch stream.
-                                    if t == 1:
+                                    if t == 0:
                                         T.wait_cross_flag(_FLAG_SCORE_READY)
                                         T.wait_flag("v", "mte2", 0)
                                         T.copy(
@@ -835,10 +831,10 @@ def build_sparse_attn_sharedkv(
                                         )
                                         T.set_flag("mte2", "v", 0)
                                     # ---- V1(t-1): online softmax of chunk t-1 ----
-                                    if t >= 2:
-                                        if t <= NI_total + 1:
-                                            pv1 = (t - 2) % 2
-                                            pm1 = (t - 2) % 3
+                                    if t >= 1:
+                                        if t <= NI_total:
+                                            pv1 = (t - 1) % 2
+                                            pm1 = (t - 1) % 3
                                             # ---- masked score (S2b.1d-beta) ----
                                             # Chunk t-1's score is ALREADY in half pv1
                                             # (prefetched last step), so the old
@@ -934,31 +930,29 @@ def build_sparse_attn_sharedkv(
                                             # the softmax would serialize MM1(t) latency
                                             # in front of the VEC work -- the gap we are
                                             # removing.
-                                            if t < NI_total + 1:
+                                            if t < NI_total:
                                                 T.wait_cross_flag(_FLAG_SCORE_READY)
-                                                # WAR (eid (t-1)%2): select(t-3) freed
-                                                # this half (pre-set covers t=2,3).
-                                                T.wait_flag("v", "mte2", (t - 1) % 2)
+                                                # WAR (eid t%2): select(t-2) freed this
+                                                # half (pre-set covers steps 1..2).
+                                                T.wait_flag("v", "mte2", t % 2)
                                                 T.copy(
                                                     ws_score[
                                                         cid,
-                                                        (t - 1) % 3,
+                                                        t % 3,
                                                         vid * v_block : vid * v_block
                                                         + v_block,
                                                         :,
                                                     ],
                                                     acc_s_ub_[
-                                                        ((t - 1) % 2) * v_block : (
-                                                            (t - 1) % 2
-                                                        )
+                                                        (t % 2) * v_block : (t % 2)
                                                         * v_block
                                                         + v_block,
                                                         :,
                                                     ],
                                                 )
-                                                # RAW (eid (t-1)%2): V1(t-1) selects
-                                                # from this half next step.
-                                                T.set_flag("mte2", "v", (t - 1) % 2)
+                                                # RAW (eid t%2): V1(t) selects from
+                                                # this half next step.
+                                                T.set_flag("mte2", "v", t % 2)
 
                                             # ---- cast P, publish for cube ----
                                             T.copy(acc_s_ub, acc_s_half)
@@ -986,8 +980,8 @@ def build_sparse_attn_sharedkv(
                                             T.barrier_all()
                                             T.set_cross_flag("MTE3", _FLAG_P_READY)
                                     # ---- V2(t-2): merge chunk t-2 into the accumulator ----
-                                    if t >= 3:
-                                        pv2 = (t - 3) % 2
+                                    if t >= 2:
+                                        pv2 = (t - 2) % 2
                                         # ---- wait P@V (chunk c2), merge output ----
                                         T.wait_cross_flag(_FLAG_PV_READY)
                                         T.barrier_all()
