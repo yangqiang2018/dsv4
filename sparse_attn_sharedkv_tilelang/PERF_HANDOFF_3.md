@@ -93,6 +93,14 @@ pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill" -
 - **S2c 也试了、也回退了(2026-06-10)**:cube MM2→t-2 的 PreloadPipeline skew(S2c.0,`4044e56`+parity 修复 `b6d306a`,decode+prefill 全 pass)Duration 36.9→**44.4ms**;full S2c(双侧)有 ws_kv 越界 bug 修后未单独验。`c9f9948` 回退到 1d-β。
 - **⭐ 全程 profile 数据链与硬结论**:基线 36.3 → 1c/1d 36.9(机制生效:pipe-sum 29>aiv 22.5) → 1e 40.9(回退) → S2c.0 44.4(回退)。**每个"调度结构"刀都不赚反亏;gap≈14ms 恒定;vector scalar≈10ms + mte2≈8-9ms 是基底**。与 AscendC 6.87ms 的差距≈100×/chunk,来源是 **per-op 粒度**(32×select、32×add、64×逐行 gather DMA、每 op 标量发射)而非调度——AscendC 单条 vector 指令处理整 tile,TileLang tile.* 逐头逐行。**调度层已挖完,继续在 skew/barrier 上动刀没有肉**。下一阶段唯一有肉的方向:**砍 per-op 数**(select/add tile 化、gather 合并 DMA、mask 改加性盖在 score 上),做之前先建小型微基准验单 op 成本,别再上整 kernel 试。
 
+**✅ 微基准已建并跑通(`bench_microop.py`,NPU 2026-06-10)**,vector 核成本模型:
+- 整块 [32,128] mul = 44.6ns;**拆 32 行 = 501ns(11×罚);scalar-mul/select per-row ≈31ns/行**。
+- DMA:16×2KB = 1×32KB ≈ 166ns,**纯带宽限制,合并 DMA 无肉**(gather 碎片不亏)。
+- flag/barrier 空流水下 ≈0。
+- 每 chunk per-row 链 ≈3µs,640 chunk/核 ≈2ms 可削(V1 select 32 + V2 mul/add 64)。
+- 已加 `select_fused`(整 tile 4096 元素 + 128bit mask 周期复用) / `add_fused` case 待跑——select_fused 若 ~45ns 且 mask 周期语义正确,V1 select 32→1、V2 add 32→2,是 ~2ms 的刀;mask 周期正确性需先单测。
+- 坑(已 push 修):JIT cache 按 AST,闭包注入 body 9 case 全跑第一个 kernel → 每 case 写显式 prim_func + 解析期常量裁剪;fill(Duplicate)不收 uint8 → mask 用 compare 生成。
+
 ---
 
 ## 3. commit 地图（main 上,可回退）
