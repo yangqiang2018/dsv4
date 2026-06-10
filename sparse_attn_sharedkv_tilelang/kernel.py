@@ -765,29 +765,37 @@ def build_sparse_attn_sharedkv(
                                                 )
                                                 # write[gp] done -> half pp free (gp+2)
                                                 T.set_flag("mte3", "mte2", pp)
-                                        # S2b.1b: drain the 2 dangling back-flags (the
+                                        # S2b.1c: drain the 2 dangling back-flags (the
                                         # last two passes set mte3->mte2 with no
-                                        # in-loop waiter), then a barrier to keep V0
-                                        # isolated from V1 (gather||V1 overlap is the
-                                        # next step, S2b.1c).
+                                        # in-loop waiter) so kv_ub_multi's two halves
+                                        # are free for the next chunk's gather. The
+                                        # V0-end barrier is GONE now: dropping it lets
+                                        # this chunk's gather MTE2/MTE3 keep draining
+                                        # into V1(t-1)'s VEC window (the overlap we
+                                        # want). set_cross_flag("MTE3") stays correct
+                                        # without it -- it is pipe-ordered on MTE3, so
+                                        # it still fires only after the ws_kv writes
+                                        # land, and cube's KV_READY wait is unaffected.
                                         T.wait_flag("mte3", "mte2", 0)
                                         T.wait_flag("mte3", "mte2", 1)
-                                        T.barrier_all()
                                         T.set_cross_flag("MTE3", _FLAG_KV_READY)
                                     # ---- V1(t-1): online softmax of chunk t-1 ----
                                     if t >= 1:
                                         if t <= NI_total:
                                             pv1 = (t - 1) % 2
                                             # ---- additive mask (0 / -inf) ----
+                                            # S2b.1c: V1 is debarriered. Every op in
+                                            # this phase is VEC (all tile.* plus the
+                                            # UB->UB copies), so the hardware keeps them
+                                            # in program order with NO flag; only the 3
+                                            # cross-pipe edges below need a flag pair.
                                             T.tile.fill(acc_s_ub_, 0.0)
-                                            T.barrier_all()
                                             # select's selMask needs a whole
                                             # Buffer (it calls .access_ptr, which
                                             # a Var-indexed parity BufferRegion
                                             # lacks), so copy chunk t-1's mask
                                             # row into the whole mask_sel first.
                                             T.copy(mask_ub[pv1, :], mask_sel)
-                                            T.barrier_all()
                                             for h_i in T.serial(v_block):
                                                 T.tile.select(
                                                     acc_s_ub[h_i, :],
@@ -796,13 +804,23 @@ def build_sparse_attn_sharedkv(
                                                     -T.infinity(accum_dtype),
                                                     "VSEL_TENSOR_SCALAR_MODE",
                                                 )
-                                                T.barrier_all()
+                                            # WAR flag #1 (set): the selects (VEC) read
+                                            # acc_s_ub_ as the masked-in 0 values; the
+                                            # ws_score load (MTE2) below overwrites
+                                            # acc_s_ub_, so it must not run until the
+                                            # selects are done.
+                                            T.set_flag("v", "mte2", 0)
                                             T.copy(m_i, m_i_prev)
-                                            T.barrier_all()
 
                                             # ---- wait Q@K^T, online softmax ----
+                                            # wait_cross_flag blocks the execution
+                                            # stream until cube signals SCORE_READY, so
+                                            # the MTE2 load below cannot issue early --
+                                            # no barrier needed for the cross-core dep.
                                             T.wait_cross_flag(_FLAG_SCORE_READY)
-                                            T.barrier_all()
+                                            # WAR flag #1 (wait): hold the load until the
+                                            # selects finished reading acc_s_ub_.
+                                            T.wait_flag("v", "mte2", 0)
                                             T.copy(
                                                 ws_score[
                                                     cid,
@@ -813,22 +831,22 @@ def build_sparse_attn_sharedkv(
                                                 ],
                                                 acc_s_ub_,
                                             )
-                                            T.barrier_all()
+                                            # RAW flag #2: load (MTE2) writes acc_s_ub_,
+                                            # add (VEC) reads it.
+                                            T.set_flag("mte2", "v", 0)
+                                            T.wait_flag("mte2", "v", 0)
                                             T.tile.add(
                                                 acc_s_ub,
                                                 acc_s_ub,
                                                 acc_s_ub_,
                                             )
-                                            T.barrier_all()
                                             T.tile.mul(
                                                 acc_s_ub,
                                                 acc_s_ub,
                                                 softmax_scale,
                                             )
-                                            T.barrier_all()
 
                                             T.reduce_max(acc_s_ub, m_i, dim=-1)
-                                            T.barrier_all()
                                             # m_i = max(m_i_prev, m_i): the dst must
                                             # be the LAST operand. T.tile.max in the
                                             # form T.tile.max(m_i, m_i, m_i_prev)
@@ -839,11 +857,8 @@ def build_sparse_attn_sharedkv(
                                             # dst-last form matches the verified
                                             # example_online_softmax.py.
                                             T.tile.max(m_i, m_i_prev, m_i)
-                                            T.barrier_all()
                                             T.tile.sub(m_i_prev, m_i_prev, m_i)
-                                            T.barrier_all()
                                             T.tile.exp(m_i_prev, m_i_prev)
-                                            T.barrier_all()
                                             # Stash the rescale factor alpha = exp(m_prev
                                             # - m_new) into this chunk's parity HALF of the
                                             # flat alpha buffer so V2 of the same chunk
@@ -857,32 +872,25 @@ def build_sparse_attn_sharedkv(
                                                     pv1 * ub_len : pv1 * ub_len + ub_len
                                                 ],
                                             )
-                                            T.barrier_all()
 
                                             for h_i in range(v_block):
-                                                T.barrier_all()
                                                 T.tile.sub(
                                                     acc_s_ub[h_i, :],
                                                     acc_s_ub[h_i, :],
                                                     m_i[h_i],
                                                 )
-                                                T.barrier_all()
                                             T.tile.exp(acc_s_ub, acc_s_ub)
-                                            T.barrier_all()
                                             T.reduce_sum(
                                                 acc_s_ub,
                                                 sumexp_i_ub,
                                                 dim=-1,
                                             )
-                                            T.barrier_all()
                                             T.tile.mul(sumexp, sumexp, m_i_prev)
-                                            T.barrier_all()
                                             T.tile.add(
                                                 sumexp,
                                                 sumexp,
                                                 sumexp_i_ub,
                                             )
-                                            T.barrier_all()
                                             # The acc_o rescale lives in V2 now (alpha was
                                             # stashed above); V1 never touches acc_o, so
                                             # V1(t-1) and V2(t-2) run in one pipeline step
@@ -890,7 +898,10 @@ def build_sparse_attn_sharedkv(
 
                                             # ---- cast P, publish for cube ----
                                             T.copy(acc_s_ub, acc_s_half)
-                                            T.barrier_all()
+                                            # RAW flag #3: cast (VEC) writes acc_s_half,
+                                            # the ws_p write (MTE3) reads it.
+                                            T.set_flag("v", "mte3", 0)
+                                            T.wait_flag("v", "mte3", 0)
                                             T.copy(
                                                 acc_s_half,
                                                 ws_p[
@@ -901,6 +912,13 @@ def build_sparse_attn_sharedkv(
                                                     :,
                                                 ],
                                             )
+                                            # V1-end barrier KEPT: it drains this chunk's
+                                            # gather (MTE2/MTE3) + softmax (VEC) before
+                                            # V2, acting as the step boundary so the
+                                            # single-buffered V1 scratch (acc_s_ub/ub_/
+                                            # half, m_i*, sumexp, mask_sel) is free for
+                                            # the next chunk -- no cross-chunk ping-pong
+                                            # needed until S2b.1d.
                                             T.barrier_all()
                                             T.set_cross_flag("MTE3", _FLAG_P_READY)
                                     # ---- V2(t-2): merge chunk t-2 into the accumulator ----
