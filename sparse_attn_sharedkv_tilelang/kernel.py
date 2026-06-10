@@ -45,6 +45,16 @@ from tvm import ir as tvm_ir
 from tvm import tir as tvm_tir
 
 
+def _sub_tile2(buf, row0, rows, col0, cols):
+    return tvm_tir.BufferRegion(
+        buf,
+        [
+            tvm_ir.Range.from_min_extent(row0, rows),
+            tvm_ir.Range.from_min_extent(col0, cols),
+        ],
+    )
+
+
 def _sub_tile(buf, row0, rows, cols):
     """Explicit tvm BufferRegion for a sub-tile (subscript slices collapse to
     BufferLoad and tile.* rejects them; binary_op/select accept BufferRegion,
@@ -1044,18 +1054,44 @@ def build_sparse_attn_sharedkv(
                                                 acc_o_ub,
                                             )
                                             T.barrier_all()
-                                            for h_i in range(MERGE_HEADS):
+                                            # FUSE-V2: alpha row broadcast + fused
+                                            # mul/add via BufferRegion sub-tiles --
+                                            # 64 per-row issues -> 6 per pass. The
+                                            # [16,256] halves reuse the 16K brc_tmp.
+                                            for dh in range(2):
+                                                T.tile.broadcast(
+                                                    _sub_tile(brc_tmp, 0, 16, 256),
+                                                    tvm_tir.BufferRegion(
+                                                        alpha,
+                                                        [
+                                                            tvm_ir.Range.from_min_extent(
+                                                                pv2 * ub_len + hbase, 16
+                                                            )
+                                                        ],
+                                                    ),
+                                                    axis=1,
+                                                )
                                                 T.barrier_all()
                                                 T.tile.mul(
-                                                    acc_o[hbase + h_i, :],
-                                                    acc_o[hbase + h_i, :],
-                                                    alpha[pv2 * ub_len + hbase + h_i],
+                                                    _sub_tile2(
+                                                        acc_o, hbase, 16, dh * 256, 256
+                                                    ),
+                                                    _sub_tile2(
+                                                        acc_o, hbase, 16, dh * 256, 256
+                                                    ),
+                                                    _sub_tile(brc_tmp, 0, 16, 256),
                                                 )
                                                 T.barrier_all()
                                                 T.tile.add(
-                                                    acc_o[hbase + h_i, :],
-                                                    acc_o[hbase + h_i, :],
-                                                    acc_o_ub[h_i, :],
+                                                    _sub_tile2(
+                                                        acc_o, hbase, 16, dh * 256, 256
+                                                    ),
+                                                    _sub_tile2(
+                                                        acc_o, hbase, 16, dh * 256, 256
+                                                    ),
+                                                    _sub_tile2(
+                                                        acc_o_ub, 0, 16, dh * 256, 256
+                                                    ),
                                                 )
                                                 T.barrier_all()
 
