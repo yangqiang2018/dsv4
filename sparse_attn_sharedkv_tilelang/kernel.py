@@ -626,7 +626,8 @@ def build_sparse_attn_sharedkv(
                                     # ---- V0(t): gather chunk t + build mask ----
                                     if t < NI_total:
                                         c0 = t
-                                        pv0 = t % 3
+                                        pv0 = t % 2
+                                        pm0 = t % 3
                                         is_ori = c0 < NI_ori
 
                                         # ---- gather KV + build mask ----
@@ -639,7 +640,7 @@ def build_sparse_attn_sharedkv(
                                             T.copy(idx_int, idx_float)
                                             T.barrier_all()
                                             T.tile.compare(
-                                                mask_ub[pv0, :],
+                                                mask_ub[pm0, :],
                                                 idx_float,
                                                 T.float32(ori_right),
                                                 "LE",
@@ -731,22 +732,22 @@ def build_sparse_attn_sharedkv(
                                             T.barrier_all()
                                             # mask = (idx >= 0) AND (idx < thr)
                                             T.tile.compare(
-                                                mask_ub[pv0, :],
+                                                mask_ub[pm0, :],
                                                 idx_float,
                                                 T.float32(-0.5),
                                                 "GT",
                                             )
                                             T.tile.compare(
-                                                mask_ub_2[pv0, :],
+                                                mask_ub_2[pm0, :],
                                                 idx_float,
                                                 T.float32(cmp_threshold),
                                                 "LT",
                                             )
                                             T.barrier_all()
                                             T.tile.bitwise_and(
-                                                mask_ub[pv0, :],
-                                                mask_ub[pv0, :],
-                                                mask_ub_2[pv0, :],
+                                                mask_ub[pm0, :],
+                                                mask_ub[pm0, :],
+                                                mask_ub_2[pm0, :],
                                             )
                                             T.barrier_all()
                                             # Batched sparse gather. cmp indices
