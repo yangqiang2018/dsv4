@@ -249,9 +249,14 @@ AscendC 的核内重叠靠 `SetFlag/WaitFlag<HardEvent::V_MTE2>(eid)` + ping-pon
 - score load `acc_s_ub_`、ws_o load `acc_o_ub` 要开 ×2(`acc_s_ub_` 16K→32K、`acc_o_ub` 32K→64K),否则 V1(t)/V2(t) 的 MTE2 load 会和 V1(t-1)/V2(t-2) 的 VEC 抢 buffer。⚠️ 这会顶 UB 墙(acc_o_ub ×2 = 64K),需要重新核 170K 预算——可能 score 或 ws_o load 只 ×2 一个、或 acc_o_ub 维持单缓冲(merge 的 load∥compute 不重叠,只保跨相位重叠)。**实施前先把 ping-pong 深度和 UB 预算重算清楚**。
 
 **增量子步**(每步 NPU 验证):
-- **S2b.1·smoke**(`ec9b282`,✅ **decode+prefill 已验证**):gather(MTE2)→写 ws_kv(MTE3) 的 barrier 换一对配平 `set_flag/wait_flag`(写后 barrier 保留 → 零竞态)。**验通了 pipe-flag 原语在本 kernel 能 lower + 跑对 + 不死锁**——后面所有去 barrier 的地基。
-- **⚠️ 阻塞点(做真跨相位前必须先解决)**:**V1 里同 dtype `T.copy(UB,UB)`(`mask_ub→mask_sel`、`m_i→m_i_prev`、`m_i_prev→alpha`)走哪条 pipe?** 决定去 barrier 后给不给它补 flag、补哪条(set_flag 需要 src pipe)。codegen 的 `copy_ub_to_ub` 那张表是 extra-args 数、不是 pipe,没查到。解决:读非-pto codegen 对 `copy_ub_to_ub` 发的 AscendC API 看它落哪个 pipe,或一个"漏 flag 就死锁/错"的最小 NPU 探针。(`acc_s_ub→acc_s_half` 是 fp32→bf16 cast = VEC vconv,这个确定。)
-- **S2b.1a(真跨相位,下一刀)**:解决阻塞点后,去 V0↔V1 之间 + 各自内部 barrier、补 flag,让 **V0 gather-MTE2 ∥ V1 softmax-VEC** 重叠(V2 仍隔离)。这才是吃 gap 的真收益(gather 7.1ms 藏到 softmax 的 12ms VEC+scalar 后)。
-- **S2b.1b/c**:纳入 V2、跨 chunk 全打通 + ping-pong 调深(上面 UB 预算告警)。
-- **备选小刀(不阻塞,ROI 低)**:V0 内部 ping-pong(gather[gp+1] ∥ write[gp],要 forward+back flag + 平衡 drain)——只藏 V0 的写 ~1ms,复杂度不值,除非想先单独把 back-flag/平衡机制验掉。
-- 回退点:tag `s2a-forward-verified` 或 S2b.0 的 `0fe56b7`。
+- **S2b.1·smoke**(`ec9b282`,✅):gather(MTE2)→ws_kv(MTE3) barrier 换配平 flag、写后 barrier 保留。验通 pipe-flag 原语能 lower+跑对+不死锁。
+- **阻塞点 ✅ 已解**(`1d1bcfc`):`copy_ub_to_ub` = **VEC pipe**(见上面那条)。
+- **S2b.1b**(`1d1bcfc`,✅):V0 gather 内部 ping-pong(gather[gp](MTE2) ∥ write[gp-1](MTE3),forward+back flag + 平衡 drain;去 per-pass barrier、保 V0-end barrier)。验通 back-flag/ping-pong/平衡机制。
+- **S2b.1c — 拆 V1 内部 barrier(下一刀,最复杂)**:去 V0-end barrier + V1 全部 barrier,补 flag,让 gather(MTE2) ∥ V1 的 VEC。V2 仍 barrier(它的 barrier 当 step 边界 drain 上一 chunk 的 VEC,**免掉跨 chunk WAR ping-pong**)。V1 里 UB→UB / tile.* 全 VEC 自动 in-order,**只这 3 处跨 pipe 要 flag**:
+  - **WAR**:`select`(VEC 读 `acc_s_ub_`=0)→ `load ws_score`(MTE2 覆写 `acc_s_ub_`):`set_flag("v","mte2")` after select / `wait_flag` before load。(否则 load 抢在 select 前覆写,select 读到 score 而非 0。)
+  - **RAW**:`load`(MTE2)→`add`(VEC 读 `acc_s_ub_`):`set_flag("mte2","v")` / wait。
+  - **RAW**:`cast→acc_s_half`(VEC)→`写 ws_p`(MTE3):`set_flag("v","mte3")` / wait。
+  - 跨核 `wait_cross_flag(SCORE_READY)` 自身 serialize、保留;V1-end barrier 保留(隔 V2)。
+  - ⚠️ 收益**有限**:gather 和 score-load 同在 MTE2 串行 → gather 只 ∥ V1 的 mask+pre-softmax VEC 几个 op,softmax 大头还没 ∥ MTE2。真大头在下一步。
+- **S2b.1d — 跨 chunk ping-pong 预取(真大头,复刻 AscendC `inputBuff1` 32K×2)**:`acc_s_ub_` ×2,MTE2 预取 chunk c+1 score(进 half (c+1)%2)while VEC 算 chunk c softmax(half c%2),`V_MTE2` flag 配 ping-pong index(`scfa_block_vector.h:461-484` 模板)。这才把 softmax-VEC ∥ MTE2、vector 21ms→~7ms。⚠️ UB:`acc_s_ub_` ×2 = +16K(170→186K 可);`acc_o_ub` ×2 = +32K 会爆 → V2 的 ws_o 预取要么不做要么挤别的,**实施前重算 §9.2 预算**。
+- 回退点:tag `s2a-forward-verified` / S2b.0 `0fe56b7` / S2b.1a `ec9b282` / S2b.1b `1d1bcfc`。
