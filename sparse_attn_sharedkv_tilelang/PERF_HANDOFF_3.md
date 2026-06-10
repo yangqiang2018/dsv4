@@ -98,7 +98,7 @@ pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill" -
 - DMA:16×2KB = 1×32KB ≈ 166ns,**纯带宽限制,合并 DMA 无肉**(gather 碎片不亏)。
 - flag/barrier 空流水下 ≈0。
 - 每 chunk per-row 链 ≈3µs,640 chunk/核 ≈2ms 可削(V1 select 32 + V2 mul/add 64)。
-- `select_fused` 19.8ns / `add_fused` 40.4ns 已实测(vs 拆 32 行 1016/501ns,25-50×)。⚠️ select_fused 的 mask 是连续位流(4096 元素要 512B mask),不是 128bit 周期复用——直接换会越界读 mask,要先把行 mask 复制 32 份(~500ns)或建 [32,128] 比较,净赚减半;V2 add 无此坑(同 tile 连续行)→ 先落 V2。
+- 已加 `select_fused`(整 tile 4096 元素 + 128bit mask 周期复用) / `add_fused` case 待跑——select_fused 若 ~45ns 且 mask 周期语义正确,V1 select 32→1、V2 add 32→2,是 ~2ms 的刀;mask 周期正确性需先单测。
 - 坑(已 push 修):JIT cache 按 AST,闭包注入 body 9 case 全跑第一个 kernel → 每 case 写显式 prim_func + 解析期常量裁剪;fill(Duplicate)不收 uint8 → mask 用 compare 生成。
 
 ---
