@@ -89,7 +89,9 @@ pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill" -
 - **1d-β ✅ 完成并 NPU 验证(2026-06-10,commit `d9d6552`)**:预取 chunk t score 进 half t%2 ∥ V1(t-1) softmax;fill+select+逐行 add 塌缩成单 select 直接套 score;稳态预取在 softmax 链后/cast 前;WAR `v↔mte2` eid=half(pre-set ×2+drain ×2)、RAW `mte2↔v` eid=half;V1-end barrier 保留。decode+prefill pass。
 - **1d 后 profile(8K scfa_prefill 稳态)**:Duration ~36.9ms(基线 36.3 持平),cube≈22.6 / aiv≈22.5,gap≈14;vector pipe:vec 6.49 / scalar 9.4 / mte2 8.9 / mte3 4.4(pipe-sum 29 > aiv 22.5 ⇒ **V0/V1 重叠生效**,但 Duration 没动)。
 - **S2b.1e debarrier V2 merge:已试、变差、已回退(`be2f1a2` → revert `cd2e958`)**。正确性 pass 但 Duration 36.9→**40.9ms**:aiv_vec 6.49→5.57(空泡确实少了),可 scalar 9.4→11.3、mte3 4.4→5.9、cube 22.6→27.0 全涨——V2 的 MTE2/标量流失去 barrier 节流后与 V0 gather/V1 抢 MTE2/总线,KV_READY 变晚把 cube 链拖长。**教训:核内 barrier 不全是纯开销,部分起"隔离资源竞争"作用;V2 debarrier 不赚,别再试同款**。
-- **S2b 阶段结论**:核内 pipe 重叠机制(flag/ping-pong/预取)全部验通,但 Duration 36.3→36.9 没赚——瓶颈不在核内 pipe 串行,而在**跨核互锁**:每 chunk 5 个 cross-flag 把 cube/vector 锁成接力(两侧各忙 22.5/36.9=61%,gap≈14ms 恒定)。**下一步别再磨核内 barrier**,转 **S2c:跨核握手解耦**(cube 提前跑 MM1(t+1) 不等 P(t)、ws_* 多缓冲深度 ≥2,参照 AscendC PreloadPipeline 的跨 chunk 提前量),那才动得了 gap。
+- **S2b 阶段结论**:核内 pipe 重叠机制(flag/ping-pong/预取)全部验通,但 Duration 36.3→36.9 没赚——瓶颈不在核内 pipe 串行。
+- **S2c 也试了、也回退了(2026-06-10)**:cube MM2→t-2 的 PreloadPipeline skew(S2c.0,`4044e56`+parity 修复 `b6d306a`,decode+prefill 全 pass)Duration 36.9→**44.4ms**;full S2c(双侧)有 ws_kv 越界 bug 修后未单独验。`c9f9948` 回退到 1d-β。
+- **⭐ 全程 profile 数据链与硬结论**:基线 36.3 → 1c/1d 36.9(机制生效:pipe-sum 29>aiv 22.5) → 1e 40.9(回退) → S2c.0 44.4(回退)。**每个"调度结构"刀都不赚反亏;gap≈14ms 恒定;vector scalar≈10ms + mte2≈8-9ms 是基底**。与 AscendC 6.87ms 的差距≈100×/chunk,来源是 **per-op 粒度**(32×select、32×add、64×逐行 gather DMA、每 op 标量发射)而非调度——AscendC 单条 vector 指令处理整 tile,TileLang tile.* 逐头逐行。**调度层已挖完,继续在 skew/barrier 上动刀没有肉**。下一阶段唯一有肉的方向:**砍 per-op 数**(select/add tile 化、gather 合并 DMA、mask 改加性盖在 score 上),做之前先建小型微基准验单 op 成本,别再上整 kernel 试。
 
 ---
 
