@@ -99,6 +99,7 @@ pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill" -
 - flag/barrier 空流水下 ≈0。
 - 每 chunk per-row 链 ≈3µs,640 chunk/核 ≈2ms 可削(V1 select 32 + V2 mul/add 64)。
 - `select_fused` 19.8ns / `add_fused` 40.4ns 已实测(vs 拆行 1016/501ns)——但**两条 fused 路全死**:① select_fused 的 mask 是连续位流(4096 元素要 512B mask、非 128bit 周期),要 32 份行 mask 复制、净赚减半;② **binary_op/fill 的 dst 不收子 tile slice**——`acc_o[hbase:hbase+16,:]` 即便常量起点也塌成 BufferLoad(只有整 buffer 有 access_ptr),V2 fused add 编译挂、已回退(`4606d4a`→`b695965`)。**子 tile fused 的语言锁已解**:`binary_op` 收 tvm `BufferRegion`,prim_func 内手工构造(`tvm_tir.BufferRegion`+`Range.from_min_extent`,见 `052423a` 的 `_sub_tile` helper)即可绕过 slice→BufferLoad 塌缩——编译/数值在 NPU 验证通过。**但 V2 fused add 这刀 perf 又反向(36.9→43.3ms,`15c176c` 回退)**:aiv_vec 6.49→5.10 局部赚,V2 提前完成让下一 step 的 gather/写更早抢 MTE2/MTE3,cube mte2 5.9→6.8、Duration +6.4。这是 1e/S2c.0 的同款共振模式,坐死结论:**36.9 是当前结构下的脆弱平衡点,任何局部加速都触发资源抢占共振,前向优化线收官**(改进剩两条:tilelang 提供整 tile 跨行带步原语;或换全局调度=重写 chunk 分配)。BufferRegion 技法已记入 pitfalls(它真正的价值留给反向 kernel)。
+- **AscendC 对账(2026-06-10,scfa_block_vector.h)坐实两个未复刻大头,皆为 TileLang 语言能力缺口**:① `SoftmaxFlashV2`(:442)——整 tile softmax 单库调用,我们是 ~10 op 长链+32 行 per-row sub;② `Brcb`+`RowMuls`(:330,924-928)——alpha 广播+整块行乘,我们是 32 次标量 mul。sync 密度(58 SetFlag/WaitFlag)与我们持平,非差距点。**补法=tilelang-ascend 加这两个 intrinsic 包装(改编译器);量级对得上三场景统一 3-6× 差距,是前向 17%→50% 的剩余答案。**
 - 坑(已 push 修):JIT cache 按 AST,闭包注入 body 9 case 全跑第一个 kernel → 每 case 写显式 prim_func + 解析期常量裁剪;fill(Duplicate)不收 uint8 → mask 用 compare 生成。
 
 ---
