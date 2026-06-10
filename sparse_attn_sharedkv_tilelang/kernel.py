@@ -1059,33 +1059,13 @@ def build_sparse_attn_sharedkv(
                                             # sub-tiles are legal -- 8-row halves
                                             # fit the 16K brc_tmp; the merge add is
                                             # one whole 16x512 region per pass.
-                                            for rh in range(2):
-                                                T.tile.broadcast(
-                                                    _sub_tile(brc_tmp, 0, 8, D),
-                                                    tvm_tir.BufferRegion(
-                                                        alpha,
-                                                        [
-                                                            tvm_ir.Range.from_min_extent(
-                                                                pv2 * ub_len
-                                                                + hbase
-                                                                + rh * 8,
-                                                                8,
-                                                            )
-                                                        ],
-                                                    ),
-                                                    axis=1,
-                                                )
-                                                T.barrier_all()
+                                            for h_i in range(MERGE_HEADS):
                                                 T.tile.mul(
-                                                    _sub_tile(
-                                                        acc_o, hbase + rh * 8, 8, D
-                                                    ),
-                                                    _sub_tile(
-                                                        acc_o, hbase + rh * 8, 8, D
-                                                    ),
-                                                    _sub_tile(brc_tmp, 0, 8, D),
+                                                    acc_o[hbase + h_i, :],
+                                                    acc_o[hbase + h_i, :],
+                                                    alpha[pv2 * ub_len + hbase + h_i],
                                                 )
-                                                T.barrier_all()
+                                            T.barrier_all()
                                             T.tile.add(
                                                 _sub_tile(acc_o, hbase, MERGE_HEADS, D),
                                                 _sub_tile(acc_o, hbase, MERGE_HEADS, D),
