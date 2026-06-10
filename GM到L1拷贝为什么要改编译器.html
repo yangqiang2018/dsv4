@@ -4,11 +4,19 @@
 <meta charset="utf-8">
 <title>GM→L1 拷贝为什么要改编译器</title>
 <style>
-nav#toc{position:fixed;top:90px;left:max(8px,calc(50% - 440px - 190px));width:175px;font-size:.86em;background:#f8fafc;border:1px solid #dde;border-radius:8px;padding:12px 14px;line-height:1.5}
-nav#toc b{display:block;margin-bottom:6px;color:#345}
-nav#toc a{display:block;color:#1d6fb8;text-decoration:none;padding:3px 0;border-left:3px solid transparent;padding-left:7px;margin-left:-10px}
-nav#toc a:hover{border-left-color:#4a90d9;background:#eef6ff}
-@media(max-width:1260px){nav#toc{display:none}}
+.sidenav{display:none}
+@media (min-width:1180px){
+  .sidenav{display:block;position:fixed;top:0;left:0;width:264px;height:100vh;overflow-y:auto;padding:30px 16px 48px;box-sizing:border-box;background:#fbfbf8;border-right:1px solid #e3e3de}
+  .sidenav .snav-title{margin:0 0 14px;padding-left:12px;font-size:12px;font-weight:700;letter-spacing:.14em;color:#777}
+  .sidenav ol{list-style:none;margin:0;padding:0}
+  .sidenav li{margin:1px 0}
+  .sidenav a{display:flex;gap:9px;align-items:baseline;padding:6px 11px;border-radius:8px;border-left:2px solid transparent;color:#475461;font-size:13.5px;line-height:1.45;text-decoration:none}
+  .sidenav a .n{color:#2f6fea;font-weight:700;min-width:16px;text-align:right}
+  .sidenav a:hover{background:#e8f0fe}
+  .sidenav a.active{background:#e8f0fe;color:#2f6fea;font-weight:700;border-left-color:#2f6fea}
+  body{margin-left:max(300px,calc((100% - 880px)/2));margin-right:auto}
+}
+.totop{position:fixed;right:22px;bottom:22px;width:44px;height:44px;border-radius:50%;background:#2f6fea;color:#fff;display:flex;align-items:center;justify-content:center;font-size:20px;text-decoration:none;opacity:.92}
 html{scroll-behavior:smooth}
 body{font-family:"PingFang SC","Microsoft YaHei",sans-serif;max-width:880px;margin:32px auto;padding:0 16px;line-height:1.75;color:#222}
 h1{font-size:1.6em;border-bottom:3px solid #4a90d9;padding-bottom:8px}
@@ -24,7 +32,8 @@ td,th{border:1px solid #bbb;padding:6px 12px;text-align:center}
 </head>
 <body>
 
-<nav id="toc"><b>目录</b><a href="#sec1">一、两个仓库和一条搬运指令</a><a href="#sec2">二、关键：L1 的货架不是按行摆的</a><a href="#sec3">三、这条指令支持什么</a><a href="#sec4">四、出错过程</a><a href="#sec5">五、为什么 kernel 里绕不过去，要改编译器？</a><a href="#sec6">六、回到我们的场景</a></nav>
+<a id="top"></a>
+<aside class="sidenav"><p class="snav-title">目录</p><ol><li><a href="#sec1"><span class="n">1</span><span>两个仓库和一条搬运指令</span></a></li><li><a href="#sec2"><span class="n">2</span><span>L1 的货架不是按行摆</span></a></li><li><a href="#sec3"><span class="n">3</span><span>指令支持什么、不支持什么</span></a></li><li><a href="#sec4"><span class="n">4</span><span>出错过程</span></a></li><li><a href="#sec5"><span class="n">5</span><span>为什么要改编译器</span></a></li><li><a href="#sec6"><span class="n">6</span><span>回到我们的场景</span></a></li></ol></aside>
 <h1>为什么"把数据搬进车间"这一步，TileLang 改不动，必须改编译器？</h1>
 
 <p>本文用一个 <b>8 行 × 4 列</b> 的小例子，解释我们在昇腾 NPU 上遇到的一个底层限制。不需要任何神经网络或写算子的背景。</p>
@@ -107,5 +116,7 @@ td,th{border:1px solid #bbb;padding:6px 12px;text-align:center}
 <h2 id="sec6">六、回到我们的场景</h2>
 <p>修好之后，搬 KV 的活可由 cube 自己干，省掉一整条"vector 代搬 + 中转仓 + 等待信号"流水（华为官方算子正是如此），相应场景预计还有 2~3 倍加速。在那之前 TileLang 算子只能走中转路，性能上限即当前版本。</p>
 
+<a href="#top" class="totop">↑</a>
+<script>(function(){var hs=[].slice.call(document.querySelectorAll('h2[id]')),ls=[].slice.call(document.querySelectorAll('.sidenav a'));function u(){var c=hs[0];hs.forEach(function(h){if(h.getBoundingClientRect().top<=130)c=h});ls.forEach(function(l){l.classList.toggle('active',l.getAttribute('href')==='#'+c.id)})}document.addEventListener('scroll',u,{passive:true});u()})();</script>
 </body>
 </html>
