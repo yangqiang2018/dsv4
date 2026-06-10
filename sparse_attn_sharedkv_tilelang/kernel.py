@@ -241,11 +241,6 @@ def build_sparse_attn_sharedkv(
         "kv_ub_multi": 64 * KB,  # [2*16,512]bf16 = 32KB -> 64..96KB
         "acc_o_ub": 96 * KB,  # [16,512]fp32 = 32KB -> 96..128KB
         "acc_s_half": 96 * KB,  # [32,128]bf16 = 8KB, aliases acc_o_ub head (see above)
-        # [32,128]fp32 broadcast scratch for V1's whole-tile sub; aliases
-        # acc_o_ub like acc_s_half (V1 uses it, V2 owns acc_o_ub, the V1-end
-        # barrier serializes them). 96..112K; overlaps acc_s_half too -- both
-        # are V1-internal and the cast (acc_s_half write) is AFTER sub/exp.
-        "brc_tmp": 96 * KB,
         "acc_s_ub_": 128 * KB,  # [2*32,128]fp32 = 32KB -> 128..160KB (1d ping-pong)
         "acc_s_ub": 160 * KB,  # [32,128]fp32 = 16KB -> 160..176KB
         # Per-row scalar vectors + index/mask scratch, packed from 176KB.
@@ -360,7 +355,6 @@ def build_sparse_attn_sharedkv(
                 # computes half (t-1)%2.
                 acc_s_ub_ = T.alloc_ub([2 * v_block, BI], accum_dtype)
                 acc_s_half = T.alloc_ub([v_block, BI], dtype)
-                brc_tmp = T.alloc_ub([v_block, BI], accum_dtype)
                 idx_int = T.alloc_ub([BI], indices_dtype)
                 idx_float = T.alloc_ub([BI], accum_dtype)
                 # Multi-row gather staging buffer, sub-tiled (S2b.0) into a
@@ -406,7 +400,6 @@ def build_sparse_attn_sharedkv(
                         acc_s_ub: ub_addr["acc_s_ub"],
                         acc_s_ub_: ub_addr["acc_s_ub_"],
                         acc_s_half: ub_addr["acc_s_half"],
-                        brc_tmp: ub_addr["brc_tmp"],
                         m_i: ub_addr["m_i"],
                         m_i_prev: ub_addr["m_i_prev"],
                         sumexp: ub_addr["sumexp"],
@@ -896,13 +889,12 @@ def build_sparse_attn_sharedkv(
                                                 ],
                                             )
 
-                                            # Whole-tile sub via row broadcast -- the
-                                            # AscendC Brcb+RowSub form: 32 per-row VEC
-                                            # issues become broadcast + one [32,128]
-                                            # sub (micro-bench: ~31ns/issue saved).
-                                            # All VEC, in-order, no flag change.
-                                            T.tile.broadcast(brc_tmp, m_i, axis=1)
-                                            T.tile.sub(acc_s_ub, acc_s_ub, brc_tmp)
+                                            for h_i in range(v_block):
+                                                T.tile.sub(
+                                                    acc_s_ub[h_i, :],
+                                                    acc_s_ub[h_i, :],
+                                                    m_i[h_i],
+                                                )
                                             T.tile.exp(acc_s_ub, acc_s_ub)
                                             T.reduce_sum(
                                                 acc_s_ub,
