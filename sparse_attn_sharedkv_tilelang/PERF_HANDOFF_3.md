@@ -85,9 +85,9 @@ pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill" -
   `acc_o`@0(64K)→`kv_ub_multi`@64(32K)→`acc_o_ub`@96(32K)→`acc_s_ub_`@128(**32K,[2,32,128]**)→`acc_s_ub`@160(16K)→`acc_s_half`@176(8K)→scalars@184(~2.3K);`acc_o_half`(epilogue,32K bf16)别名 `kv_ub_multi`@64(与 gather 时段不重叠)。峰值 186.3K。
 
 **小步拆分(各自独立 NPU 验,复刻 S2b.0 的"先布局后 overlap")**:
-- **1d-α — UB 重排 + `acc_s_ub_` ×2,parity 索引,不预取**:按上面新布局改 `ub_addr` + alloc `[2,v_block,BI]`,V1 里 `acc_s_ub_` 全部加 `pv1` 维(load/select/add 都在 half pv1)。**行为不变**(V1-end barrier 仍全 drain,两 half 在 barrier 下交替用),只验"186K 布局在硬件上不爆/不撞 + [2,…] 索引对"。flag eid 仍 0。
-- **1d-β — 预取 + ping-pong**:把 score-load 提前一拍(step t 预取 chunk t 的 ws_score 进 half t%2,需 chunk t 的 `SCORE_READY`),让它 ∥ V1(t-1) 算 half (t-1)%2 的 softmax;flag eid 改成跟 half 走(`set_flag("v","mte2",half)`/`wait_flag`),V1-end barrier 从"全 drain"退化成放 MTE2 预取穿过。**这步引竞态,最需小步 + NPU 验**。
-- ⚠️ β 动 step 边界 + 跨 chunk 时序,是 S2b 最 race-prone 的一步。
+- **1d-α ✅ 完成并 NPU 验证(2026-06-10,commits `3812768`+`e56f05b`+`69ba88c`)**:`acc_s_ub_` 扁平 `[2*v_block,BI]`(half=行 `pv*v_block..+v_block`),V1 全程只用 half pv1,行为不变。途中坐实三个事实(都已进 pitfalls skill):① Var 起点 2D slice 是 BufferLoad → fill 编译炸/add 走标量路静默错 → fill 整 buffer、add 逐行;② annotate 布局顶部不是自由空间,planner 把 reduce/sort 隐藏 tmp 排在 named 峰值之后,新布局须留 ≥13K 尾巴 → `acc_s_half` 别名进 `acc_o_ub` 头 8K(named 峰值 178.3K,尾 13.7K);③ 该别名靠 V1-end+V2-end barrier 串行,**β 保留 V1-end barrier 时安全,若动 barrier 必须先拆别名**。
+- **1d-β — 预取 + ping-pong(下一刀)**:重排 V1 = 先算 softmax(t-1)(score 已在 half (t-1)%2)→ 再 `wait_cross(SCORE_READY)` + load chunk t 进 half t%2,MTE2 load ∥ 后续 VEC;fill 改逐行(只清 half (t-1),别动预取 half);flag eid 跟 half 走(`set/wait_flag("v","mte2",half)`,WAR 隔 2 步配平,prologue 预 set 两个 eid、epilogue drain);prologue 在 t=0 先 load chunk0。V1-end barrier 保留(预取在 barrier 前已发、overlap 在 step 内完成;别名也因此保住)。
+- ⚠️ β 动 chunk 时序,是 S2b 最 race-prone 的一步;`wait_cross_flag` 是计数信号量,V1 每 step 恰好 1 次 SCORE_READY wait(共 NI 次)不变,只是挪位。
 
 之后还有 **S2b.2**(cube 侧 MM1/MM2 去 barrier,同理)。
 

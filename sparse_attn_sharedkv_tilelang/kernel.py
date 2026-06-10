@@ -607,6 +607,11 @@ def build_sparse_attn_sharedkv(
                                 # indexed by TIR parity). Step t: V0(t) gather, V1(t-1) softmax,
                                 # V2(t-2) merge. Guards give the prologue (t<2) / epilogue
                                 # (t>=NI). Forward-flag counts stay balanced at NI each.
+                                # S2b.1d-beta WAR pre-set: both acc_s_ub_ halves start
+                                # writable for the score prefetch (select(t-2) re-arms
+                                # half t%2 from step 2 on; drain after the loop).
+                                T.set_flag("v", "mte2", 0)
+                                T.set_flag("v", "mte2", 1)
                                 for t in range(NI_total + 2):
                                     # ---- V0(t): gather chunk t + build mask ----
                                     if t < NI_total:
@@ -801,25 +806,36 @@ def build_sparse_attn_sharedkv(
                                         T.wait_flag("mte3", "mte2", 0)
                                         T.wait_flag("mte3", "mte2", 1)
                                         T.set_cross_flag("MTE3", _FLAG_KV_READY)
+                                    # ---- S2b.1d-beta prologue: prefetch chunk 0 score ----
+                                    # Cold start: nothing to overlap yet, just land
+                                    # chunk 0 in half 0 so V1(0) finds it at t=1.
+                                    # Steady-state prefetch lives inside V1 below.
+                                    if t == 0:
+                                        T.wait_cross_flag(_FLAG_SCORE_READY)
+                                        T.wait_flag("v", "mte2", 0)
+                                        T.copy(
+                                            ws_score[
+                                                cid,
+                                                0,
+                                                vid * v_block : vid * v_block + v_block,
+                                                :,
+                                            ],
+                                            acc_s_ub_[0:v_block, :],
+                                        )
+                                        T.set_flag("mte2", "v", 0)
                                     # ---- V1(t-1): online softmax of chunk t-1 ----
                                     if t >= 1:
                                         if t <= NI_total:
                                             pv1 = (t - 1) % 2
-                                            # ---- additive mask (0 / -inf) ----
-                                            # S2b.1c: V1 is debarriered. Every op in
-                                            # this phase is VEC (all tile.* plus the
-                                            # UB->UB copies), so the hardware keeps them
-                                            # in program order with NO flag; only the 3
-                                            # cross-pipe edges below need a flag pair.
-                                            # Fill the WHOLE x2 buffer: a Var-start 2D
-                                            # slice [pv1*v_block:+v_block, :] parses as
-                                            # BufferLoad, which tile.fill rejects (no
-                                            # access_ptr). Filling both halves is
-                                            # behavior-identical in 1d-alpha (the idle
-                                            # half is drained); 1d-beta must NOT fill
-                                            # the prefetch half -- switch to per-row
-                                            # fill (single Var row = BufferRegion).
-                                            T.tile.fill(acc_s_ub_, 0.0)
+                                            # ---- masked score (S2b.1d-beta) ----
+                                            # Chunk t-1's score is ALREADY in half pv1
+                                            # (prefetched last step), so the old
+                                            # fill-0 + select-0/-inf + add(score)
+                                            # collapses into ONE select straight on the
+                                            # score (in-window -> score, out -> -inf),
+                                            # matching AscendC. RAW: the prefetch load
+                                            # (MTE2) wrote half pv1 last step.
+                                            T.wait_flag("mte2", "v", pv1)
                                             # select's selMask needs a whole
                                             # Buffer (it calls .access_ptr, which
                                             # a Var-indexed parity BufferRegion
@@ -834,55 +850,12 @@ def build_sparse_attn_sharedkv(
                                                     -T.infinity(accum_dtype),
                                                     "VSEL_TENSOR_SCALAR_MODE",
                                                 )
-                                            # WAR flag #1 (set): the selects (VEC) read
-                                            # acc_s_ub_ as the masked-in 0 values; the
-                                            # ws_score load (MTE2) below overwrites
-                                            # acc_s_ub_, so it must not run until the
-                                            # selects are done.
-                                            T.set_flag("v", "mte2", 0)
+                                            # WAR (eid = half): selects are done reading
+                                            # half pv1; the prefetch 2 steps ahead may
+                                            # overwrite it. Balanced by the pre-set pair
+                                            # before the loop + the drain after it.
+                                            T.set_flag("v", "mte2", pv1)
                                             T.copy(m_i, m_i_prev)
-
-                                            # ---- wait Q@K^T, online softmax ----
-                                            # wait_cross_flag blocks the execution
-                                            # stream until cube signals SCORE_READY, so
-                                            # the MTE2 load below cannot issue early --
-                                            # no barrier needed for the cross-core dep.
-                                            T.wait_cross_flag(_FLAG_SCORE_READY)
-                                            # WAR flag #1 (wait): hold the load until the
-                                            # selects finished reading acc_s_ub_.
-                                            T.wait_flag("v", "mte2", 0)
-                                            T.copy(
-                                                ws_score[
-                                                    cid,
-                                                    pv1,
-                                                    vid * v_block : vid * v_block
-                                                    + v_block,
-                                                    :,
-                                                ],
-                                                acc_s_ub_[
-                                                    pv1 * v_block : pv1 * v_block
-                                                    + v_block,
-                                                    :,
-                                                ],
-                                            )
-                                            # RAW flag #2: load (MTE2) writes acc_s_ub_,
-                                            # add (VEC) reads it.
-                                            T.set_flag("mte2", "v", 0)
-                                            T.wait_flag("mte2", "v", 0)
-                                            # Per-row add: a Var-start 2D slice of the
-                                            # x2 buffer parses as BufferLoad, and
-                                            # binary_op's BufferLoad src1 path is the
-                                            # SCALAR adds (forwards indices[0] only) --
-                                            # silently wrong. A single Var row
-                                            # [pv1*v_block+h_i, :] is a BufferRegion
-                                            # (same form as the select src0); 32 VEC
-                                            # adds run back-to-back in-order, no sync.
-                                            for h_i in T.serial(v_block):
-                                                T.tile.add(
-                                                    acc_s_ub[h_i, :],
-                                                    acc_s_ub[h_i, :],
-                                                    acc_s_ub_[pv1 * v_block + h_i, :],
-                                                )
                                             T.tile.mul(
                                                 acc_s_ub,
                                                 acc_s_ub,
@@ -938,6 +911,40 @@ def build_sparse_attn_sharedkv(
                                             # stashed above); V1 never touches acc_o, so
                                             # V1(t-1) and V2(t-2) run in one pipeline step
                                             # without racing on the accumulator.
+
+                                            # ---- prefetch chunk t score (1d-beta) ----
+                                            # Issued AFTER the whole softmax VEC chain:
+                                            # those ops are already in flight, so the
+                                            # wait_cross stall (cube finishing MM1(t))
+                                            # blocks only this load, and the MTE2 DMA
+                                            # then runs parallel to the cast (VEC) and
+                                            # ws_p write (MTE3) below. Putting it before
+                                            # the softmax would serialize MM1(t) latency
+                                            # in front of the VEC work -- the gap we are
+                                            # removing.
+                                            if t < NI_total:
+                                                T.wait_cross_flag(_FLAG_SCORE_READY)
+                                                # WAR (eid t%2): select(t-2) freed half
+                                                # t%2 (pre-set covers steps 1..2).
+                                                T.wait_flag("v", "mte2", t % 2)
+                                                T.copy(
+                                                    ws_score[
+                                                        cid,
+                                                        t % 2,
+                                                        vid * v_block : vid * v_block
+                                                        + v_block,
+                                                        :,
+                                                    ],
+                                                    acc_s_ub_[
+                                                        (t % 2) * v_block : (t % 2)
+                                                        * v_block
+                                                        + v_block,
+                                                        :,
+                                                    ],
+                                                )
+                                                # RAW (eid t%2): V1(t) selects from this
+                                                # half next step.
+                                                T.set_flag("mte2", "v", t % 2)
 
                                             # ---- cast P, publish for cube ----
                                             T.copy(acc_s_ub, acc_s_half)
@@ -1010,6 +1017,12 @@ def build_sparse_attn_sharedkv(
                                                 )
                                                 T.barrier_all()
 
+                                # 1d-beta drain: the last two selects set v->mte2
+                                # with no in-loop waiter (no prefetch in the final
+                                # 2 steps); consume them so no event leaks into
+                                # the next kernel launch (balances the pre-set).
+                                T.wait_flag("v", "mte2", 0)
+                                T.wait_flag("v", "mte2", 1)
                                 # ---- normalize and write back ----
                                 for h_i in range(v_block):
                                     T.barrier_all()
