@@ -975,15 +975,8 @@ def build_sparse_attn_sharedkv(
                                     if t >= 2:
                                         pv2 = (t - 2) % 2
                                         # ---- wait P@V (chunk c2), merge output ----
-                                        # S2b.1e: V2 debarriered. wait_cross_flag
-                                        # self-serializes, the mul/add chain is all
-                                        # VEC (auto in-order), and the per-head alpha
-                                        # reads are scalar-channel -- the only true
-                                        # cross-pipe deps are the ws_o load (MTE2) vs
-                                        # the adds (VEC), per pass. eid 2 avoids V1's
-                                        # mte2<->v / v<->mte2 events (eid 0/1; same
-                                        # (src,dst) pairs, ids stay disjoint).
                                         T.wait_cross_flag(_FLAG_PV_READY)
+                                        T.barrier_all()
                                         # Output recurrence acc_o = alpha*acc_o + O,
                                         # sub-tiled (S2b.0) into N_MERGE_PASS passes of
                                         # MERGE_HEADS heads so the P@V load fits the 32KB
@@ -996,12 +989,6 @@ def build_sparse_attn_sharedkv(
                                         # acc_o[hbase+h_i] (no Var-offset range slice).
                                         for mp in range(N_MERGE_PASS):
                                             hbase = mp * MERGE_HEADS
-                                            # WAR: pass 0's adds must finish reading
-                                            # acc_o_ub before pass 1's load overwrites
-                                            # it. Cross-step reuse needs no flag: the
-                                            # V1-end barrier drains everything.
-                                            if mp >= 1:
-                                                T.wait_flag("v", "mte2", 2)
                                             T.copy(
                                                 ws_o[
                                                     cid,
@@ -1014,22 +1001,21 @@ def build_sparse_attn_sharedkv(
                                                 ],
                                                 acc_o_ub,
                                             )
-                                            # RAW: load (MTE2) -> adds (VEC).
-                                            T.set_flag("mte2", "v", 2)
-                                            T.wait_flag("mte2", "v", 2)
+                                            T.barrier_all()
                                             for h_i in range(MERGE_HEADS):
+                                                T.barrier_all()
                                                 T.tile.mul(
                                                     acc_o[hbase + h_i, :],
                                                     acc_o[hbase + h_i, :],
                                                     alpha[pv2 * ub_len + hbase + h_i],
                                                 )
+                                                T.barrier_all()
                                                 T.tile.add(
                                                     acc_o[hbase + h_i, :],
                                                     acc_o[hbase + h_i, :],
                                                     acc_o_ub[h_i, :],
                                                 )
-                                            if mp == 0:
-                                                T.set_flag("v", "mte2", 2)
+                                                T.barrier_all()
 
                                 # 1d-beta drain: the last two selects set v->mte2
                                 # with no in-loop waiter (no prefetch in the final
