@@ -1002,6 +1002,13 @@ def build_sparse_attn_sharedkv(
                                                 acc_o_ub,
                                             )
                                             T.barrier_all()
+                                            # Per-head rescale stays scalar (alpha
+                                            # differs per row, no broadcast op), but
+                                            # the O-merge add is FUSED: one 16x512
+                                            # add replaces 16 per-row adds (micro-
+                                            # bench: 40ns vs 16x16ns; split costs 11x
+                                            # in issue overhead). Constant-start
+                                            # region slice -> BufferRegion, safe.
                                             for h_i in range(MERGE_HEADS):
                                                 T.barrier_all()
                                                 T.tile.mul(
@@ -1009,13 +1016,13 @@ def build_sparse_attn_sharedkv(
                                                     acc_o[hbase + h_i, :],
                                                     alpha[pv2 * ub_len + hbase + h_i],
                                                 )
-                                                T.barrier_all()
-                                                T.tile.add(
-                                                    acc_o[hbase + h_i, :],
-                                                    acc_o[hbase + h_i, :],
-                                                    acc_o_ub[h_i, :],
-                                                )
-                                                T.barrier_all()
+                                            T.barrier_all()
+                                            T.tile.add(
+                                                acc_o[hbase : hbase + MERGE_HEADS, :],
+                                                acc_o[hbase : hbase + MERGE_HEADS, :],
+                                                acc_o_ub,
+                                            )
+                                            T.barrier_all()
 
                                 # 1d-beta drain: the last two selects set v->mte2
                                 # with no in-loop waiter (no prefetch in the final
