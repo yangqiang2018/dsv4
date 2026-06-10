@@ -1054,18 +1054,22 @@ def build_sparse_attn_sharedkv(
                                                 acc_o_ub,
                                             )
                                             T.barrier_all()
-                                            # FUSE-V2: alpha row broadcast + fused
-                                            # mul/add via BufferRegion sub-tiles --
-                                            # 64 per-row issues -> 6 per pass. The
-                                            # [16,256] halves reuse the 16K brc_tmp.
-                                            for dh in range(2):
+                                            # FUSE-V2: binary_op regions are FLAT
+                                            # (offset+size), so only FULL-ROW
+                                            # sub-tiles are legal -- 8-row halves
+                                            # fit the 16K brc_tmp; the merge add is
+                                            # one whole 16x512 region per pass.
+                                            for rh in range(2):
                                                 T.tile.broadcast(
-                                                    _sub_tile(brc_tmp, 0, 16, 256),
+                                                    _sub_tile(brc_tmp, 0, 8, D),
                                                     tvm_tir.BufferRegion(
                                                         alpha,
                                                         [
                                                             tvm_ir.Range.from_min_extent(
-                                                                pv2 * ub_len + hbase, 16
+                                                                pv2 * ub_len
+                                                                + hbase
+                                                                + rh * 8,
+                                                                8,
                                                             )
                                                         ],
                                                     ),
@@ -1073,27 +1077,21 @@ def build_sparse_attn_sharedkv(
                                                 )
                                                 T.barrier_all()
                                                 T.tile.mul(
-                                                    _sub_tile2(
-                                                        acc_o, hbase, 16, dh * 256, 256
+                                                    _sub_tile(
+                                                        acc_o, hbase + rh * 8, 8, D
                                                     ),
-                                                    _sub_tile2(
-                                                        acc_o, hbase, 16, dh * 256, 256
+                                                    _sub_tile(
+                                                        acc_o, hbase + rh * 8, 8, D
                                                     ),
-                                                    _sub_tile(brc_tmp, 0, 16, 256),
+                                                    _sub_tile(brc_tmp, 0, 8, D),
                                                 )
                                                 T.barrier_all()
-                                                T.tile.add(
-                                                    _sub_tile2(
-                                                        acc_o, hbase, 16, dh * 256, 256
-                                                    ),
-                                                    _sub_tile2(
-                                                        acc_o, hbase, 16, dh * 256, 256
-                                                    ),
-                                                    _sub_tile2(
-                                                        acc_o_ub, 0, 16, dh * 256, 256
-                                                    ),
-                                                )
-                                                T.barrier_all()
+                                            T.tile.add(
+                                                _sub_tile(acc_o, hbase, MERGE_HEADS, D),
+                                                _sub_tile(acc_o, hbase, MERGE_HEADS, D),
+                                                acc_o_ub,
+                                            )
+                                            T.barrier_all()
 
                                 # 1d-beta drain: the last two selects set v->mte2
                                 # with no in-loop waiter (no prefetch in the final
