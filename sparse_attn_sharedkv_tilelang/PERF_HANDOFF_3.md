@@ -7,16 +7,18 @@
 
 ## 0. 一句话现状
 
-- **基线**:forward 双缓冲软件流水,decode+prefill 数值都对,**8K scfa_prefill 稳态 36.3ms / 18.9%**(`性能% = AscendC 6.87ms ÷ TileLang Duration × 100%`)。HEAD `bd56634`,main 干净。
+- **基线**:forward 双缓冲软件流水,decode+prefill 数值都对,**8K scfa_prefill 稳态 36.3ms / 18.9%**(`性能% = AscendC 6.87ms ÷ TileLang Duration × 100%`)。HEAD `0487312`,main 干净。
 - **profile 结论**:Duration 36.3ms,cube `aicore_time`≈21.2ms,vector `aiv_time`≈21.2ms,**跨核 gap≈15ms**。gap 的根因是**核内 `barrier_all` 把 pipe 抽干** → 每核串行 pipe-sum≈21ms,而 pipe-max 只≈7ms(vector mte2 7.1 / scalar 6.7 / vec 5.3 / mte3 2.8)。
 - **S2b 目标**:去核内 barrier、补 pipe 级 `set_flag/wait_flag`,让每核 MTE2∥VEC∥MTE3 并行 → 每核朝 ~7ms、Duration 朝 ~10ms(~60%+)。这是数量级的大头。
-- **进度**:S2b.0(UB sub-tile + un-alias)✅、S2b.1a(pipe-flag 原语 smoke)✅、S2b.1b(V0 gather 内部 ping-pong)✅ —— **三层机制全验通**。下一刀 **S2b.1c**(拆 V1 内部 barrier)是最复杂、最 race-prone 的一刀,设计已定稿,待实施。
+- **进度**:S2b.0(UB sub-tile + un-alias)✅、S2b.1a(pipe-flag 原语 smoke)✅、S2b.1b(V0 gather 内部 ping-pong)✅、**S2b.1c(拆 V1 内部 barrier)✅ decode+prefill 全 pass(NPU 2026-06-10,commit `0487312`)** —— **核内 debarrier 机制全验通**。下一刀 **S2b.1d**(跨 chunk score 预取 ping-pong)是 vector 21→~7ms 的真大头,设计见 §2/§9.4,**实施前先重算 §9.2 UB 预算**。
 
 ---
 
-## 1. ⭐ 立刻要做的（接手第一件事）：S2b.1c — 拆 V1 内部 barrier
+## 1. ✅ 已完成并验证：S2b.1c — 拆 V1 内部 barrier（commit `0487312`）
 
-**完整设计在 `PIPELINE_DESIGN.md §9.4`（连同 §9.1/§9.2 的机制和 UB 预算）。** 下面是可直接动手的实施清单。
+> **状态:decode + prefill 全 pass(NPU 2026-06-10)。核内 debarrier 的 flag 设计验通、不死锁。下一刀 S2b.1d 见 §2。** 下面这份清单保留作 flag 设计的事后参照(万一 1d 重排循环时要回看 V1 的 hazard 边)。
+
+**完整设计在 `PIPELINE_DESIGN.md §9.4`（连同 §9.1/§9.2 的机制和 UB 预算）。** 下面是已落地的实施清单。
 
 **目标**:去掉 V0-end barrier + V1 内部全部 `barrier_all`,让 V0 的 gather-MTE2 和 V1 的 VEC 在硬件上并行。V2 仍 `barrier_all`(它当 step 边界、drain 上一 chunk 的 VEC,这样**免掉跨 chunk WAR 的 ping-pong**)。
 
@@ -71,9 +73,11 @@ pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill" -
 
 ---
 
-## 2. 紧接着：S2b.1d — 跨 chunk score 预取 ping-pong（真大头）
+## 2. ⭐ 立刻要做（接手第一件事）：S2b.1d — 跨 chunk score 预取 ping-pong（真大头）
 
 **这才把 softmax-VEC ∥ MTE2、vector 21ms→~7ms。** 复刻 AscendC `inputBuff1` 32K×2 ping-pong(`ops-transformer/.../sparse_attn_sharedkv/op_kernel/arch32/sparse_attn_sharedkv_scfa_block_vector.h:461-484`)。
+
+**前置(1c 已铺好的地基)**:V1 已 debarrier、3 对 pipe flag(`v↔mte2` WAR / `mte2↔v` RAW / `v↔mte3` RAW)就位、V1-end barrier 还在当 step 边界。1d 要做的是把 `acc_s_ub_` 开 ×2、把 score-load 提前一拍(预取 c+1)让它 ∥ 当前 chunk 的 softmax-VEC,flag 的 eid 改成跟 ping-pong index 走(`set_flag("v","mte2",half)` / `wait_flag` 按 half)。⚠️ 提前 score-load 后,V1-end barrier 可能要从"全 drain"退化成只 drain VEC/MTE3、放 MTE2 预取穿过 —— 这步会动 step 边界语义,**最易引入跨 chunk 竞态,务必小步 + 每步 NPU 验**。
 
 - `acc_s_ub_` 开 ×2([2,v_block,BI] 或扁平),MTE2 预取 chunk c+1 的 ws_score 进 half (c+1)%2,**while** VEC 算 chunk c 的 softmax(half c%2)。配 `V_MTE2` 风格 flag(`set_flag("v","mte2",half)` / `wait_flag` 按 ping-pong index)。
 - ⚠️ **UB 预算**(§9.2,当前峰值 176K / 墙 192K):`acc_s_ub_` ×2 = +16K → 186K(还行,6K 余量)。`acc_o_ub` ×2 = +32K **会爆** → V2 的 ws_o 预取这步先不做,或挤别的。**实施前重算 §9.2 的 170K 预算表**。
@@ -91,17 +95,20 @@ pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill" -
 - `0fe56b7` **S2b.0b** merge sub-tile(2×16 头)+ un-alias 到 170K 布局。✅ **S2b.0 整刀完成**。
 - `ec9b282` **S2b.1a** pipe-flag smoke(gather MTE2→MTE3 换 flag)。✅
 - `1d1bcfc` **S2b.1b** V0 gather 内部 ping-pong(forward+back flag + 平衡 drain)+ 记录 `copy_ub_to_ub=VEC`。✅
-- `bd56634` **HEAD**,docs(S2b.1c/1d 设计)。
+- `bd56634` docs(S2b.1c/1d 设计)。
+- `0487312` **S2b.1c** debarrier V1 softmax(删 V0-end barrier + V1 全部 20 个 barrier,补 3 对 pipe flag:`v↔mte2` WAR / `mte2↔v` RAW / `v↔mte3` RAW;保留 V1-end barrier 当 step 边界)。✅ **decode+prefill 验证**。**最新稳回退点**。
+- **HEAD** = `0487312`(+ 本次 docs 更新)。
 
 ---
 
-## 4. 当前 kernel 结构（HEAD bd56634, kernel.py 要点）
+## 4. 当前 kernel 结构（HEAD `0487312`, kernel.py 要点）
 
 - 闭包常量:`GATHER_ROWS=16`/`N_GATHER_PASS=4`(gather 4×16 行)、`MERGE_HEADS=16`/`N_MERGE_PASS=2`(merge 2×16 头)、`ub_len`、`mask_w=32`。
 - UB 布局(§9.2,un-aliased,峰值 176K):`acc_o`@0(64K)、`acc_s_ub`@64K、`acc_s_ub_`@80K、`acc_s_half`@96K、scalars/masks/alpha@104K、`kv_ub_multi`@112K(32K,gather ping-pong [2*16,D])、`acc_o_ub`@144K(32K,merge [16,D])、`acc_o_half`@112K(别名 kv_ub_multi,epilogue-only)。
 - vector loop `for t in range(NI_total+2)`:V0(t) gather / V1(t-1) softmax / V2(t-2) merge,错位流水。cube loop `for t in range(NI_total+1)`:MM1(t) / MM2(t-1)。**注意:`for...in range()` 在 prim_func 里是 TIR loop,loop var 是 Var(不是 Python int)。**
-- V0 gather(ori+cmp)已 ping-pong:per pass `if gp>=2: wait_flag("mte3","mte2",pp)` → 16 行 gather(MTE2) → `set_flag/wait_flag("mte2","mte3",pp)` → write(MTE3) → `set_flag("mte3","mte2",pp)`;loop 后 drain `wait_flag("mte3","mte2",0/1)` + `barrier_all`(V0-end,S2b.1c 要删) + `set_cross_flag(MTE3,KV_READY)`。
-- V1 / V2 仍全 `barrier_all`(待 S2b.1c / 之后拆)。
+- V0 gather(ori+cmp)已 ping-pong:per pass `if gp>=2: wait_flag("mte3","mte2",pp)` → 16 行 gather(MTE2) → `set_flag/wait_flag("mte2","mte3",pp)` → write(MTE3) → `set_flag("mte3","mte2",pp)`;loop 后 drain `wait_flag("mte3","mte2",0/1)` + `set_cross_flag(MTE3,KV_READY)`。**V0-end barrier 已删(S2b.1c)** → gather MTE2/MTE3 能流进 V1 的 VEC 窗口。
+- **V1 已 debarrier(S2b.1c)**:内部零 `barrier_all`,3 对 pipe flag(`set_flag/wait_flag`):`v→mte2`(WAR,select 读 `acc_s_ub_` → load 覆写)、`mte2→v`(RAW,load → add)、`v→mte3`(RAW,cast → write ws_p),全 eid 0;`wait_cross_flag(SCORE_READY)` 自身 serialize 保留;**末尾保留一个 `barrier_all` 当 step 边界**(drain 上一 chunk,使单缓冲 scratch 免跨 chunk ping-pong)。
+- V2 仍全 `barrier_all`(待 S2b.2 或被 1d 触及时再拆)。
 
 ---
 
@@ -136,5 +143,7 @@ pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill" -
 3. **tile `binary_op` 标量第三参(BufferLoad)只转发 `indices[0]`**:2D 标量 `buf[a,b]` 会丢 `b`、读成 `buf.flat[a]`。per-element 标量来源用**扁平 1D** buffer + 单个计算索引(alpha 就是这么修的)。
 4. **`[2,…]` parity buffer 喂不同 op 的 operand 类型规则**(gemm_v0 收裸冒号 BufferRegion、select 的 selMask 要整 Buffer、compare/and 收 BufferRegion)。
 5. (本文件 §1 的事实)`copy` 的 pipe:gm→ub=MTE2 / ub→gm=MTE3 / ub→ub=VEC;tile.*=VEC;同 pipe 自动 in-order。
+
+**S2b.1c 验通后(2026-06-10)新沉淀进 `tilelang-perf` skill「手段 3:核内 debarrier」**:`barrier_all` 是全 pipe drain → 单核 pipe-sum;删它、只在跨 pipe 真依赖补 `set_flag/wait_flag`(同 pipe 自动 in-order)→ pipe-max。含 hazard 机械判定法、`wait_cross_flag` 自身 serialize(后面不用补 barrier)、渐进式 debarrier(先保留 step-boundary barrier 免跨 chunk ping-pong)。perf 数字栏待 S2b.1d 回填。
 
 > 这些 skill 是给"写/review TileLang Ascend kernel"用的,新 session 写 flag 时 skill 会自动触发,照着来。
