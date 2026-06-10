@@ -802,14 +802,15 @@ def build_sparse_attn_sharedkv(
                                             # UB->UB copies), so the hardware keeps them
                                             # in program order with NO flag; only the 3
                                             # cross-pipe edges below need a flag pair.
-                                            T.tile.fill(
-                                                acc_s_ub_[
-                                                    pv1 * v_block : pv1 * v_block
-                                                    + v_block,
-                                                    :,
-                                                ],
-                                                0.0,
-                                            )
+                                            # Fill the WHOLE x2 buffer: a Var-start 2D
+                                            # slice [pv1*v_block:+v_block, :] parses as
+                                            # BufferLoad, which tile.fill rejects (no
+                                            # access_ptr). Filling both halves is
+                                            # behavior-identical in 1d-alpha (the idle
+                                            # half is drained); 1d-beta must NOT fill
+                                            # the prefetch half -- switch to per-row
+                                            # fill (single Var row = BufferRegion).
+                                            T.tile.fill(acc_s_ub_, 0.0)
                                             # select's selMask needs a whole
                                             # Buffer (it calls .access_ptr, which
                                             # a Var-indexed parity BufferRegion
@@ -859,15 +860,20 @@ def build_sparse_attn_sharedkv(
                                             # add (VEC) reads it.
                                             T.set_flag("mte2", "v", 0)
                                             T.wait_flag("mte2", "v", 0)
-                                            T.tile.add(
-                                                acc_s_ub,
-                                                acc_s_ub,
-                                                acc_s_ub_[
-                                                    pv1 * v_block : pv1 * v_block
-                                                    + v_block,
-                                                    :,
-                                                ],
-                                            )
+                                            # Per-row add: a Var-start 2D slice of the
+                                            # x2 buffer parses as BufferLoad, and
+                                            # binary_op's BufferLoad src1 path is the
+                                            # SCALAR adds (forwards indices[0] only) --
+                                            # silently wrong. A single Var row
+                                            # [pv1*v_block+h_i, :] is a BufferRegion
+                                            # (same form as the select src0); 32 VEC
+                                            # adds run back-to-back in-order, no sync.
+                                            for h_i in T.serial(v_block):
+                                                T.tile.add(
+                                                    acc_s_ub[h_i, :],
+                                                    acc_s_ub[h_i, :],
+                                                    acc_s_ub_[pv1 * v_block + h_i, :],
+                                                )
                                             T.tile.mul(
                                                 acc_s_ub,
                                                 acc_s_ub,
