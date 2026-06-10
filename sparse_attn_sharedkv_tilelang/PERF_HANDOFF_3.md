@@ -79,9 +79,15 @@ pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill" -
 
 **前置(1c 已铺好的地基)**:V1 已 debarrier、3 对 pipe flag(`v↔mte2` WAR / `mte2↔v` RAW / `v↔mte3` RAW)就位、V1-end barrier 还在当 step 边界。1d 要做的是把 `acc_s_ub_` 开 ×2、把 score-load 提前一拍(预取 c+1)让它 ∥ 当前 chunk 的 softmax-VEC,flag 的 eid 改成跟 ping-pong index 走(`set_flag("v","mte2",half)` / `wait_flag` 按 half)。⚠️ 提前 score-load 后,V1-end barrier 可能要从"全 drain"退化成只 drain VEC/MTE3、放 MTE2 预取穿过 —— 这步会动 step 边界语义,**最易引入跨 chunk 竞态,务必小步 + 每步 NPU 验**。
 
-- `acc_s_ub_` 开 ×2([2,v_block,BI] 或扁平),MTE2 预取 chunk c+1 的 ws_score 进 half (c+1)%2,**while** VEC 算 chunk c 的 softmax(half c%2)。配 `V_MTE2` 风格 flag(`set_flag("v","mte2",half)` / `wait_flag` 按 ping-pong index)。
-- ⚠️ **UB 预算**(§9.2,当前峰值 176K / 墙 192K):`acc_s_ub_` ×2 = +16K → 186K(还行,6K 余量)。`acc_o_ub` ×2 = +32K **会爆** → V2 的 ws_o 预取这步先不做,或挤别的。**实施前重算 §9.2 的 170K 预算表**。
-- 这步要重排 V1 的循环结构(把 score-load 提前一拍),比 S2b.1c 更动调度,**务必小步 + 每步 NPU 验**。
+- `acc_s_ub_` 开 ×2([2,v_block,BI]),MTE2 预取 chunk c+1 的 ws_score 进 half (c+1)%2,**while** VEC 算 chunk c 的 softmax(half c%2)。配 `V_MTE2` 风格 flag(`set_flag("v","mte2",half)` / `wait_flag` 按 ping-pong index)。
+
+**✅ UB 预算已重算(本 session,kernel.py `ub_addr` 实测 offset)**:当前峰值 **176K**(acc_o 64K + acc_s_ub 16K + acc_s_ub_ 16K + acc_s_half 8K + scalars ~2.3K + kv_ub_multi 32K + acc_o_ub 32K)。`acc_s_ub_` ×2 = +16K → **峰值 186.3K < 192K(~5.7K 余量)✓**;`acc_o_ub` ×2 = +32K → 218K **爆墙 ✗** ⇒ **1d 只预取 score,`acc_o_ub` 维持单缓冲**(V2 ws_o 预取不做)。但 `acc_s_ub_` 现在 80–96K、夹在 acc_s_half@96K 与 kv_ub_multi@112K 之间,扩 32K **不能原地长,必须重排 `ub_addr`**。建议新布局(大 buffer 先放):
+  `acc_o`@0(64K)→`kv_ub_multi`@64(32K)→`acc_o_ub`@96(32K)→`acc_s_ub_`@128(**32K,[2,32,128]**)→`acc_s_ub`@160(16K)→`acc_s_half`@176(8K)→scalars@184(~2.3K);`acc_o_half`(epilogue,32K bf16)别名 `kv_ub_multi`@64(与 gather 时段不重叠)。峰值 186.3K。
+
+**小步拆分(各自独立 NPU 验,复刻 S2b.0 的"先布局后 overlap")**:
+- **1d-α — UB 重排 + `acc_s_ub_` ×2,parity 索引,不预取**:按上面新布局改 `ub_addr` + alloc `[2,v_block,BI]`,V1 里 `acc_s_ub_` 全部加 `pv1` 维(load/select/add 都在 half pv1)。**行为不变**(V1-end barrier 仍全 drain,两 half 在 barrier 下交替用),只验"186K 布局在硬件上不爆/不撞 + [2,…] 索引对"。flag eid 仍 0。
+- **1d-β — 预取 + ping-pong**:把 score-load 提前一拍(step t 预取 chunk t 的 ws_score 进 half t%2,需 chunk t 的 `SCORE_READY`),让它 ∥ V1(t-1) 算 half (t-1)%2 的 softmax;flag eid 改成跟 half 走(`set_flag("v","mte2",half)`/`wait_flag`),V1-end barrier 从"全 drain"退化成放 MTE2 预取穿过。**这步引竞态,最需小步 + NPU 验**。
+- ⚠️ β 动 step 边界 + 跨 chunk 时序,是 S2b 最 race-prone 的一步。
 
 之后还有 **S2b.2**(cube 侧 MM1/MM2 去 barrier,同理)。
 
