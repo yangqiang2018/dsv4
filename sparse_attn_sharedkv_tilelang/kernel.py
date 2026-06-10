@@ -218,23 +218,31 @@ def build_sparse_attn_sharedkv(
     l0c_addr = {"acc_s_l0c": 0, "acc_o_l0c": 0}  # disjoint phases ⇒ alias
     # UB (192KB). acc_s_* are [32,128]. S2b.0b sub-tiles the two 64KB chunk
     # buffers into 32KB tiles: kv_ub_multi (gather) and acc_o_ub (P@V merge)
-    # are now SEPARATE 32KB buffers (un-aliased, so S2b.1 can keep both live
-    # without barriers); acc_o_half (epilogue cast) aliases kv_ub_multi.
-    # Peak = 176KB (16KB margin).
+    # are SEPARATE 32KB buffers (un-aliased, both live without barriers);
+    # acc_o_half (epilogue cast) aliases kv_ub_multi. S2b.1d-alpha doubles
+    # acc_s_ub_ to a [2*v_block, BI] = 32KB flat ping-pong (halves
+    # pv*v_block..+v_block, same flat form as alpha / ws_kv rows) so 1d-beta
+    # can prefetch the next chunk's score into the idle half; that no longer
+    # fits between acc_s_half and kv_ub_multi, forcing this full repack.
+    # Peak = 186.3KB (5.7KB margin). acc_o_ub stays SINGLE-buffered: x2 = +32KB
+    # -> 218KB blows the wall (matches AscendC, which ping-pongs the score
+    # inputBuff1 32K*2 but NOT the output accumulator).
     ub_addr = {
         "acc_o": 0,  # [32,512]fp32 = 64KB -> 0..64KB
-        "acc_s_ub": 64 * KB,  # [32,128]fp32 = 16KB -> 64..80KB
-        "acc_s_ub_": 80 * KB,  # [32,128]fp32 = 16KB -> 80..96KB
-        "acc_s_half": 96 * KB,  # [32,128]bf16 = 8KB -> 96..104KB
-        # Per-row scalar vectors + index/mask scratch, packed from 104KB.
-        "m_i": 104 * KB,
-        "m_i_prev": 104 * KB + 128,
-        "sumexp": 104 * KB + 256,
-        "sumexp_i_ub": 104 * KB + 384,
-        "sinks_ub": 104 * KB + 512,
-        "lse_ub": 104 * KB + 640,
-        "idx_int": 104 * KB + 768,  # [128]int32 = 512B
-        "idx_float": 104 * KB + 1280,  # [128]fp32 = 512B
+        "kv_ub_multi": 64 * KB,  # [2*16,512]bf16 = 32KB -> 64..96KB
+        "acc_o_ub": 96 * KB,  # [16,512]fp32 = 32KB -> 96..128KB
+        "acc_s_ub_": 128 * KB,  # [2*32,128]fp32 = 32KB -> 128..160KB (1d ping-pong)
+        "acc_s_ub": 160 * KB,  # [32,128]fp32 = 16KB -> 160..176KB
+        "acc_s_half": 176 * KB,  # [32,128]bf16 = 8KB -> 176..184KB
+        # Per-row scalar vectors + index/mask scratch, packed from 184KB.
+        "m_i": 184 * KB,
+        "m_i_prev": 184 * KB + 128,
+        "sumexp": 184 * KB + 256,
+        "sumexp_i_ub": 184 * KB + 384,
+        "sinks_ub": 184 * KB + 512,
+        "lse_ub": 184 * KB + 640,
+        "idx_int": 184 * KB + 768,  # [128]int32 = 512B
+        "idx_float": 184 * KB + 1280,  # [128]fp32 = 512B
         # Mask double buffer [2, mask_w]: row padded to mask_w (=32B) so BOTH
         # parity rows are 32B aligned. A [2, BI//8] buffer's row stride is 16B,
         # so the odd-parity row mask_ub[1,:] starts at +16B -- not 32B aligned
@@ -242,8 +250,8 @@ def build_sparse_attn_sharedkv(
         # by the VEC instruction is not aligned" on device). parity = chunk % 2
         # is a TIR Var (real TIR loop), so the row is picked by Var index, only
         # the low BI//8 bytes of each row carry the mask.
-        "mask_ub": 104 * KB + 1792,  # [2,32]uint8 = 64B, rows 32B aligned
-        "mask_ub_2": 104 * KB + 1856,  # [2,32]uint8 = 64B (V0 AND scratch)
+        "mask_ub": 184 * KB + 1792,  # [2,32]uint8 = 64B, rows 32B aligned
+        "mask_ub_2": 184 * KB + 1856,  # [2,32]uint8 = 64B (V0 AND scratch)
         # alpha[2*ub_len]fp32 = 256B: the V1->V2 rescale-factor handoff, double
         # buffered by chunk parity -- V2(t-2) reads slot (t-2)%2 while V1(t-1)
         # writes slot (t-1)%2. FLAT 1D (not [2,ub_len]): the per-head rescale is
@@ -251,11 +259,9 @@ def build_sparse_attn_sharedkv(
         # binary_op scalar path forwards only indices[0] to the intrinsic -- a
         # 2D alpha[pv, h_i] would silently drop h_i and read alpha.flat[pv] for
         # every head. A single flat index keeps the whole offset in indices[0].
-        "alpha": 104 * KB + 2048,  # [2*ub_len]fp32 = 256B -> ..2304
-        "mask_sel": 104 * KB + 2304,  # [32]uint8 whole buffer for select selMask
-        "kv_ub_multi": 112 * KB,  # [2*16,512]bf16 = 32KB -> 112..144KB
-        "acc_o_ub": 144 * KB,  # [16,512]fp32 = 32KB -> 144..176KB
-        "acc_o_half": 112 * KB,  # [32,512]bf16 = 32KB, aliases kv_ub_multi (epilogue)
+        "alpha": 184 * KB + 2048,  # [2*ub_len]fp32 = 256B -> ..2304
+        "mask_sel": 184 * KB + 2304,  # [32]uint8 whole buffer for select selMask
+        "acc_o_half": 64 * KB,  # [32,512]bf16 = 32KB, aliases kv_ub_multi (epilogue)
     }
 
     # Output 0: attn_out [total_tokens, n_heads, D] (dtype)
@@ -331,7 +337,14 @@ def build_sparse_attn_sharedkv(
                 # alpha.flat[pv]. The flat index keeps the offset in indices[0].
                 alpha = T.alloc_ub([2 * ub_len], accum_dtype)
                 acc_s_ub = T.alloc_ub([v_block, BI], accum_dtype)
-                acc_s_ub_ = T.alloc_ub([v_block, BI], accum_dtype)
+                # S2b.1d-alpha: [2*v_block, BI] flat ping-pong (halves
+                # pv*v_block .. +v_block). 1d-alpha only repacks + doubles the
+                # buffer; V1 still uses half pv1=(t-1)%2 throughout, so behavior
+                # is unchanged under the V1-end barrier (the two halves are used
+                # by alternating chunks, fully drained between them). 1d-beta
+                # will prefetch chunk t's score into half t%2 while V1(t-1)
+                # computes half (t-1)%2.
+                acc_s_ub_ = T.alloc_ub([2 * v_block, BI], accum_dtype)
                 acc_s_half = T.alloc_ub([v_block, BI], dtype)
                 idx_int = T.alloc_ub([BI], indices_dtype)
                 idx_float = T.alloc_ub([BI], accum_dtype)
@@ -789,7 +802,14 @@ def build_sparse_attn_sharedkv(
                                             # UB->UB copies), so the hardware keeps them
                                             # in program order with NO flag; only the 3
                                             # cross-pipe edges below need a flag pair.
-                                            T.tile.fill(acc_s_ub_, 0.0)
+                                            T.tile.fill(
+                                                acc_s_ub_[
+                                                    pv1 * v_block : pv1 * v_block
+                                                    + v_block,
+                                                    :,
+                                                ],
+                                                0.0,
+                                            )
                                             # select's selMask needs a whole
                                             # Buffer (it calls .access_ptr, which
                                             # a Var-indexed parity BufferRegion
@@ -800,7 +820,7 @@ def build_sparse_attn_sharedkv(
                                                 T.tile.select(
                                                     acc_s_ub[h_i, :],
                                                     mask_sel,
-                                                    acc_s_ub_[h_i, :],
+                                                    acc_s_ub_[pv1 * v_block + h_i, :],
                                                     -T.infinity(accum_dtype),
                                                     "VSEL_TENSOR_SCALAR_MODE",
                                                 )
@@ -829,7 +849,11 @@ def build_sparse_attn_sharedkv(
                                                     + v_block,
                                                     :,
                                                 ],
-                                                acc_s_ub_,
+                                                acc_s_ub_[
+                                                    pv1 * v_block : pv1 * v_block
+                                                    + v_block,
+                                                    :,
+                                                ],
                                             )
                                             # RAW flag #2: load (MTE2) writes acc_s_ub_,
                                             # add (VEC) reads it.
@@ -838,7 +862,11 @@ def build_sparse_attn_sharedkv(
                                             T.tile.add(
                                                 acc_s_ub,
                                                 acc_s_ub,
-                                                acc_s_ub_,
+                                                acc_s_ub_[
+                                                    pv1 * v_block : pv1 * v_block
+                                                    + v_block,
+                                                    :,
+                                                ],
                                             )
                                             T.tile.mul(
                                                 acc_s_ub,
