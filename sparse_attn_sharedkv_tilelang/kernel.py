@@ -41,6 +41,22 @@ padding: TND passes ``q_prefix[b] = cu_seqlens_q[b]``, BSND passes
 
 import tilelang
 from tilelang import language as T
+from tvm import ir as tvm_ir
+from tvm import tir as tvm_tir
+
+
+def _sub_tile(buf, row0, rows, cols):
+    """Explicit tvm BufferRegion for a sub-tile (subscript slices collapse to
+    BufferLoad and tile.* rejects them; binary_op/select accept BufferRegion,
+    offset from region mins, constant or Var)."""
+    return tvm_tir.BufferRegion(
+        buf,
+        [
+            tvm_ir.Range.from_min_extent(row0, rows),
+            tvm_ir.Range.from_min_extent(0, cols),
+        ],
+    )
+
 
 # Disable AND clear TileLang's on-disk kernel cache. disable_cache()
 # alone is not enough: the JIT cache key tracks the prim_func signature
@@ -270,6 +286,12 @@ def build_sparse_attn_sharedkv(
         # every head. A single flat index keeps the whole offset in indices[0].
         "alpha": 176 * KB + 2048,  # [2*ub_len]fp32 = 256B -> ..2304
         "mask_sel": 176 * KB + 2304,  # [32]uint8 whole buffer for select selMask
+        # FUSE-V1: [32,16]u8 = 512B mask, mask_sel row broadcast x32 so ONE
+        # 4096-elem select covers the whole tile (contiguous bitstream).
+        "mask_full": 176 * KB + 2336,
+        # FUSE-V1: [32,128]f32 broadcast scratch, aliases acc_o_ub head
+        # (V1-internal; V1-end barrier serializes V2; cast comes after).
+        "brc_tmp": 96 * KB,
         "acc_o_half": 64 * KB,  # [32,512]bf16 = 32KB, aliases kv_ub_multi (epilogue)
     }
 
@@ -355,6 +377,8 @@ def build_sparse_attn_sharedkv(
                 # computes half (t-1)%2.
                 acc_s_ub_ = T.alloc_ub([2 * v_block, BI], accum_dtype)
                 acc_s_half = T.alloc_ub([v_block, BI], dtype)
+                brc_tmp = T.alloc_ub([v_block, BI], accum_dtype)
+                mask_full = T.alloc_ub([v_block, BI // 8], "uint8")
                 idx_int = T.alloc_ub([BI], indices_dtype)
                 idx_float = T.alloc_ub([BI], accum_dtype)
                 # Multi-row gather staging buffer, sub-tiled (S2b.0) into a
@@ -400,6 +424,8 @@ def build_sparse_attn_sharedkv(
                         acc_s_ub: ub_addr["acc_s_ub"],
                         acc_s_ub_: ub_addr["acc_s_ub_"],
                         acc_s_half: ub_addr["acc_s_half"],
+                        brc_tmp: ub_addr["brc_tmp"],
+                        mask_full: ub_addr["mask_full"],
                         m_i: ub_addr["m_i"],
                         m_i_prev: ub_addr["m_i_prev"],
                         sumexp: ub_addr["sumexp"],
@@ -842,14 +868,27 @@ def build_sparse_attn_sharedkv(
                                             # lacks), so copy chunk t-1's mask
                                             # row into the whole mask_sel first.
                                             T.copy(mask_ub[pv1, :], mask_sel)
-                                            for h_i in T.serial(v_block):
-                                                T.tile.select(
-                                                    acc_s_ub[h_i, :],
-                                                    mask_sel,
-                                                    acc_s_ub_[pv1 * v_block + h_i, :],
-                                                    -T.infinity(accum_dtype),
-                                                    "VSEL_TENSOR_SCALAR_MODE",
-                                                )
+                                            # FUSE-V1: replicate the 16B row mask x32
+                                            # (one broadcast) -> contiguous 4096-bit
+                                            # mask -> ONE whole-tile select replaces
+                                            # 32 per-row issues.
+                                            T.tile.broadcast(
+                                                mask_full,
+                                                _sub_tile(mask_sel, 0, 1, BI // 8),
+                                                axis=0,
+                                            )
+                                            T.tile.select(
+                                                acc_s_ub,
+                                                mask_full,
+                                                _sub_tile(
+                                                    acc_s_ub_,
+                                                    pv1 * v_block,
+                                                    v_block,
+                                                    BI,
+                                                ),
+                                                -T.infinity(accum_dtype),
+                                                "VSEL_TENSOR_SCALAR_MODE",
+                                            )
                                             # WAR (eid = half): selects are done reading
                                             # half pv1; the prefetch 2 steps ahead may
                                             # overwrite it. Balanced by the pre-set pair
@@ -889,12 +928,8 @@ def build_sparse_attn_sharedkv(
                                                 ],
                                             )
 
-                                            for h_i in range(v_block):
-                                                T.tile.sub(
-                                                    acc_s_ub[h_i, :],
-                                                    acc_s_ub[h_i, :],
-                                                    m_i[h_i],
-                                                )
+                                            T.tile.broadcast(brc_tmp, m_i, axis=1)
+                                            T.tile.sub(acc_s_ub, acc_s_ub, brc_tmp)
                                             T.tile.exp(acc_s_ub, acc_s_ub)
                                             T.reduce_sum(
                                                 acc_s_ub,
