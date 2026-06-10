@@ -80,8 +80,7 @@ def main():
     results = {}
 
     def noise(a, b, row, blk, msk, Src):
-        for _ in T.serial(REPS):
-            pass
+        pass  # shell-only baseline (launch + init/teardown)
 
     def fused_mul(a, b, row, blk, msk, Src):
         for _ in T.serial(REPS):
