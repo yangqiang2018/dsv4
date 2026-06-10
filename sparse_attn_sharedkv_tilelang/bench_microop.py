@@ -22,8 +22,8 @@ tilelang.cache.clear_cache()
 
 H, W = 32, 128  # acc_s tile shape, fp32
 D = 512
-REPS = 200  # in-kernel repeats per launch
-LAUNCH = 20  # timed launches; first 5 warm up
+REPS = 2000  # in-kernel repeats per launch (TIR loop)
+LAUNCH = 5  # timed launches; first 5 warm up
 NOISE_KEY = "noise"
 
 
@@ -80,44 +80,44 @@ def main():
     results = {}
 
     def noise(a, b, row, blk, msk, Src):
-        for _ in range(REPS):
+        for _ in T.serial(REPS):
             pass
 
     def fused_mul(a, b, row, blk, msk, Src):
-        for _ in range(REPS):
+        for _ in T.serial(REPS):
             T.tile.mul(a, a, b)  # 1 op covers H*W
 
     def split_mul(a, b, row, blk, msk, Src):
-        for _ in range(REPS):
+        for _ in T.serial(REPS):
             for h in range(H):
                 T.tile.mul(a[h, :], a[h, :], b[h, :])  # H ops
 
     def split_mul_scalar(a, b, row, blk, msk, Src):
-        for _ in range(REPS):
+        for _ in T.serial(REPS):
             for h in range(H):
                 T.tile.mul(a[h, :], a[h, :], b[h, 0])  # H scalar-muls (V2 form)
 
     def per_row_select(a, b, row, blk, msk, Src):
-        for _ in range(REPS):
+        for _ in T.serial(REPS):
             for h in range(H):
                 T.tile.select(a[h, :], msk, b[h, :], -1.0, "VSEL_TENSOR_SCALAR_MODE")
 
     def dma_rows(a, b, row, blk, msk, Src):
-        for _ in range(REPS):
+        for _ in T.serial(REPS):
             for r in range(16):
                 T.copy(Src[r, :], blk[r, :])  # 16 x 2KB DMA
 
     def dma_block(a, b, row, blk, msk, Src):
-        for _ in range(REPS):
+        for _ in T.serial(REPS):
             T.copy(Src[0:16, :], blk)  # 1 x 32KB DMA
 
     def flag_pair(a, b, row, blk, msk, Src):
-        for _ in range(REPS):
+        for _ in T.serial(REPS):
             T.set_flag("v", "mte3", 0)
             T.wait_flag("v", "mte3", 0)
 
     def barrier(a, b, row, blk, msk, Src):
-        for _ in range(REPS):
+        for _ in T.serial(REPS):
             T.barrier_all()
 
     cases = [
