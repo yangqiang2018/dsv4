@@ -86,8 +86,9 @@ pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill" -
 
 **小步拆分(各自独立 NPU 验,复刻 S2b.0 的"先布局后 overlap")**:
 - **1d-α ✅ 完成并 NPU 验证(2026-06-10,commits `3812768`+`e56f05b`+`69ba88c`)**:`acc_s_ub_` 扁平 `[2*v_block,BI]`(half=行 `pv*v_block..+v_block`),V1 全程只用 half pv1,行为不变。途中坐实三个事实(都已进 pitfalls skill):① Var 起点 2D slice 是 BufferLoad → fill 编译炸/add 走标量路静默错 → fill 整 buffer、add 逐行;② annotate 布局顶部不是自由空间,planner 把 reduce/sort 隐藏 tmp 排在 named 峰值之后,新布局须留 ≥13K 尾巴 → `acc_s_half` 别名进 `acc_o_ub` 头 8K(named 峰值 178.3K,尾 13.7K);③ 该别名靠 V1-end+V2-end barrier 串行,**β 保留 V1-end barrier 时安全,若动 barrier 必须先拆别名**。
-- **1d-β — 预取 + ping-pong(下一刀)**:重排 V1 = 先算 softmax(t-1)(score 已在 half (t-1)%2)→ 再 `wait_cross(SCORE_READY)` + load chunk t 进 half t%2,MTE2 load ∥ 后续 VEC;fill 改逐行(只清 half (t-1),别动预取 half);flag eid 跟 half 走(`set/wait_flag("v","mte2",half)`,WAR 隔 2 步配平,prologue 预 set 两个 eid、epilogue drain);prologue 在 t=0 先 load chunk0。V1-end barrier 保留(预取在 barrier 前已发、overlap 在 step 内完成;别名也因此保住)。
-- ⚠️ β 动 chunk 时序,是 S2b 最 race-prone 的一步;`wait_cross_flag` 是计数信号量,V1 每 step 恰好 1 次 SCORE_READY wait(共 NI 次)不变,只是挪位。
+- **1d-β ✅ 完成并 NPU 验证(2026-06-10,commit `d9d6552`)**:预取 chunk t score 进 half t%2 ∥ V1(t-1) softmax;fill+select+逐行 add 塌缩成单 select 直接套 score;稳态预取放 softmax 链后/cast 前;WAR `v↔mte2` eid=half(pre-set ×2 + drain ×2),RAW `mte2↔v` eid=half;V1-end barrier 保留。decode+prefill 全 pass。
+- **1d 后 profile(8K scfa_prefill 稳态,2026-06-10)**:Duration ~36.9ms(基线 36.3 持平),cube `aicore_time`≈22.6ms,vector `aiv_time`≈22.5ms,gap≈14ms;vector pipe:vec 6.49 / scalar 9.4 / mte2 8.9 / mte3 4.4(pipe-sum≈29ms > aiv_time 22.5 ⇒ **V0/V1 的 pipe 内并行已生效**,但 V2 仍全 barrier、把整体拖回 pipe-sum)。cube_util 61.9%。**结论:1d 的机制工作了,但 Duration 不动——剩余大头是 V2 merge 的 per-头 barrier(≈65 barrier/chunk:2 pass × 32 头 × mul+add)和 cube 侧 MM1/MM2 barrier**。
+- **下一刀 S2b.1e — debarrier V2 merge**:删 V2 内全部 barrier;`wait_cross(PV_READY)` 自 serialize 保留;每 pass `load ws_o→acc_o_ub`(MTE2)→`set/wait("mte2","v",eid)`→32 头 mul/add(VEC,自动 in-order);pass 间 acc_o_ub 复用 WAR:add 读完 `set("v","mte2")`,下 pass load 前 wait。⚠️ eid 别撞 V1:V1 已占 `mte2↔v` 0/1、`v↔mte2` 0/1 ⇒ **V2 用 eid 2**(同 (src,dst) 不同 eid 独立)。acc_s_half 别名 acc_o_ub 头 8K 仍安全:V2 的 add(VEC)与下一 step V1 的 select/cast 同 pipe in-order,V1-end barrier 仍隔 chunk。
 
 之后还有 **S2b.2**(cube 侧 MM1/MM2 去 barrier,同理)。
 
