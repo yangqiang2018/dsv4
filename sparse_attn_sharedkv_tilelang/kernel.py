@@ -874,7 +874,14 @@ def build_sparse_attn_sharedkv(
                                             # 32 per-row issues.
                                             T.tile.broadcast(
                                                 mask_full,
-                                                _sub_tile(mask_sel, 0, 1, BI // 8),
+                                                tvm_tir.BufferRegion(
+                                                    mask_sel,
+                                                    [
+                                                        tvm_ir.Range.from_min_extent(
+                                                            0, BI // 8
+                                                        )
+                                                    ],
+                                                ),
                                                 axis=0,
                                             )
                                             T.tile.select(
