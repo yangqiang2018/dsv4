@@ -779,6 +779,103 @@ def build_sparse_attn_sharedkv(
                                             T.barrier_all()
                                             # ORI KV is now cube-direct (GM->L1,
                                             # AscendC form): no vector gather.
+                                            if not cube_direct:
+                                                # Batched gather: issue all BI//2 row
+                                                # DMAs into distinct rows of
+                                                # kv_ub_multi with NO per-row barrier
+                                                # (disjoint dst rows -> MTE2 pipelines
+                                                # them), then one barrier + one
+                                                # batched write-out. Out-of-window
+                                                # tokens (g_idx > ori_right) are
+                                                # gathered too: the window is a prefix
+                                                # of a valid causal range (g_idx <=
+                                                # s_global < act_kv) so the block-table
+                                                # entry is always valid, and the
+                                                # additive score mask sets their
+                                                # column to -inf -- the gathered value
+                                                # never contributes.
+                                                for gp in range(N_GATHER_PASS):
+                                                    pp = gp % 2
+                                                    gh = pp * GATHER_ROWS
+                                                    kv_row0 = (
+                                                        vid * (BI // 2)
+                                                        + gp * GATHER_ROWS
+                                                    )
+                                                    # S2b.1b: ping-pong the gather UB half
+                                                    # so gather[gp] (MTE2 into half pp)
+                                                    # overlaps write[gp-1] (MTE3 from the
+                                                    # other half). WAR: half pp was last
+                                                    # read by write[gp-2], so wait its
+                                                    # back-flag before overwriting it.
+                                                    if gp >= 2:
+                                                        T.wait_flag("mte3", "mte2", pp)
+                                                    # DataCopyPA-style block gather: the
+                                                    # ori window rows are CONTIGUOUS, so
+                                                    # when all 16 stay in one page issue
+                                                    # ONE 16-row DMA (2 scalar ops vs
+                                                    # 16x table+div+mod); fall back to
+                                                    # per-row only across a page edge.
+                                                    g0 = chunk_start + kv_row0
+                                                    blk0 = ori_block_table[
+                                                        b_i, g0 // ori_block_size
+                                                    ]
+                                                    row0 = g0 % ori_block_size
+                                                    if (
+                                                        row0 + GATHER_ROWS
+                                                        <= ori_block_size
+                                                    ):
+                                                        T.copy(
+                                                            ori_KV[
+                                                                blk0,
+                                                                row0 : row0
+                                                                + GATHER_ROWS,
+                                                                0,
+                                                                :,
+                                                            ],
+                                                            kv_ub_multi[
+                                                                gh : gh + GATHER_ROWS, :
+                                                            ],
+                                                        )
+                                                    else:
+                                                        for r in range(GATHER_ROWS):
+                                                            g_idx = (
+                                                                chunk_start
+                                                                + kv_row0
+                                                                + r
+                                                            )
+                                                            ori_blk = ori_block_table[
+                                                                b_i,
+                                                                g_idx // ori_block_size,
+                                                            ]
+                                                            ori_row = (
+                                                                g_idx % ori_block_size
+                                                            )
+                                                            T.copy(
+                                                                ori_KV[
+                                                                    ori_blk,
+                                                                    ori_row,
+                                                                    0,
+                                                                    :,
+                                                                ],
+                                                                kv_ub_multi[gh + r, :],
+                                                            )
+                                                    # gather[gp](MTE2) -> write[gp](MTE3)
+                                                    T.set_flag("mte2", "mte3", pp)
+                                                    T.wait_flag("mte2", "mte3", pp)
+                                                    T.copy(
+                                                        kv_ub_multi[
+                                                            gh : gh + GATHER_ROWS, :
+                                                        ],
+                                                        ws_kv[
+                                                            cid,
+                                                            pv0,
+                                                            kv_row0 : kv_row0
+                                                            + GATHER_ROWS,
+                                                            :,
+                                                        ],
+                                                    )
+                                                    # write[gp] done -> half pp free (gp+2)
+                                                    T.set_flag("mte3", "mte2", pp)
                                         else:
                                             if is_cfa:
                                                 # CFA: this chunk's compressed
