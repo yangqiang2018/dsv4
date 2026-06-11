@@ -185,6 +185,8 @@ def build_sparse_attn_sharedkv(
     # generates them per chunk with createvecindex instead of reading a
     # host-synthesized cmp_indices array (mirrors the Ascend C CFA path).
     is_cfa = scenario == 2
+    # cube-direct KV verified on SWA only so far; cmp paths pending diagnosis.
+    cube_direct = NI_cmp == 0
 
     H_per_block = gqa_group  # 64
     v_block = H_per_block // 2  # 32 -- each AIV handles half the heads
@@ -548,7 +550,7 @@ def build_sparse_attn_sharedkv(
                                         # blocks -- no vector gather, no ws_kv
                                         # round-trip, no KV_READY. Only SCFA's
                                         # sparse topK chunks keep the vector path.
-                                        if t < NI_ori:
+                                        if cube_direct and t < NI_ori:
                                             # dst picked at COMPILE time (a TIR-var
                                             # ternary on gp is illegal): lo half then
                                             # hi half, 4x16 rows each.
@@ -601,7 +603,7 @@ def build_sparse_attn_sharedkv(
                                                 )
                                             T.barrier_all()
                                         else:
-                                            if is_cfa:
+                                            if False and is_cfa:
                                                 for gp in range(BI_half // GATHER_ROWS):
                                                     gc0 = (
                                                         t - NI_ori
@@ -760,7 +762,7 @@ def build_sparse_attn_sharedkv(
                                         is_ori = c0 < NI_ori
 
                                         # ---- gather KV + build mask ----
-                                        if is_ori:
+                                        if is_ori and not cube_direct:
                                             chunk_start = ori_left + c0 * BI
                                             T.tile.createvecindex(
                                                 idx_int,
@@ -840,56 +842,47 @@ def build_sparse_attn_sharedkv(
                                             # contribution, so reading token 0's
                                             # KV is harmless (matches the old
                                             # fill-0 path numerically).
-                                            if is_cfa:
-                                                pass
-                                            else:
-                                                for gp in range(N_GATHER_PASS):
-                                                    pp = gp % 2
-                                                    gh = pp * GATHER_ROWS
-                                                    kv_row0 = (
-                                                        vid * (BI // 2)
-                                                        + gp * GATHER_ROWS
+                                            for gp in range(N_GATHER_PASS):
+                                                pp = gp % 2
+                                                gh = pp * GATHER_ROWS
+                                                kv_row0 = (
+                                                    vid * (BI // 2) + gp * GATHER_ROWS
+                                                )
+                                                # S2b.1b ping-pong (see ori branch):
+                                                # gather[gp](MTE2,half pp) overlaps
+                                                # write[gp-1](MTE3); WAR back-flag.
+                                                if gp >= 2:
+                                                    T.wait_flag("mte3", "mte2", pp)
+                                                for r in range(GATHER_ROWS):
+                                                    cmp_idx = idx_int[kv_row0 + r]
+                                                    safe_idx = T.if_then_else(
+                                                        cmp_idx < 0, 0, cmp_idx
                                                     )
-                                                    # S2b.1b ping-pong (see ori branch):
-                                                    # gather[gp](MTE2,half pp) overlaps
-                                                    # write[gp-1](MTE3); WAR back-flag.
-                                                    if gp >= 2:
-                                                        T.wait_flag("mte3", "mte2", pp)
-                                                    for r in range(GATHER_ROWS):
-                                                        cmp_idx = idx_int[kv_row0 + r]
-                                                        safe_idx = T.if_then_else(
-                                                            cmp_idx < 0, 0, cmp_idx
-                                                        )
-                                                        cmp_blk = cmp_block_table[
-                                                            b_i,
-                                                            safe_idx // cmp_block_size,
-                                                        ]
-                                                        cmp_row = (
-                                                            safe_idx % cmp_block_size
-                                                        )
-                                                        T.copy(
-                                                            cmp_KV[
-                                                                cmp_blk, cmp_row, 0, :
-                                                            ],
-                                                            kv_ub_multi[gh + r, :],
-                                                        )
-                                                    # gather[gp](MTE2) -> write[gp](MTE3)
-                                                    T.set_flag("mte2", "mte3", pp)
-                                                    T.wait_flag("mte2", "mte3", pp)
+                                                    cmp_blk = cmp_block_table[
+                                                        b_i,
+                                                        safe_idx // cmp_block_size,
+                                                    ]
+                                                    cmp_row = safe_idx % cmp_block_size
                                                     T.copy(
-                                                        kv_ub_multi[
-                                                            gh : gh + GATHER_ROWS, :
-                                                        ],
-                                                        ws_kv[
-                                                            cid,
-                                                            pv0,
-                                                            kv_row0 : kv_row0
-                                                            + GATHER_ROWS,
-                                                            :,
-                                                        ],
+                                                        cmp_KV[cmp_blk, cmp_row, 0, :],
+                                                        kv_ub_multi[gh + r, :],
                                                     )
-                                                    # write[gp] done -> half pp free (gp+2)
-                                                    T.set_flag("mte3", "mte2", pp)
+                                                # gather[gp](MTE2) -> write[gp](MTE3)
+                                                T.set_flag("mte2", "mte3", pp)
+                                                T.wait_flag("mte2", "mte3", pp)
+                                                T.copy(
+                                                    kv_ub_multi[
+                                                        gh : gh + GATHER_ROWS, :
+                                                    ],
+                                                    ws_kv[
+                                                        cid,
+                                                        pv0,
+                                                        kv_row0 : kv_row0 + GATHER_ROWS,
+                                                        :,
+                                                    ],
+                                                )
+                                                # write[gp] done -> half pp free (gp+2)
+                                                T.set_flag("mte3", "mte2", pp)
                                         # S2b.1c: drain the 2 dangling back-flags (the
                                         # last two passes set mte3->mte2 with no
                                         # in-loop waiter) so kv_ub_multi's two halves
@@ -901,11 +894,10 @@ def build_sparse_attn_sharedkv(
                                         # without it -- it is pipe-ordered on MTE3, so
                                         # it still fires only after the ws_kv writes
                                         # land, and cube's KV_READY wait is unaffected.
-                                        if not is_cfa:
-                                            if t >= NI_ori:
-                                                T.wait_flag("mte3", "mte2", 0)
-                                                T.wait_flag("mte3", "mte2", 1)
-                                                T.set_cross_flag("MTE3", _FLAG_KV_READY)
+                                        if t >= NI_ori:
+                                            T.wait_flag("mte3", "mte2", 0)
+                                            T.wait_flag("mte3", "mte2", 1)
+                                            T.set_cross_flag("MTE3", _FLAG_KV_READY)
                                     # ---- S2b.1d-beta prologue: prefetch chunk 0 score ----
                                     # Cold start: nothing to overlap yet, just land
                                     # chunk 0 in half 0 so V1(0) finds it at t=1.
