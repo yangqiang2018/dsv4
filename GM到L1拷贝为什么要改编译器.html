@@ -24,6 +24,10 @@ h2{font-size:1.25em;margin-top:2em;border-left:5px solid #4a90d9;padding-left:10
 p.note{background:#eef6ff;border-left:4px solid #4a90d9;padding:10px 14px;border-radius:4px}
 p.bad{background:#fff0f0;border-left:4px solid #d9534f;padding:10px 14px;border-radius:4px}
 code{background:#f4f4f4;padding:1px 5px;border-radius:3px;font-size:.92em}
+pre{background:#1e2530;color:#e6e6e6;padding:14px 16px;border-radius:8px;overflow-x:auto;font-size:.86em;line-height:1.5}
+pre .c{color:#8aa0b8}
+pre .k{color:#e0a85b}
+pre b{color:#ff8585;font-weight:600}
 figure{margin:20px 0;text-align:center}
 figcaption{font-size:.9em;color:#666;margin-top:6px}
 table{border-collapse:collapse;margin:14px 0}
@@ -92,11 +96,25 @@ td,th{border:1px solid #bbb;padding:6px 12px;text-align:center}
 <p>为什么常用却没人撞坑？因为绝大多数算子一次搬满整块。我们的算子（PageAttention 取 KV）数据按"页"散落在 GM，要<b>分几次</b>往同一个 L1 块的不同段补——立刻踩中。</p>
 
 <h2 id="sec4">四、出错过程（8 行块、分两批各 4 行）</h2>
-<p>真正的根子先说破：这条搬运指令<b>没有"从第几行开始写"这个参数</b>。它只知道两件事——块的整体形状（8 行 × 4 列，编译期写死）、这次给它几行。所以它对任何一次调用都只有一种理解："这是一个完整 8 行块、从它的开头写起。"</p>
+<p>真正的根子先说破：这条搬运指令<b>没有"从第几行开始写"这个参数</b>。它只知道两件事——块的整体形状（8 行 × 4 列，编译期写死）、这次给它几行。把实际代码摆出来一眼就明白：</p>
+<pre><span class="c"># TileLang 里这样写一次 GM→L1 搬运：</span>
+T.<span class="k">copy</span>(ori_KV[blk, row : row+8, :],  <span class="c"># 源：GM 里某 8 行</span>
+       kv_l1)                      <span class="c"># 目标：L1 缓冲</span>
+
+<span class="c"># 编译器把它翻成这条底层调用：</span>
+<span class="k">copy_gm_to_l1</span>&lt;bf16, <b>8, 4</b>&gt;(   <span class="c"># ← 8,4 = 整块形状，编译期写死</span>
+    kv_l1,                  <span class="c"># 目标缓冲（只有一个起点地址）</span>
+    src,                    <span class="c"># 源地址</span>
+    srcN = 4,               <span class="c"># 源一行多少列</span>
+    tailM = 4,              <span class="c"># ← 这次给几行</span>
+    tailN = 4);             <span class="c"># ← 一行里几列有效</span>
+<span class="c">#   能调的就这几个数：块形 + 几行 + 几列。</span>
+<span class="c">#   <b>从来没有一个「从第几行开始写」的参数。</b></span></pre>
+<p>所以它对任何一次调用都只有一种理解："这是一个完整 8 行块、从它的开头写起。"</p>
 <p>而麻烦正好撞上 <a href="#sec2">第二节</a>的 NZ：在 L1 里，<b>一行被拆成两段，分别躺在相隔很远的两个竖条里</b>（如 r1 = 条① 的 a1a2 + 条② 的 a3a4）。下图是这个 8 行块在 L1 的真实样子：</p>
 
 <figure>
-<svg width="760" height="320" viewBox="0 0 760 320" xmlns="http://www.w3.org/2000/svg" font-size="12.5">
+<svg width="760" height="232" viewBox="0 0 760 232" xmlns="http://www.w3.org/2000/svg" font-size="12.5">
 <!-- two strips -->
 <text x="10" y="18" font-weight="bold">L1 里的 8 行块（NZ）：每行拆成两半，分放两个竖条</text>
 <g transform="translate(70,30)">
@@ -123,11 +141,11 @@ td,th{border:1px solid #bbb;padding:6px 12px;text-align:center}
 <text x="200" y="20" fill="#d9534f" font-size="11">r5 r6 r7 r8（条①后半，要跳 4 行）</text>
 <text x="200" y="62" fill="#d9534f" font-size="11">r5 r6 r7 r8（条②后半，也要跳 4 行）</text>
 </g>
-<text x="10" y="296" fill="#d9534f">"从第 5 行接着写" = 在条①跳 4 行 <b>同时</b> 在条②也跳 4 行 —— 两个不同的地址调整。</text>
-<text x="10" y="314" fill="#d9534f">但指令只收<b>一个</b>起点指针 + 整块形状，一个指针表达不了"在每个竖条里各跳 4 行"。</text>
 </svg>
 <figcaption>图 2：一行散在多个竖条，"前进 4 行"不是单一偏移——这正是一个起点指针表达不出来的东西。</figcaption>
 </figure>
+
+<p><b>"从第 5 行接着写"</b>意味着：在条① 跳 4 行、<b>同时</b>在条② 也跳 4 行——这是两个不同的地址调整。可指令只收<b>一个</b>起点指针 + 整块形状，一个指针表达不了"在每个竖条里各跳 4 行"。</p>
 
 <p class="note">于是第 2 批只能被指令当成"一个新块从这个指针写起"：它在这个偏移点身后<b>重新铺一套两条</b>，落点和真实的"后半"对不齐；再加上它会把自己以为的"空白行"清零，连第 1 批已写好的另一半也被波及。两批各按各的原点行事、互相打架——实测约一半元素归零或放错（~55% 错）。一次写满整块就没事（只有一个原点、无需偏移），偏偏我们的 KV 来自不同的"页"、必须分批补。</p>
 
