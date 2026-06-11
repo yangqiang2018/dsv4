@@ -799,56 +799,29 @@ def build_sparse_attn_sharedkv(
                                                     # back-flag before overwriting it.
                                                     if gp >= 2:
                                                         T.wait_flag("mte3", "mte2", pp)
-                                                    # DataCopyPA-style block gather: the
-                                                    # ori window rows are CONTIGUOUS, so
-                                                    # when all 16 stay in one page issue
-                                                    # ONE 16-row DMA (2 scalar ops vs
-                                                    # 16x table+div+mod); fall back to
-                                                    # per-row only across a page edge.
-                                                    g0 = chunk_start + kv_row0
-                                                    blk0 = ori_block_table[
-                                                        b_i, g0 // ori_block_size
-                                                    ]
-                                                    row0 = g0 % ori_block_size
-                                                    if (
-                                                        row0 + GATHER_ROWS
-                                                        <= ori_block_size
-                                                    ):
+                                                    # Per-row gather (proven 1d-beta
+                                                    # form). FUSE-V0's single-DMA
+                                                    # block-copy fast path was never
+                                                    # prefill-verified and is the last
+                                                    # window-dependent suspect.
+                                                    for r in range(GATHER_ROWS):
+                                                        g_idx = (
+                                                            chunk_start + kv_row0 + r
+                                                        )
+                                                        ori_blk = ori_block_table[
+                                                            b_i,
+                                                            g_idx // ori_block_size,
+                                                        ]
+                                                        ori_row = g_idx % ori_block_size
                                                         T.copy(
                                                             ori_KV[
-                                                                blk0,
-                                                                row0 : row0
-                                                                + GATHER_ROWS,
+                                                                ori_blk,
+                                                                ori_row,
                                                                 0,
                                                                 :,
                                                             ],
-                                                            kv_ub_multi[
-                                                                gh : gh + GATHER_ROWS, :
-                                                            ],
+                                                            kv_ub_multi[gh + r, :],
                                                         )
-                                                    else:
-                                                        for r in range(GATHER_ROWS):
-                                                            g_idx = (
-                                                                chunk_start
-                                                                + kv_row0
-                                                                + r
-                                                            )
-                                                            ori_blk = ori_block_table[
-                                                                b_i,
-                                                                g_idx // ori_block_size,
-                                                            ]
-                                                            ori_row = (
-                                                                g_idx % ori_block_size
-                                                            )
-                                                            T.copy(
-                                                                ori_KV[
-                                                                    ori_blk,
-                                                                    ori_row,
-                                                                    0,
-                                                                    :,
-                                                                ],
-                                                                kv_ub_multi[gh + r, :],
-                                                            )
                                                     # gather[gp](MTE2) -> write[gp](MTE3)
                                                     T.set_flag("mte2", "mte3", pp)
                                                     T.wait_flag("mte2", "mte3", pp)
