@@ -991,10 +991,16 @@ def build_sparse_attn_sharedkv(
                                         # without it -- it is pipe-ordered on MTE3, so
                                         # it still fires only after the ws_kv writes
                                         # land, and cube's KV_READY wait is unaffected.
-                                        if t >= NI_ori:
+                                        # Non-cube-direct (SCFA/CFA): the vector
+                                        # gather ran for EVERY chunk (ori + cmp), so
+                                        # every chunk set 2 mte3->mte2 back-flags and
+                                        # must drain them -- gating this by t>=NI_ori
+                                        # leaked +2 per slot and deadlocked prefill
+                                        # (the event counter saturates over many
+                                        # query slots; decode's single slot survived).
+                                        if not cube_direct:
                                             T.wait_flag("mte3", "mte2", 0)
                                             T.wait_flag("mte3", "mte2", 1)
-                                        if not cube_direct:
                                             T.set_cross_flag("MTE3", _FLAG_KV_READY)
                                     # ---- S2b.1d-beta prologue: prefetch chunk 0 score ----
                                     # Cold start: nothing to overlap yet, just land
