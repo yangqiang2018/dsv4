@@ -164,3 +164,14 @@ pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill" -
 **S2b.1c 验通后(2026-06-10)新沉淀进 `tilelang-perf` skill「手段 3:核内 debarrier」**:`barrier_all` 是全 pipe drain → 单核 pipe-sum;删它、只在跨 pipe 真依赖补 `set_flag/wait_flag`(同 pipe 自动 in-order)→ pipe-max。含 hazard 机械判定法、`wait_cross_flag` 自身 serialize(后面不用补 barrier)、渐进式 debarrier(先保留 step-boundary barrier 免跨 chunk ping-pong)。perf 数字栏待 S2b.1d 回填。
 
 > 这些 skill 是给"写/review TileLang Ascend kernel"用的,新 session 写 flag 时 skill 会自动触发,照着来。
+
+---
+
+## 11. ⚠️ fork 切换引入 prefill 数值回归（2026-06-11，环境问题，非内核）
+
+- **现状**:cube-direct(SWA,KV 不过 vector)+ 编译器 GM→L1 子块写补丁(fork `b5efa1b`/`52ad83a`,noClear 跳过子块清块竞争)decode 三场景两 dtype 全绿;**prefill 全场景 <99.5%**(scfa 99.22%)。
+- **Ground truth(`87df937` 探针)**:把 kernel 换成 session 前"prefill 验过"的 1d-β(`d9d6552`),在同一 fork 上**只有 98.95%,比当前 99.22% 还差**。⇒ **prefill 失败是 fork 本身(领先旧 tilelang-ascend 37 commit,数值变了),不是 cube-direct/编译器/FUSE 的锅;我们的工作反而改善了 prefill**。
+- **已坐实的 bug 与修复(都在当前 HEAD)**:① cube-direct 集成把 back-flag drain 误门控 `t>=NI_ori` → prefill 多 slot 事件计数饱和死锁(`cc06dfa` 改回 `not cube_direct` 逐 chunk);② FUSE-V0 ori 块 gather 的页边界分支 prefill 错(`1ee7873` 退回逐行,95.69→99.22);③ FUSE-V1/V2 整块 broadcast/别名全退回逐行(`85ed7cb`/`88b9151`)。
+- **HEAD `356912c`** = 当前最佳:cube-direct(SWA decode 验证)+ SCFA/CFA 逐行老路。`probe-current-9922` 分支留存。
+- **下一步(环境三选一,留给用户定向)**:① bisect fork 的 37 commit 找数值回归点;② 把编译器子块补丁打到原 0.1.9 源(若 0.1.9 上 prefill 过)而非 fork;③ 暂以 decode 验证为准、prefill 借线另行 triage(metadata 算子用户已说先不管)。
+- 编译器补丁是干净独立产出:codegen 检出子块(行 extent<dstM)传 noClear=1 跳过整块 InitConstValue;whole-block 路径字节等价(SCFA/CFA 不受影响)。
