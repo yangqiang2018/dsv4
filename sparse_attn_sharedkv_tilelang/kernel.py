@@ -549,7 +549,10 @@ def build_sparse_attn_sharedkv(
                                         # round-trip, no KV_READY. Only SCFA's
                                         # sparse topK chunks keep the vector path.
                                         if t < NI_ori:
-                                            for gp in range(BI // GATHER_ROWS):
+                                            # dst picked at COMPILE time (a TIR-var
+                                            # ternary on gp is illegal): lo half then
+                                            # hi half, 4x16 rows each.
+                                            for gp in range(BI_half // GATHER_ROWS):
                                                 g0 = (
                                                     ori_left + t * BI + gp * GATHER_ROWS
                                                 )
@@ -569,22 +572,37 @@ def build_sparse_attn_sharedkv(
                                                         gp * GATHER_ROWS : (gp + 1)
                                                         * GATHER_ROWS,
                                                         :,
-                                                    ]
-                                                    if gp < (BI_half // GATHER_ROWS)
-                                                    else kv_hi[
+                                                    ],
+                                                )
+                                            for gp in range(BI_half // GATHER_ROWS):
+                                                g0 = (
+                                                    ori_left
+                                                    + t * BI
+                                                    + BI_half
+                                                    + gp * GATHER_ROWS
+                                                )
+                                                blkc = ori_block_table[
+                                                    b_i, g0 // ori_block_size
+                                                ]
+                                                rowc = g0 % ori_block_size
+                                                T.copy(
+                                                    ori_KV[
+                                                        blkc,
+                                                        rowc : rowc + GATHER_ROWS,
+                                                        0,
+                                                        :,
+                                                    ],
+                                                    kv_hi[
                                                         pa,
-                                                        gp * GATHER_ROWS - BI_half : (
-                                                            gp + 1
-                                                        )
-                                                        * GATHER_ROWS
-                                                        - BI_half,
+                                                        gp * GATHER_ROWS : (gp + 1)
+                                                        * GATHER_ROWS,
                                                         :,
                                                     ],
                                                 )
                                             T.barrier_all()
                                         else:
                                             if is_cfa:
-                                                for gp in range(BI // GATHER_ROWS):
+                                                for gp in range(BI_half // GATHER_ROWS):
                                                     gc0 = (
                                                         t - NI_ori
                                                     ) * BI + gp * GATHER_ROWS
@@ -604,14 +622,29 @@ def build_sparse_attn_sharedkv(
                                                             gp * GATHER_ROWS : (gp + 1)
                                                             * GATHER_ROWS,
                                                             :,
-                                                        ]
-                                                        if gp < (BI_half // GATHER_ROWS)
-                                                        else kv_hi[
+                                                        ],
+                                                    )
+                                                for gp in range(BI_half // GATHER_ROWS):
+                                                    gc0 = (
+                                                        (t - NI_ori) * BI
+                                                        + BI_half
+                                                        + gp * GATHER_ROWS
+                                                    )
+                                                    blkc = cmp_block_table[
+                                                        b_i, gc0 // cmp_block_size
+                                                    ]
+                                                    rowc = gc0 % cmp_block_size
+                                                    T.copy(
+                                                        cmp_KV[
+                                                            blkc,
+                                                            rowc : rowc + GATHER_ROWS,
+                                                            0,
+                                                            :,
+                                                        ],
+                                                        kv_hi[
                                                             pa,
-                                                            gp * GATHER_ROWS
-                                                            - BI_half : (gp + 1)
-                                                            * GATHER_ROWS
-                                                            - BI_half,
+                                                            gp * GATHER_ROWS : (gp + 1)
+                                                            * GATHER_ROWS,
                                                             :,
                                                         ],
                                                     )
