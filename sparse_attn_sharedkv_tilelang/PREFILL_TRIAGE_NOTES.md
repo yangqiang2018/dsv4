@@ -5,9 +5,22 @@
 
 ---
 
-## 0. 一句话
+## ✅ RESOLVED（2026-06-11，隔离探针坐实 + 修复已推）
 
-把 §1 的 66-commit 盲 bisect 收窄到 **2 个动我们跨核 CV 机制的结构性 pass**（#1002 workspace-reduction、#1102 cross-core if-fix）+ 1 个 reduce 尺寸（#978）。其余（含名字最像的 #1027 TROWSUM、cast #1000、pad #1118）已用代码级分析排除/降权。**最便宜的第一刀**：注释掉 `phase.py:72` 的 `AscendWorkspaceReduction()`，kernel 重 JIT 跑 prefill（不用重装 .so）。
+**根因 = `AscendWorkspaceReduction` pass（#1002 `4477f9a`, `phase.py:72`）**。用户实测：注释掉 `phase.py:72` 重 JIT → prefill scfa 恢复 ≥99.5%。机制见 §3。
+
+**修复 = 整函数 opt-out attr `disable_workspace_reduction`**（已推，待容器验）：
+- fork ascendc_pto **`03f8858`**：`AscendWorkspaceReductionPass::Substitute` 顶部守卫，带该 attr 即原样返回。
+- dsv4 main **`8343436`**：`kernel.py` body 首行 `T.func_attr({"disable_workspace_reduction": True})`。
+- **容器验证**：两仓 pull → fork `.cc` 改了**必须重装 .so**（`USE_ASCEND=True pip install -e . --no-build-isolation`）→ 跑 prefill 全场景两 dtype + decode 回归检查。
+
+下面 §1–§5 是定位过程的完整记录（含已排除的红鲱鱼），保留备查。
+
+---
+
+## 0. 一句话（定位时）
+
+把 §1 的 66-commit 盲 bisect 收窄到 **2 个动我们跨核 CV 机制的结构性 pass**（#1002 workspace-reduction、#1102 cross-core if-fix）+ 1 个 reduce 尺寸（#978）。其余（含名字最像的 #1027 TROWSUM、cast #1000、pad #1118）已用代码级分析排除/降权。**最便宜的第一刀**：注释掉 `phase.py:72` 的 `AscendWorkspaceReduction()`，kernel 重 JIT 跑 prefill（不用重装 .so）。→ **此刀已被用户执行并命中，见顶部 RESOLVED。**
 
 ---
 
