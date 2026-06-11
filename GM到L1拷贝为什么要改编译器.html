@@ -123,7 +123,7 @@ T.<span class="k">copy</span>(ori_KV[blk, row : row+4, :],
 <p>而麻烦正好撞上 <a href="#sec2">第二节</a>的 NZ：在 L1 里，<b>一行被拆成两段，分别躺在相隔很远的两个竖条里</b>（如 r1 = 条① 的 a1a2 + 条② 的 a3a4）。下图是这个 8 行块在 L1 的真实样子：</p>
 
 <figure>
-<svg width="760" height="232" viewBox="0 0 760 232" xmlns="http://www.w3.org/2000/svg" font-size="12.5">
+<svg width="760" height="266" viewBox="0 0 760 266" xmlns="http://www.w3.org/2000/svg" font-size="12.5">
 <!-- two strips -->
 <text x="10" y="18" font-weight="bold">L1 里的 8 行块（NZ）：每行拆成两半，分放两个竖条</text>
 <g transform="translate(70,30)">
@@ -147,8 +147,8 @@ T.<span class="k">copy</span>(ori_KV[blk, row : row+4, :],
 <g transform="translate(70,176)">
 <rect x="176" width="176" height="30" fill="#fff" stroke="#d9534f" stroke-dasharray="5"/>
 <rect x="176" y="42" width="176" height="30" fill="#fff" stroke="#d9534f" stroke-dasharray="5"/>
-<text x="200" y="20" fill="#d9534f" font-size="11">r5 r6 r7 r8（条①后半，要跳 4 行）</text>
-<text x="200" y="62" fill="#d9534f" font-size="11">r5 r6 r7 r8（条②后半，也要跳 4 行）</text>
+<text x="196" y="20" fill="#d9534f" font-size="11">r5 r6 r7 r8（条① 后半）</text>
+<text x="196" y="62" fill="#d9534f" font-size="11">r5 r6 r7 r8（条② 后半）</text>
 </g>
 </svg>
 <figcaption>图 2：一行散在多个竖条，"前进 4 行"不是单一偏移——这正是一个起点指针表达不出来的东西。</figcaption>
