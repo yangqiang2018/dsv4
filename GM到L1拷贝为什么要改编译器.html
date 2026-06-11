@@ -84,7 +84,7 @@ td,th{border:1px solid #bbb;padding:6px 12px;text-align:center}
 <figcaption>图 1：行排 → NZ 重排。第 5 行在 L1 里的地址，必须知道"整块有 8 行"才算得出来。</figcaption>
 </figure>
 
-<p class="note">重点：<b>一个元素放在 L1 哪个角落，取决于整块的行数</b>。拿第 3 行的 c3 来说：整块 8 行时它在地址 16+4=20，整块 4 行时在 8+4=12——同一个元素、不同的家。这就是后面一切问题的根源。</p>
+<p class="note">重点：<b>一个元素放在 L1 哪个角落，取决于整块的行数</b>。拿第 3 行的 c3 来说：整块 8 行时它在地址 16+4=20，整块 4 行时在 8+4=12——同一个元素、不同的家。记住这个"按竖条摆、一行拆两段"，下一节要用到。</p>
 
 <h2 id="sec3">三、这条指令支持什么、不支持什么</h2>
 <table>
@@ -97,76 +97,27 @@ td,th{border:1px solid #bbb;padding:6px 12px;text-align:center}
 
 <h2 id="sec4">四、出错过程（8 行块、分两批各 4 行）</h2>
 <p>先回应一个很自然的疑问：上面 <code>ori_KV[blk, row : row+8, :]</code> 不是已经写了"从第 row 行取 8 行"吗——怎么说不能指定行？</p>
-<p>因为一次搬运有<b>两头</b>，"能不能指定行"两头不一样：</p>
-<ul>
-<li><b>源头 GM</b>（按行线性排）："从第几行起、取几行" = "从某地址起、读多长"，<b>天然支持</b>——那个 <code>row : row+8</code> 就是它，没问题。</li>
-<li><b>目标 L1</b>（NZ 竖条排，见<a href="#sec2">第二节</a>）：这条指令<b>只接受一个目标起点地址 + 整块形状</b>，没有"往第几行写"这一项。</li>
-</ul>
-<p>把代码摊开就一目了然——能切行段的是<b>源</b>，目标只能给整块：</p>
-<pre><span class="c"># ✅ 源(GM)：想取哪几行，随便切</span>
-T.<span class="k">copy</span>(ori_KV[blk, row : row+8, :],   <span class="c"># 从第 row 行取 8 行 —— 支持</span>
-       kv_l1)                           <span class="c"># 目标：只能整块给</span>
+<p><b>能指定行——这一点你没看错。</b>源头 GM 那侧 <code>row : row+8</code> 是"从某地址读多长"，天然支持；目标 L1 那侧你甚至能写 <code>kv_l1[4:8, :]</code> 让它从第 5 行写起。而且因为 NZ 里每个竖条的步长一致，把目标指针往后挪"4 行"，<b>写入真能正好落进两条的后半</b>（你直觉里"碰巧对齐"的那件事，其实是必然）。<b>所以——写入位置不是坑。</b></p>
+<p>坑在另一个"好心办坏事"的设定：这条搬运指令<b>一次只为"填满一个块"而设计</b>。一旦它发现你这次给的行数比整块少（给 4 行、块却是 8 行），它会<b>先把"它眼里的整块"全部清零</b>，好让你没填的行是干净的 0。从头一次填满，这没问题；可要<b>分两批拼一个块</b>，第 2 批的这个"自动清零"就闯祸了：</p>
+<pre><span class="c"># 想分两批填同一个 8 行块：先 r1–r4，再 r5–r8</span>
+T.<span class="k">copy</span>(ori_KV[blk, row : row+4, :], kv_l1[0:4, :])   <span class="c"># 第 1 批</span>
+T.<span class="k">copy</span>(ori_KV[blk, row+4 : row+8, :], kv_l1[<b>4:8</b>, :]) <span class="c"># 第 2 批：写入能对齐 ✓</span>
 
-<span class="c"># ❌ 我们真正想要的：只往 L1 的"第 4~8 行"补 4 行</span>
-T.<span class="k">copy</span>(ori_KV[blk, row : row+4, :],
-       kv_l1[<b>4:8</b>, :])                   <span class="c"># ← 目标也想切行段</span>
-<span class="c">#   这行能编过，但 L1 是 NZ：编译器把 kv_l1[4:8] 退化成一个"偏移指针",</span>
-<span class="c">#   底层模板仍按"整块从这个指针起"重新铺 NZ + 清零 —— 即下面要演的错。</span>
+<span class="c"># 第 2 批编译成的底层调用：</span>
+<span class="k">copy_gm_to_l1</span>&lt;bf16, <b>8, 4</b>&gt;(dst_ptr, src, srcN=4, <b>tailM=4</b>, tailN=4);
+<span class="c">#   tailM=4 &lt; 8(整块) → 模板自动把"从 dst_ptr 起、一整块的长度"先清零，</span>
+<span class="c">#   <b>没有任何参数能关掉这步清零</b> —— 这才是真正的坑。</span></pre>
 
-<span class="c"># 它最终编译成的底层调用，参数表里根本没有"目标起始行":</span>
-<span class="k">copy_gm_to_l1</span>&lt;bf16, <b>8, 4</b>&gt;(   <span class="c"># 8,4 = 整块形状(编译期写死)</span>
-    dst_ptr,                <span class="c"># 目标：就一个起点地址(切行段也只是挪它)</span>
-    src_ptr, srcN = 4,      <span class="c"># 源：地址 + 每行列数</span>
-    tailM = 4, tailN = 4);  <span class="c"># 这次搬几行 / 一行几列有效</span>
-<span class="c">#   能调的就这些：块形 + 几行 + 几列 —— 唯独没有"写到目标的第几行"。</span></pre>
-<p>所以"指定行"只在<b>源</b>那头成立；到了 NZ 的<b>目标</b>那头，切了也不算数。它对任何一次调用都只有一种理解："这是一个完整 8 行块、从它的开头写起。"下面看它具体错在哪：</p>
-<p>而麻烦正好撞上 <a href="#sec2">第二节</a>的 NZ：在 L1 里，<b>一行被拆成两段，分别躺在相隔很远的两个竖条里</b>（如 r1 = 条① 的 a1a2 + 条② 的 a3a4）。下图是这个 8 行块在 L1 的真实样子：</p>
+<p>把整个 L1 缓冲摊成一条地址带（条① 在前、条② 在后），就能看清第 2 批的"清零"扫到了哪里：</p>
 
 <figure>
-<svg width="760" height="266" viewBox="0 0 760 266" xmlns="http://www.w3.org/2000/svg" font-size="12.5">
-<!-- two strips -->
-<text x="10" y="18" font-weight="bold">L1 里的 8 行块（NZ）：每行拆成两半，分放两个竖条</text>
-<g transform="translate(70,30)">
-<text x="-58" y="20">条①(c1c2)</text>
-<rect width="352" height="30" fill="#fff" stroke="#999"/>
-<rect width="176" height="30" fill="#cfe8cf" stroke="#6a6"/>
-<g stroke="#ddd"><line x1="44" y2="30"/><line x1="88" y2="30"/><line x1="132" y2="30"/><line x1="176" y1="0" y2="30" stroke="#6a6"/><line x1="220" y2="30"/><line x1="264" y2="30"/><line x1="308" y2="30"/></g>
-<g fill="#333" font-size="11"><text x="14" y="20">r1</text><text x="58" y="20">r2</text><text x="102" y="20">r3</text><text x="146" y="20">r4</text><text x="190" y="20">r5</text><text x="234" y="20">r6</text><text x="278" y="20">r7</text><text x="322" y="20">r8</text></g>
-</g>
-<g transform="translate(70,72)">
-<text x="-58" y="20">条②(c3c4)</text>
-<rect width="352" height="30" fill="#fff" stroke="#999"/>
-<rect width="176" height="30" fill="#cfe8cf" stroke="#6a6"/>
-<g stroke="#ddd"><line x1="44" y2="30"/><line x1="88" y2="30"/><line x1="132" y2="30"/><line x1="176" y1="0" y2="30" stroke="#6a6"/><line x1="220" y2="30"/><line x1="264" y2="30"/><line x1="308" y2="30"/></g>
-<g fill="#333" font-size="11"><text x="14" y="20">r1</text><text x="58" y="20">r2</text><text x="102" y="20">r3</text><text x="146" y="20">r4</text><text x="190" y="20">r5</text><text x="234" y="20">r6</text><text x="278" y="20">r7</text><text x="322" y="20">r8</text></g>
-</g>
-<text x="70" y="128" fill="#2a7a2a">绿＝第 1 批 r1–r4，落对了（正好是两条各自的前半）✓</text>
-
-<!-- batch 2 target -->
-<text x="10" y="166" font-weight="bold" fill="#d9534f">第 2 批要填 r5–r8 = 两条各自的后半（下面两段红框）：</text>
-<g transform="translate(70,176)">
-<rect x="176" width="176" height="30" fill="#fff" stroke="#d9534f" stroke-dasharray="5"/>
-<rect x="176" y="42" width="176" height="30" fill="#fff" stroke="#d9534f" stroke-dasharray="5"/>
-<text x="196" y="20" fill="#d9534f" font-size="11">r5 r6 r7 r8（条① 后半）</text>
-<text x="196" y="62" fill="#d9534f" font-size="11">r5 r6 r7 r8（条② 后半）</text>
-</g>
-</svg>
-<figcaption>图 2：一行散在多个竖条，"前进 4 行"不是单一偏移——这正是一个起点指针表达不出来的东西。</figcaption>
-</figure>
-
-<p><b>"从第 5 行接着写"</b>意味着：在条① 跳 4 行、<b>同时</b>在条② 也跳 4 行——这是两个不同的地址调整。可指令只收<b>一个</b>起点指针 + 整块形状，一个指针表达不了"在每个竖条里各跳 4 行"。</p>
-
-<p>于是第 2 批只能被指令当成"一个完整 8 行块、从这个偏移指针写起"。把整个 L1 缓冲摊成一条地址带（条① 在前、条② 在后），就能看清它接下来干的两件坏事：</p>
-
-<figure>
-<svg width="700" height="250" viewBox="0 0 700 250" xmlns="http://www.w3.org/2000/svg" font-size="12">
+<svg width="700" height="232" viewBox="0 0 700 232" xmlns="http://www.w3.org/2000/svg" font-size="12">
 <defs>
 <pattern id="hatch" width="7" height="7" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
 <rect width="7" height="7" fill="#fff0f0"/><line x1="0" y1="0" x2="0" y2="7" stroke="#d9534f" stroke-width="2"/></pattern>
 <marker id="a2" markerWidth="7" markerHeight="7" refX="3.5" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 z" fill="#d9534f"/></marker>
 </defs>
 <text x="20" y="18" font-weight="bold">L1 缓冲摊成一条地址带（第 1 批写完时）：</text>
-<!-- five segments -->
 <g transform="translate(20,30)">
 <rect width="120" height="40" fill="#cfe8cf" stroke="#6a6"/><text x="20" y="18" font-size="11">条① r1–r4</text><text x="34" y="33" font-size="10" fill="#2a7a2a">第1批✓</text>
 <rect x="120" width="120" height="40" fill="#fff" stroke="#999"/><text x="138" y="18" font-size="11">条① r5–r8</text><text x="160" y="33" font-size="10" fill="#999">空</text>
@@ -174,30 +125,26 @@ T.<span class="k">copy</span>(ori_KV[blk, row : row+4, :],
 <rect x="360" width="120" height="40" fill="#fff" stroke="#999"/><text x="378" y="18" font-size="11">条② r5–r8</text><text x="400" y="33" font-size="10" fill="#999">空</text>
 <rect x="480" width="120" height="40" fill="#eee" stroke="#999" stroke-dasharray="3"/><text x="500" y="18" font-size="11">缓冲之外</text><text x="505" y="33" font-size="10" fill="#777">邻居的数据</text>
 </g>
-<!-- offset pointer -->
-<text x="140" y="92" fill="#d9534f" font-size="11">↑ 第 2 批的偏移指针落在这里</text>
-<!-- clear span -->
+<text x="140" y="92" fill="#d9534f" font-size="11">↑ 第 2 批的目标指针落在这里（条① 的后半，写入位置没错）</text>
 <line x1="140" y1="104" x2="620" y2="104" stroke="#d9534f" stroke-width="2" marker-end="url(#a2)"/>
 <rect x="140" y="108" width="480" height="40" fill="url(#hatch)" stroke="#d9534f" stroke-dasharray="5"/>
-<text x="150" y="133" fill="#d9534f" font-size="11">第 2 批以为自己在写"新的一整块"→ 从指针起把"一整块长度"全部清零</text>
-<!-- callouts -->
-<text x="20" y="178" fill="#d9534f">✗ 清零范围盖住了「条② r1–r4」——那是第 1 批刚写好的数据，被抹成 0。</text>
+<text x="150" y="133" fill="#d9534f" font-size="11">但它"填自己 4 行"前，先从指针起把"一整块的长度"全部清零 ↓</text>
+<text x="20" y="178" fill="#d9534f">✗ 清零扫过「条② r1–r4」——那是第 1 批刚写好的数据，被抹成 0。</text>
 <text x="20" y="200" fill="#d9534f">✗ 还一路清到「缓冲之外」，踩坏了邻居的数据。</text>
-<text x="20" y="228" fill="#666">（同时它写入的落点也按"新块"坐标算，未必对得齐真实的"后半"。）</text>
 </svg>
-<figcaption>图 3：第 2 批把偏移指针当成新块开头 → 它的"清零"横扫第 1 批的地盘、还冲出缓冲。</figcaption>
+<figcaption>图 2：写入位置其实是对的；闯祸的是那个关不掉的"自动清零"——它从偏移指针起横扫一整块长度，抹掉第 1 批、还冲出缓冲。</figcaption>
 </figure>
 
-<p class="note">两件坏事叠加：<b>① 落点错位</b>——它按"新块"坐标重排，和真实的后半对不齐；<b>② 清零误伤</b>——它从偏移点清掉"一整块长度"，扫过第 1 批已写的另一条、还冲出缓冲。两批各按各的原点行事、互相打架——实测约一半元素归零或放错（~55% 错）。<b>一次写满整块就没这事</b>（只有一个原点、不用偏移），偏偏我们的 KV 散在不同的"页"、必须分批补——这就逼到了那个缺失的"目标起始行"参数上。</p>
+<p class="note">于是"分批拼一个块"成了死局：第 2 批为了"填满自己"必先清零整块，而它的清零从偏移点一路扫过第 1 批已写的数据、还冲出缓冲——实测约一半元素被抹（~55% 错）。<b>一次写满整块就没这事</b>（只清一次、清的正好是自己），偏偏我们的 KV 散在不同的"页"、必须分批补。</p>
 
 <h2 id="sec5">五、为什么 kernel 里绕不过去，要改编译器？</h2>
-<p>因为"块形"是<b>编译期模板参数</b>：<code>copy_gm_to_l1&lt;8行,4列&gt;</code> 写死在生成的 C++ 里。kernel 作者只能给它一个起点指针，<b>没有任何参数能告诉它"这是大块中间的第 3 行"</b>。下三种绕法都被堵死：</p>
+<p>注意：问题<b>不是</b>"指定不了行"——行能指定，写入也落得对。问题是<b>那步"自动清零"写死在底层模板里、关不掉</b>：模板只要看到"这次的行数 &lt; 整块"，就无条件 <code>InitConstValue</code> 把整块清零。kernel 作者手里<b>没有任何开关</b>能说"我是来补全的，别清零"或"只清我写的这几行"。三条绕法都堵死：</p>
 <ul>
-<li>偏移指针 → 被当新块起点（图 2）。</li>
-<li>把缓冲拆成 4 个小块 → 矩阵乘法器要整块输入，会多 8 倍调度反而更慢。</li>
-<li>每次搬的行数当变量 → 行数也必须是编译期常量。</li>
+<li><b>不偏移、从头写</b> → 第 2 批直接盖掉第 1 批，照样拼不起来。</li>
+<li><b>偏移到第 5 行写</b> → 写入对了，但那步整块清零照样把第 1 批扫掉（图 2）。</li>
+<li><b>把缓冲拆成多个小块、各自整块填</b> → 矩阵乘法器要一整块连续输入，拆了要么多搬一遍、要么多算几趟，反而更慢。</li>
 </ul>
-<p class="note">手写 Ascend C 没这问题：自己直接算 NZ 偏移写进去（约一行代码）。所以这不是硬件不行，是 <b>TileLang 编译器没暴露"块内偏移"这个旋钮</b>。修法约几十行：给拷贝指令加"目标块内行号"参数 + 关掉清零。</p>
+<p class="note">手写 Ascend C 没这问题：它的搬运是自己写的循环，想清就清、想补就补。所以这不是硬件不行，是 <b>TileLang 的拷贝模板缺一个"部分填充、不自动清零"的模式</b>。修法在模板里（约几十行）：发现是部分写时，别强制清整块（或只清写入的那一段）。这就是"必须改编译器"的确切含义。</p>
 
 <h2 id="sec6">六、回到我们的场景</h2>
 <p>修好之后，搬 KV 的活可由 cube 自己干，省掉一整条"vector 代搬 + 中转仓 + 等待信号"流水（华为官方算子正是如此），相应场景预计还有 2~3 倍加速。在那之前 TileLang 算子只能走中转路，性能上限即当前版本。</p>
