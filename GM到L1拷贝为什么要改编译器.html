@@ -91,29 +91,54 @@ td,th{border:1px solid #bbb;padding:6px 12px;text-align:center}
 </table>
 <p>为什么常用却没人撞坑？因为绝大多数算子一次搬满整块。我们的算子（PageAttention 取 KV）数据按"页"散落在 GM，要<b>分几次</b>往同一个 L1 块的不同段补——立刻踩中。</p>
 
-<h2 id="sec4">四、出错过程（4 行一段、分两次搬 8 行）</h2>
+<h2 id="sec4">四、出错过程（8 行块、分两批各 4 行）</h2>
+<p>真正的根子先说破：这条搬运指令<b>没有"从第几行开始写"这个参数</b>。它一共只知道两件事——</p>
+<ul>
+<li><b>块的整体形状</b>（这里 8 行 × 4 列，编译期就写死了）；</li>
+<li><b>这次给它几行</b>（比如 4 行）。</li>
+</ul>
+<p>于是它对任何一次调用都只有<b>一种理解</b>："这是某个 8 行块、从它的第 0 行开始的前几行"。当我们想分两批填满一个 8 行块时，这个"只会从第 0 行开始"的假设就出事了：</p>
 
 <figure>
-<svg width="820" height="270" viewBox="0 0 820 270" xmlns="http://www.w3.org/2000/svg" font-size="12">
-<text x="10" y="16" font-weight="bold">第 1 次：搬 1~4 行，从 L1 起点写</text>
-<g transform="translate(10,26)">
-<rect width="320" height="60" fill="#fffaf0" stroke="#999"/>
-<rect width="160" height="60" fill="#cfe8cf" stroke="#6a6"/>
-<text x="40" y="35">1~4 行（正确）</text><text x="200" y="35" fill="#999">空</text>
+<svg width="800" height="340" viewBox="0 0 800 340" xmlns="http://www.w3.org/2000/svg" font-size="12.5">
+<!-- target -->
+<text x="10" y="16" font-weight="bold">我们想要的 8 行块（一个缓冲，按顺序放满 r1…r8）：</text>
+<g transform="translate(10,24)">
+<rect width="480" height="30" fill="#f6faff" stroke="#999"/>
+<g stroke="#ddd"><line x1="60" y2="30"/><line x1="120" y2="30"/><line x1="180" y2="30"/><line x1="240" y2="30"/><line x1="300" y2="30"/><line x1="360" y2="30"/><line x1="420" y2="30"/></g>
+<g fill="#333"><text x="22" y="20">r1</text><text x="82" y="20">r2</text><text x="142" y="20">r3</text><text x="202" y="20">r4</text><text x="262" y="20">r5</text><text x="322" y="20">r6</text><text x="382" y="20">r7</text><text x="442" y="20">r8</text></g>
 </g>
-<text x="10" y="120" font-weight="bold">第 2 次：想补 5~8 行 → 模板仍按"新的 8 行整块"摆 + 先清零</text>
-<g transform="translate(10,130)">
-<rect width="320" height="60" fill="#fffaf0" stroke="#999"/>
-<rect width="160" height="60" fill="#eee" stroke="#d9534f" stroke-dasharray="4"/>
-<text x="22" y="35" fill="#d9534f">第1次的数据被清零!</text>
-<rect x="160" width="160" height="60" fill="#f7d7d7" stroke="#d9534f"/>
-<text x="180" y="35" fill="#d9534f">5~8行 且按错块形错位</text>
+
+<!-- call 1 -->
+<text x="10" y="92" font-weight="bold">第 1 批：指针指块头，递 4 行（r1–r4）。指令照"完整 8 行块、前 4 行"办：</text>
+<g transform="translate(10,100)">
+<rect width="480" height="30" fill="#fff" stroke="#999"/>
+<rect width="240" height="30" fill="#cfe8cf" stroke="#6a6"/>
+<g fill="#333"><text x="22" y="20">r1</text><text x="82" y="20">r2</text><text x="142" y="20">r3</text><text x="202" y="20">r4</text></g>
+<text x="270" y="20" fill="#999">（其余先清零）</text>
 </g>
-<text x="10" y="225" fill="#d9534f" font-weight="bold">结果：一半数据归零、另一半放错货架 → 数值约一半全错（实测 ~55%）。</text>
-<text x="10" y="248" fill="#666">两个机制叠加：① 偏移指针被当成"新整块"的起点重排 NZ；② 尾块路径自动整块清零。</text>
+<text x="500" y="120" fill="#2a7a2a">r1–r4 落对了 ✓</text>
+
+<!-- call 2 -->
+<text x="10" y="172" font-weight="bold">第 2 批：把指针往后挪到"第 5 行处"，递 4 行（r5–r8）。</text>
+<text x="10" y="192" fill="#d9534f">但指令不知道这是"第 5 行"，它把这个挪后的指针当成<b>另一个全新 8 行块的第 0 行</b>：</text>
+<g transform="translate(10,202)">
+<rect width="480" height="30" fill="#fff" stroke="#999"/>
+<!-- batch1 region drawn faint -->
+<rect width="240" height="30" fill="#e8f3e8" stroke="#cfe0cf"/>
+<g fill="#bbb"><text x="22" y="20">r1</text><text x="82" y="20">r2</text><text x="142" y="20">r3</text><text x="202" y="20">r4</text></g>
+<!-- imagined fresh block starting at offset, dashed red, runs past end -->
+<rect x="240" width="480" height="30" fill="#f7d7d7" stroke="#d9534f" stroke-dasharray="5"/>
+<g fill="#d9534f"><text x="258" y="20">r5</text><text x="318" y="20">r6</text><text x="378" y="20">r7</text><text x="438" y="20">r8</text><text x="500" y="20">↯ 还按 8 行铺，冲出缓冲</text></g>
+</g>
+<text x="10" y="262" fill="#d9534f">指令以这个偏移点为"原点"重新铺 8 行的地址 + 把它以为的"其余行"清零，</text>
+<text x="10" y="282" fill="#d9534f">坐标原点和第 1 批的不是同一个 → 落点错位、清零范围越界打架。</text>
+<text x="10" y="312" font-weight="bold">最终：两批用着各自的坐标系互相干扰，约一半元素归零或放错（实测 ~55% 错）。</text>
 </svg>
-<figcaption>图 2：分段搬运的实际下场。</figcaption>
+<figcaption>图 2：症结是"没有起始行参数"——每次调用都被迫假设自己从某个块的第 0 行开始。</figcaption>
 </figure>
+
+<p class="note">换句话说：错不在"清零"或"NZ 重排"本身，而在<b>第 2 批根本没法告诉指令"我要从第 5 行接着写"</b>。它只能假装从头写，于是和第 1 批撞车。一次写满整块就没事（只有一个原点）——偏偏我们的数据来自不同的"页"，必须分批补。</p>
 
 <h2 id="sec5">五、为什么 kernel 里绕不过去，要改编译器？</h2>
 <p>因为"块形"是<b>编译期模板参数</b>：<code>copy_gm_to_l1&lt;8行,4列&gt;</code> 写死在生成的 C++ 里。kernel 作者只能给它一个起点指针，<b>没有任何参数能告诉它"这是大块中间的第 3 行"</b>。下三种绕法都被堵死：</p>
