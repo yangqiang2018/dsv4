@@ -762,7 +762,7 @@ def build_sparse_attn_sharedkv(
                                         is_ori = c0 < NI_ori
 
                                         # ---- gather KV + build mask ----
-                                        if is_ori and not cube_direct:
+                                        if is_ori:
                                             chunk_start = ori_left + c0 * BI
                                             T.tile.createvecindex(
                                                 idx_int,
@@ -897,6 +897,7 @@ def build_sparse_attn_sharedkv(
                                         if t >= NI_ori:
                                             T.wait_flag("mte3", "mte2", 0)
                                             T.wait_flag("mte3", "mte2", 1)
+                                        if not cube_direct:
                                             T.set_cross_flag("MTE3", _FLAG_KV_READY)
                                     # ---- S2b.1d-beta prologue: prefetch chunk 0 score ----
                                     # Cold start: nothing to overlap yet, just land
