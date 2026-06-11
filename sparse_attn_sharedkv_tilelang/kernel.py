@@ -1038,34 +1038,19 @@ def build_sparse_attn_sharedkv(
                                             # lacks), so copy chunk t-1's mask
                                             # row into the whole mask_sel first.
                                             T.copy(mask_ub[pv1, :], mask_sel)
-                                            # FUSE-V1: replicate the 16B row mask x32
-                                            # (one broadcast) -> contiguous 4096-bit
-                                            # mask -> ONE whole-tile select replaces
-                                            # 32 per-row issues.
-                                            T.tile.broadcast(
-                                                mask_full,
-                                                tvm_tir.BufferRegion(
+                                            # Per-row select (proven): the FUSE-V1
+                                            # whole-tile broadcast-mask select was wrong
+                                            # on partial windows -- decode never hits it
+                                            # (last query = full window, mask all-ones),
+                                            # prefill does (early queries mask -inf).
+                                            for h_i in T.serial(v_block):
+                                                T.tile.select(
+                                                    acc_s_ub[h_i, :],
                                                     mask_sel,
-                                                    [
-                                                        tvm_ir.Range.from_min_extent(
-                                                            0, BI // 8
-                                                        )
-                                                    ],
-                                                ),
-                                                axis=0,
-                                            )
-                                            T.tile.select(
-                                                acc_s_ub,
-                                                mask_full,
-                                                _sub_tile(
-                                                    acc_s_ub_,
-                                                    pv1 * v_block,
-                                                    v_block,
-                                                    BI,
-                                                ),
-                                                -T.infinity(accum_dtype),
-                                                "VSEL_TENSOR_SCALAR_MODE",
-                                            )
+                                                    acc_s_ub_[pv1 * v_block + h_i, :],
+                                                    -T.infinity(accum_dtype),
+                                                    "VSEL_TENSOR_SCALAR_MODE",
+                                                )
                                             # WAR (eid = half): selects are done reading
                                             # half pv1; the prefetch 2 steps ahead may
                                             # overwrite it. Balanced by the pre-set pair
