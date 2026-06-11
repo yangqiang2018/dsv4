@@ -1,90 +1,79 @@
 # prefill 数值回归 triage —— 本地静态分析（接 PERF_HANDOFF_4.md §1）
 
-> 本文件是 §1 的本地推进结果：**无 NPU 也能做的部分已做完**（把 66 个上游 commit 收窄到 3 个真正经过我们路径的数值嫌疑，并排除头号红鲱鱼）。
-> 实跑验证要在容器（`/sdb/yq/dsv4` + `/app/data/tilelang-ascend`）按下面"行动计划"做。
+> 本文件是 §1 的本地推进结果（无 NPU 也能做完的部分）。实跑验证在容器（`/sdb/yq/dsv4` + `/app/data/tilelang-ascend`）按 §4 做。
+> **v2（深挖后重定向）**：判断从最初的"cast/reduce 舍入"转到 **跨核 CV 结构 pass**。最初的头号 cast 嫌疑 #1000 已被代码级排除，详见 §3。
 
 ---
 
 ## 0. 一句话
 
-把 §1 的"bisect fork 上游 commit"从 **66 个盲 bisect** 收窄到 **3 个真正经过我们 (ascendc/auto) 路径的数值嫌疑**，并**排除了头号红鲱鱼 `#1027`（TROWSUM row-reduce）—— 它改的是 pto 专用函数，根本不碰我们的路径**。先做一步零重编诊断即可分流。
+把 §1 的 66-commit 盲 bisect 收窄到 **2 个动我们跨核 CV 机制的结构性 pass**（#1002 workspace-reduction、#1102 cross-core if-fix）+ 1 个 reduce 尺寸（#978）。其余（含名字最像的 #1027 TROWSUM、cast #1000、pad #1118）已用代码级分析排除/降权。**最便宜的第一刀**：注释掉 `phase.py:72` 的 `AscendWorkspaceReduction()`，kernel 重 JIT 跑 prefill（不用重装 .so）。
 
 ---
 
 ## 1. 范围已钉精确
 
-- **旧基线（prefill 验过的点）= upstream tile-ai `2e27af7`（PR #968）**。
-  证据：sibling 旧克隆 `WorkContent/tilelang-ascend` 的 HEAD `0de76b6` 是本地 merge upstream，其 `0de76b6^2`（upstream parent）= `2e27af7 (#968)`。
-- **fork 基线 = `5d3fcc9`（#1128 TopK fix）**，其上叠我们 7 个 GM→L1 补丁到 `52ad83a`。
-- **bisect 范围 = `2e27af7..5d3fcc9` = 66 commits**（PERF_HANDOFF_4 写的 ~37 是约数，以 66 为准）。
+- **旧基线（prefill 验过的点）= upstream tile-ai `2e27af7`（#968）**。证据：sibling 旧克隆 `WorkContent/tilelang-ascend` HEAD `0de76b6` 的 upstream parent (`0de76b6^2`) = `2e27af7`。
+- **fork 基线 = `5d3fcc9`（#1128）**，其上叠我们 7 个 GM→L1 补丁到 `52ad83a`。
+- **范围 = `2e27af7..5d3fcc9` = 66 commits**（PERF_HANDOFF_4 写的 ~37 是约数）。
 
 ---
 
 ## 2. 关键甄别：我们走 non-pto 路径 → 大半 commit 是红鲱鱼
 
-- kernel 用 **default non-pto Ascend C lowering**（`kernel.py:15` 明示；`T.Kernel(is_npu=True)`）。
-- 编译器 `src/transform/allocate_tmp_buffer.cc` 的 `createTmpBuffer_` 按 target 分流：
-  - `"pto"` → `GetPTOTmpBufferSize_`
-  - `"ascendc"/"auto"` → `GetAscendCTmpBufferSize_`（**我们走这条**）
-- ⇒ **所有纯 `[PTO]` codegen / `GetPTOTmpBufferSize_` 改动对我们字节级无关**，66 个里大半出局。
-
-### ❌ 已排除的头号红鲱鱼
-- **`1e763f4` (#1027) "Fix PTO row-reduce temporary buffer size and type mismatch for TROWSUM"** —— 名字最像（TROWSUM = softmax 分母），但它改的 `GetPtoRowReduceTmpCols` / TROWSUM 分支在 **`GetPTOTmpBufferSize_`（pto 专用）**，我们的 ascendc 路径走 `GetAscendCTmpBufferSize_`，**不受影响**。别在它上面浪费 NPU 时间。
+- kernel 用 **default non-pto Ascend C lowering**（`kernel.py:15`；`T.Kernel(is_npu=True)`）。
+- `allocate_tmp_buffer.cc` 的 `createTmpBuffer_` 按 target 分流 `GetPTOTmpBufferSize_`(pto) vs `GetAscendCTmpBufferSize_`(我们)⇒ **所有纯 [PTO] codegen 改动字节级无关**。
+- **❌ 排除头号红鲱鱼 `1e763f4`(#1027 "TROWSUM row-reduce tmp buffer fix")**：名字最像 softmax 分母,但改的是 `GetPTOTmpBufferSize_`(pto 专用)。别再查它。
 
 ---
 
-## 3. 真正经过我们路径的数值嫌疑（按机制排序）
+## 3. 嫌疑排序（v2，深挖代码后）
 
-bug 画像：**借线小漂移（scfa 99.22%，差阈值 0.28pt），decode 全绿、prefill 才挂**。decode↔prefill 唯一功能差 = prefill 走 -inf 屏蔽（部分窗口、行内含 exp(-inf)=0、tail 处理）。小漂移更像 **cast/round 精度** 或少量元素污染，而非布局越界（越界会是灾难性 fault 不是 99.22%）。
+bug 画像：借线小幅退化（scfa 99.22%，差阈值 0.28pt），decode 全绿、prefill 才挂。decode↔prefill 差异 = prefill 走更多 mask/window 的**条件控制流** + 更满的 workspace 占用。**结构性 sync/workspace 改动比舍入更贴这个画像**。
 
-| 序 | commit | 改动 | 文件:行 | 机制 | dtype |
-|---|---|---|---|---|---|
-| A | `577d34c` (#1000) | `copy_ub_to_ub` 新增 float→bf16 cast 分支 | `src/tl_templates/ascend/common.h` (`copy_ub_to_ub`) | 小幅精度漂移，正好 99.22% 量级 | **仅 bf16** |
-| B | `65a22c5` (#978) | reduce tmp buffer `dtype.bytes()/2` → `dtype.bytes()`（**翻倍**） | `allocate_tmp_buffer.cc:773`（`GetAscendCTmpBufferSize_` 的 `ascend_reduce()` 分支，**git blame 坐实是 #978**） | 隐藏 reduce scratch 翻倍 → UB 布局移位/越界踩相邻别名 buffer。⚠️ 但 `kernel.py:255-260` 注解显示作者**已用 178.3K 布局给 scratch 让位**，溢出可能已补偿 → 存疑 | dtype 无关 |
-| C | `4f4a060` (#1118) | `copy_gm_to_ub` pad 门控加 `\|\| (maskShapeN*sizeof(T))%32==0` | `src/tl_templates/ascend/common.h:~196` | 32B 对齐宽度改走非 pad 路径 → partial-window/tail（prefill 专属）数据可能带进 pad 区 | dtype 无关 |
+### ⭐ 头号（动我们跨核 CV 机制，且可廉价测）
+| commit | 改动 | 为什么贴 | 怎么测 |
+|---|---|---|---|
+| **`4477f9a` (#1002)** | 新增 898 行 `AscendWorkspaceReduction` pass，`phase.py:72` **无条件**跑；注释 "Erase manual workspace allocations for **virtual CV copy** in Ascend"；pass 内按 `cid * dst_full_extent` 重导 GM workspace（`ascend_workspace_reduction.cc:242/260`） | 正对我们手工分配、按 core-id 分片的 CV 跨核 workspace `ws_kv/ws_p/ws_o`（`ws_p[cid,...]`，`workspace_idx=[13,14,15,16]`）。重导布局若与 kernel 手工访问不符→污染。prefill 吃满 workspace、更易暴露 | **注释 `phase.py:72`**（pass 在 #968 基线根本不存在，禁掉 = 回到基线该阶段行为）→ kernel 重 JIT 跑 prefill。**纯 Python 改、不用重装 .so**。若禁掉后编不过/跑不了 = kernel 依赖该 pass，改走 checkout #1002 边界对比 |
+| **`1bc1002` (#1102)** | `cross_core_pipeline.cc` +370，给该 pass **新增 `IfThenElseNode` 处理**（之前收集跨核 buffer/scope 不进 if 分支） | 我们 kernel 跨核路径全是 if（`if cube_direct and t<NI_ori`、`if not cube_direct`、prefill mask 分支）。自动 sync 现在进 if 分支插/改 flag，可能与我们**手工 set_flag/wait_flag** 打架。decode 不怎么走这些分支、prefill 走得多→prefill 专属 | checkout `1bc1002` vs `1bc1002^`，各重装 .so 跑 prefill fast case |
 
-次要（结构非数值，低优先）：`3573c21`(#969 T.copy dynamic shape, `codegen_ascend.cc`)、`4477f9a`(#1002 workspace reduction pass)、`1bc1002`(#1102 cross_core_pipeline if-fix)。
+### 〇 中等
+| `65a22c5` (#978) | reduce tmp `bytes()/2`→`bytes()`（翻倍）。**git blame 坐实在我们路径 `allocate_tmp_buffer.cc:773`**（`GetAscendCTmpBufferSize_` 的 `ascend_reduce()` 分支，对应 `T.reduce_max`/`T.reduce_sum`） | 隐藏 reduce scratch 翻倍→UB 布局移位。⚠️ 但 `kernel.py:255-260` 注解显示作者已用 178.3K 布局给 scratch 让位，溢出或已补偿→存疑 | revert：`:773` 改回 `... / 2`，重装 .so 跑 |
 
-我们 kernel 确实用 `T.reduce_max`(`kernel.py:1029`) / `T.reduce_sum`(`kernel.py:1063`) 做 online-softmax 行规约 → lower 成 `ascend_reduce()`，正是 #978 改尺寸的那个 op。
+### ❌ 已排除 / 降权（代码级理由）
+- **`577d34c` (#1000) copy_ub_to_ub cast** —— **排除**。#1000 只把 `(T1=float,T2=bf16)` 加进 `CAST_NONE` 列表，即 **bf16→fp32 上转**（无损，舍入模式无关）。我们 epilogue 的是 **fp32→bf16 下转**（`T.copy(acc_s_ub, acc_s_half)`，src=fp32→dst=bf16 ⇒ `copy_ub_to_ub<T1=bf16,T2=float>`），落 `else` 分支用 `CAST_RINT`，**#1000 没碰它**。fp16 下转同理一直 `CAST_RINT`。⇒ 对两 dtype 都惰性。
+- **`4f4a060` (#1118) copy_gm_to_ub pad 门控** —— **降权**。只在 `maskShapeN` 已 32B 对齐时把 `rightPadding` 关掉（对齐宽度本不需 pad），`Duplicate` pad-fill 块未动 ⇒ 数值上≈no-op。
+- **`3573c21` (#969) T.copy dynamic shape** —— **降权**。codegen_ascend.cc 仅 9 行加动态 shape 路径，我们 kernel 全静态 shape。
 
 ---
 
-## 4. 容器行动计划（按性价比，从省到贵）
+## 4. 容器行动计划（v2，按性价比）
 
-### 步骤 0 —— 零重编诊断（先做，免费分流嫌疑）
-当前 fork HEAD 上，prefill **两 dtype 都跑**：
+### 步骤 1 —— 禁 #1002 pass（最便宜，纯 Python，不重装 .so）
 ```bash
+cd /app/data/tilelang-ascend
+# 注释掉 tilelang/engine/phase.py:72 的 AscendWorkspaceReduction()(mod)
 cd /sdb/yq/dsv4
 pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill and scfa" --runslow -v
 ```
-- **只 bf16(dtype0) 挂、fp16 过** → 直指 **A (`#1000` cast)**。
-- **两 dtype 都挂** → 指向 **B (`#978`) / C (`#1118`)**（dtype 无关）。
+- prefill 回 ≥99.5% → **#1002 坐实**（同时拿到 workaround：对本 kernel 禁该 pass，或让 pass 跳过我们手工 workspace）。
+- 编不过/跑不了 → kernel 依赖该 pass，改走"checkout `4477f9a` vs `4477f9a^` 对比"。
+- 顺带零成本分流：这步跑了**两 dtype**。结构 bug 应 dtype 无关；若只 bf16 挂、fp16 过，说明另有 bf16-specific codegen（回头单查）。
 
-### 步骤 1 —— 假设优先单点测（每个 = 1 行 revert + 重编 + 跑 fast case）
-重编：`cd /app/data/tilelang-ascend && USE_ASCEND=True pip install -e . --no-build-isolation`
-fast case：`pytest ...-k "prefill and dtype0 and scfa" --runslow -q`
+### 步骤 2 —— checkout 测 #1102
+`git checkout 1bc1002 && pip 重装 && 跑 prefill`；再 `git checkout 1bc1002^ && 重装 && 跑`。翻转即坐实。
 
-- 若步骤0指向 **bf16-only** → 先查 **A**：临时去掉 `copy_ub_to_ub` 里 `(std::is_same_v<T1,float> && std::is_same_v<T2,bfloat16_t>)` 那个 case，看 bf16 cast 路径是否变化（⚠️ 删了可能 fall-through 编译失败，这种就改成对照不同 cast 实现来测）。
-- 若步骤0是 **两 dtype 都挂** → 先 revert **B**：`allocate_tmp_buffer.cc:773` 把 `src_buffer_node->dtype.bytes();` 改回 `src_buffer_node->dtype.bytes() / 2;`，重编跑。⚠️ #978 本是 bugfix（某 op 需要更大 buffer），revert 仅作诊断，若 prefill 回 >99.5% 即坐实，再设计不踩别名的正解。
-  - B 不中 → revert **C**：`common.h:~196` 把 `if (maskShapeN == dstN || (maskShapeN * sizeof(T)) % 32 == 0)` 改回 `if (maskShapeN == dstN)`，重编跑。
+### 步骤 3 —— revert #978 一行
+`allocate_tmp_buffer.cc:773` `bytes()`→`bytes() / 2`，重装跑。⚠️ #978 本是 bugfix，revert 仅诊断。
 
-### 步骤 2 —— 兜底 `git bisect`（仅当上面都不中）
-```bash
-cd /app/data/tilelang-ascend
-git bisect start 5d3fcc9 2e27af7
-git bisect run bash -c '
-  cd /app/data/tilelang-ascend &&
-  USE_ASCEND=True pip install -e . --no-build-isolation -q || exit 125 &&
-  cd /sdb/yq/dsv4 &&
-  pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "prefill and dtype0 and scfa" --runslow -q
-'
-```
-⚠️ **caveat**：66 commit 跨度大，1d-β 内核未必每个中间 commit 都能 JIT 编译（gather/T.copy/atomic 等 API 漂移）。kernel JIT 失败会让 pytest 报 ERROR(非 FAIL)→ bisect 误判为 bad。`exit 125` 只挡 pip 装失败，挡不了 JIT 失败。所以**优先步骤 0/1**，bisect 当最后手段，且遇可疑结果手动 `git bisect skip`。
+### 兜底 —— 只在 our-path commit 上 bisect（不是全 66）
+our-path commit（动 `codegen_ascend.cc` / `tl_templates/ascend/` / 非 pto-gated transform）只有 ~7 个：`#969 #978 #980 #1002 #1034 #1102 #1118`(+端点 #1128)。在这几个边界手动二分即可，别盲跑全 66（1d-β 内核未必每个中间 commit 都能 JIT，全 bisect 易误判）。
 
 ---
 
-## 5. 关键 SHA 速查
-- 旧基线：`2e27af7`(upstream #968) ｜ fork 基线：`5d3fcc9`(#1128) ｜ fork HEAD(含补丁)：`52ad83a`
-- 红鲱鱼（别碰）：`1e763f4`(#1027 pto-only TROWSUM)
-- 嫌疑 A/B/C：`577d34c`(#1000) / `65a22c5`(#978) / `4f4a060`(#1118)
-- 本地仓：fork = `dsv4/tilelang-ascend`（branch `ascendc_pto`）；旧基线快照 = `WorkContent/tilelang-ascend`（HEAD `0de76b6`，有 `upstream` remote）
+## 5. 关键 SHA / 位置速查
+- 旧基线 `2e27af7`(#968) ｜ fork 基线 `5d3fcc9`(#1128) ｜ fork HEAD `52ad83a`
+- 头号嫌疑：`4477f9a`(#1002, `phase.py:72` + `src/transform/ascend_workspace_reduction.cc`)、`1bc1002`(#1102, `src/transform/cross_core_pipeline.cc` IfThenElse 处理)
+- 中等：`65a22c5`(#978, `allocate_tmp_buffer.cc:773`)
+- 已排除：`1e763f4`(#1027 pto)、`577d34c`(#1000 cast 上转无损)、`4f4a060`(#1118 对齐 pad)、`3573c21`(#969 动态 shape)
+- 本地仓：fork = `dsv4/tilelang-ascend`(`ascendc_pto`)；旧基线快照 = `WorkContent/tilelang-ascend`(HEAD `0de76b6`)
