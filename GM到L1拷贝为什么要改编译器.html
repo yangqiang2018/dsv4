@@ -96,21 +96,30 @@ td,th{border:1px solid #bbb;padding:6px 12px;text-align:center}
 <p>为什么常用却没人撞坑？因为绝大多数算子一次搬满整块。我们的算子（PageAttention 取 KV）数据按"页"散落在 GM，要<b>分几次</b>往同一个 L1 块的不同段补——立刻踩中。</p>
 
 <h2 id="sec4">四、出错过程（8 行块、分两批各 4 行）</h2>
-<p>真正的根子先说破：这条搬运指令<b>没有"从第几行开始写"这个参数</b>。它只知道两件事——块的整体形状（8 行 × 4 列，编译期写死）、这次给它几行。把实际代码摆出来一眼就明白：</p>
-<pre><span class="c"># TileLang 里这样写一次 GM→L1 搬运：</span>
-T.<span class="k">copy</span>(ori_KV[blk, row : row+8, :],  <span class="c"># 源：GM 里某 8 行</span>
-       kv_l1)                      <span class="c"># 目标：L1 缓冲</span>
+<p>先回应一个很自然的疑问：上面 <code>ori_KV[blk, row : row+8, :]</code> 不是已经写了"从第 row 行取 8 行"吗——怎么说不能指定行？</p>
+<p>因为一次搬运有<b>两头</b>，"能不能指定行"两头不一样：</p>
+<ul>
+<li><b>源头 GM</b>（按行线性排）："从第几行起、取几行" = "从某地址起、读多长"，<b>天然支持</b>——那个 <code>row : row+8</code> 就是它，没问题。</li>
+<li><b>目标 L1</b>（NZ 竖条排，见<a href="#sec2">第二节</a>）：这条指令<b>只接受一个目标起点地址 + 整块形状</b>，没有"往第几行写"这一项。</li>
+</ul>
+<p>把代码摊开就一目了然——能切行段的是<b>源</b>，目标只能给整块：</p>
+<pre><span class="c"># ✅ 源(GM)：想取哪几行，随便切</span>
+T.<span class="k">copy</span>(ori_KV[blk, row : row+8, :],   <span class="c"># 从第 row 行取 8 行 —— 支持</span>
+       kv_l1)                           <span class="c"># 目标：只能整块给</span>
 
-<span class="c"># 编译器把它翻成这条底层调用：</span>
-<span class="k">copy_gm_to_l1</span>&lt;bf16, <b>8, 4</b>&gt;(   <span class="c"># ← 8,4 = 整块形状，编译期写死</span>
-    kv_l1,                  <span class="c"># 目标缓冲（只有一个起点地址）</span>
-    src,                    <span class="c"># 源地址</span>
-    srcN = 4,               <span class="c"># 源一行多少列</span>
-    tailM = 4,              <span class="c"># ← 这次给几行</span>
-    tailN = 4);             <span class="c"># ← 一行里几列有效</span>
-<span class="c">#   能调的就这几个数：块形 + 几行 + 几列。</span>
-<span class="c">#   <b>从来没有一个「从第几行开始写」的参数。</b></span></pre>
-<p>所以它对任何一次调用都只有一种理解："这是一个完整 8 行块、从它的开头写起。"</p>
+<span class="c"># ❌ 我们真正想要的：只往 L1 的"第 4~8 行"补 4 行</span>
+T.<span class="k">copy</span>(ori_KV[blk, row : row+4, :],
+       kv_l1[<b>4:8</b>, :])                   <span class="c"># ← 目标也想切行段</span>
+<span class="c">#   这行能编过，但 L1 是 NZ：编译器把 kv_l1[4:8] 退化成一个"偏移指针",</span>
+<span class="c">#   底层模板仍按"整块从这个指针起"重新铺 NZ + 清零 —— 即下面要演的错。</span>
+
+<span class="c"># 它最终编译成的底层调用，参数表里根本没有"目标起始行":</span>
+<span class="k">copy_gm_to_l1</span>&lt;bf16, <b>8, 4</b>&gt;(   <span class="c"># 8,4 = 整块形状(编译期写死)</span>
+    dst_ptr,                <span class="c"># 目标：就一个起点地址(切行段也只是挪它)</span>
+    src_ptr, srcN = 4,      <span class="c"># 源：地址 + 每行列数</span>
+    tailM = 4, tailN = 4);  <span class="c"># 这次搬几行 / 一行几列有效</span>
+<span class="c">#   能调的就这些：块形 + 几行 + 几列 —— 唯独没有"写到目标的第几行"。</span></pre>
+<p>所以"指定行"只在<b>源</b>那头成立；到了 NZ 的<b>目标</b>那头，切了也不算数。它对任何一次调用都只有一种理解："这是一个完整 8 行块、从它的开头写起。"下面看它具体错在哪：</p>
 <p>而麻烦正好撞上 <a href="#sec2">第二节</a>的 NZ：在 L1 里，<b>一行被拆成两段，分别躺在相隔很远的两个竖条里</b>（如 r1 = 条① 的 a1a2 + 条② 的 a3a4）。下图是这个 8 行块在 L1 的真实样子：</p>
 
 <figure>
