@@ -335,6 +335,14 @@ def build_sparse_attn_sharedkv(
             ws_p: T.Tensor([core_num, 2, H_per_block, BI], dtype),  # type: ignore[valid-type]
             ws_o: T.Tensor([core_num, 2, H_per_block, D], accum_dtype),  # type: ignore[valid-type]
         ):
+            # Opt out of AscendWorkspaceReduction: this kernel fully manages its
+            # own cube<->vector workspace (explicit ws_* params, manual
+            # cid/vid/parity sharding, manual cross-core flags). That pass
+            # assumes UB sources were vid-halved by VidReduction and re-derives a
+            # cid-sharded GM workspace; on our manually-managed buffers it
+            # mis-rewrites and corrupts prefill (decode masks all-1 so it is
+            # insensitive; prefill's -inf/window control flow exposes it).
+            T.func_attr({"disable_workspace_reduction": True})
             with T.Kernel(core_num, is_npu=True) as (cid, vid):
                 # ---- L1 / L0 (cube). ----
                 q_l1 = T.alloc_L1([H_per_block, D], dtype)
