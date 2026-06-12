@@ -416,8 +416,13 @@ def build_sparse_attn_sharedkv(
                 # aliases it for free (no UB-budget growth). SCFA keeps the
                 # per-head loop (it needs kv_ub_multi for the gather, and the
                 # broadcast resonates in its lockstep regime -- see tilelang-perf
-                # skill "broadcast row sub").
-                m_i_brd = T.alloc_ub([v_block, BI], accum_dtype)
+                # skill "broadcast row sub"). Declared ONLY for cube_direct:
+                # otherwise the m_i_brd<->kv_ub_multi alias perturbs SCFA's alias
+                # analysis (conservative syncs around its gather, measured +4ms),
+                # even though SCFA never writes m_i_brd. Keeping it out of SCFA's
+                # IR entirely leaves that path byte-identical.
+                if cube_direct:
+                    m_i_brd = T.alloc_ub([v_block, BI], accum_dtype)
                 # Mask double buffer [2, mask_w]: V0(t) writes parity t%2 while
                 # V1(t-1) reads parity (t-1)%2 in the same step. The row is
                 # padded to mask_w (32B) so both parity rows are 32B aligned; a
@@ -465,7 +470,8 @@ def build_sparse_attn_sharedkv(
                         kv_ub_multi: ub_addr["kv_ub_multi"],
                         # m_i_brd aliases kv_ub_multi: only live when cube_direct
                         # (gather off -> kv_ub_multi idle); 16KB fits its 32KB.
-                        m_i_brd: ub_addr["kv_ub_multi"],
+                        # Keyed in only for cube_direct so SCFA's IR is unchanged.
+                        **({m_i_brd: ub_addr["kv_ub_multi"]} if cube_direct else {}),
                         mask_ub: ub_addr["mask_ub"],
                         mask_ub_2: ub_addr["mask_ub_2"],
                         mask_sel: ub_addr["mask_sel"],
