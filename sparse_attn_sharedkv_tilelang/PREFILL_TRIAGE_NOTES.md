@@ -5,16 +5,15 @@
 
 ---
 
-## ✅ RESOLVED（2026-06-11，隔离探针坐实 + 修复已推）
+## ✅ RESOLVED（2026-06-11，干净构建上 revert 坐实）
 
-**根因 = `AscendWorkspaceReduction` pass（#1002 `4477f9a`, `phase.py:72`）**。用户实测：注释掉 `phase.py:72` 重 JIT → prefill scfa 恢复 ≥99.5%。机制见 §3。
+**根因 = upstream `65a22c5`（#978 "change ascendc reduce tmp buffer size"）**，不是 #1002。它把 `GetAscendCTmpBufferSize_`（我们 ascendc 路径）`ascend_reduce` 分支 tmp 从 `args[3]*bytes()/2` 改成 `*bytes()`（翻倍），撞我们极紧的手工 UB 布局 → 污染 prefill。**修复 = 保持 `/2`**（fork `9a0d62d`，`allocate_tmp_buffer.cc`）。验证：decode 全绿 + scfa/cfa prefill 全绿。
 
-**修复 = 整函数 opt-out attr `disable_workspace_reduction`**（已推，待容器验）：
-- fork ascendc_pto **`03f8858`**：`AscendWorkspaceReductionPass::Substitute` 顶部守卫，带该 attr 即原样返回。
-- dsv4 main **`8343436`**：`kernel.py` body 首行 `T.func_attr({"disable_workspace_reduction": True})`。
-- **容器验证**：两仓 pull → fork `.cc` 改了**必须重装 .so**（`USE_ASCEND=True pip install -e . --no-build-isolation`）→ 跑 prefill 全场景两 dtype + decode 回归检查。
+**⚠️ #1002 是误判，已洗清**：之前"注释 phase.py:72 → prefill pass"是**旧 .so 假信号**（只改 Python 没 `pip install`，跑的是重装前的 .so）。干净重装后 pass-off 不修复（pass-on 99.39 > pass-off 99.20，该 pass 反而帮忙）。#1002 的 opt-out attr 全部撤回（dsv4 `d9dec74`、fork `2b2a3c3`）。**教训：NPU 任何省事信号必须在干净重装 .so 上复现。**
 
-下面 §1–§5 是定位过程的完整记录（含已排除的红鲱鱼），保留备查。
+**遗留（独立 bug，属 §9 不属 §1）**：`swa_prefill` 走 cube-direct 时 91% 错;`cube_direct=False`（老 vector 路径）→ PASS。是 cube-direct SWA 自己的 prefill bug（decode swa 用 cube-direct 却过 → GM→L1 子块写没问题，是 prefill 特有的多 chunk 流水/sync/noClear 之一）。fallback 正确但丢 cube-direct 提速。
+
+下面 §1–§5 是定位过程记录（注:§3 的嫌疑排序把 #1002/#1102 列为头号是**误判**,真凶是当时列"中等"的 #978——教训见上）。
 
 ---
 
