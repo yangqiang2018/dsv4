@@ -8,14 +8,16 @@
 ## 0. 一句话现状
 
 - **目标**（用户定）：TileLang 版前向 perf 做到 AscendC 的 **80–100%**。
-- **HEAD**：dsv4 main = `c9f0eb8`（kernel = cube-direct SWA 已启用 + 逐行 SCFA/CFA 老路）。fork `yangqiang2018/tilelang-ascend` 分支 `ascendc_pto` = `025ef5c`（#978 reduce-tmp `/2` 修复 + is_subtile runtime-extent 修复）。
-- **验证**：**decode + prefill 三场景全绿**（swa 用 cube-direct）。
-- **perf**（`perf_compare`，sharedkv 列，perf%=AscendC/TileLang，越高越接近 AscendC；**忽略 metadata 算子**）：**swa 37.0% / cfa 30.7% / scfa 16.1%**（TOTAL sharedkv 20.5%）。swa 已被 cube-direct 从 ~18.6% 基线翻倍。
-- **本棒任务**：**扩 cube-direct 到 CFA 的 cmp**（dense 连续索引），cfa 30.7% → 目标 ~swa 量级。SCFA 的 topK 离散索引留 vector 路（不动）。
+- **HEAD**：dsv4 main = `cc6c02e`（kernel = cube-direct SWA **+ CFA cmp** 已启用；SCFA 仍逐行老路）。fork `yangqiang2018/tilelang-ascend` 分支 `ascendc_pto` = `025ef5c`（#978 reduce-tmp `/2` 修复 + is_subtile runtime-extent 修复）。
+- **验证**：**decode + prefill 三场景全绿**（swa+cfa 用 cube-direct，NPU 实测 2026-06-12 全 PASS）。
+- **perf**（`perf_compare`，sharedkv 列，perf%=AscendC/TileLang，越高越接近 AscendC；**忽略 metadata 算子**）：**swa 37.0% / cfa 42.8% / scfa 15.9%**（TOTAL sharedkv 21.3%）。swa 已被 cube-direct 从 ~18.6% 翻倍；**cfa 从 30.7% → 42.8%（cube-direct cmp，反超 swa）**。
+- **下一杠杆**：**scfa 15.9%（最慢）** —— topK 离散 gather，没法 cube-direct，是硬骨头（见 §5）。
 
 ---
 
-## 1. ⭐ 立刻要做：CFA cube-direct
+## 1. ✅ 已完成（cc6c02e，NPU 验证 cfa 30.7%→42.8%）：CFA cube-direct
+
+> 这一棒收官。下面是配方记录（已落地）。下一棒看 §5（scfa 硬骨头 / 跨核 lockstep）。通用手段已沉淀进 tilelang-perf skill 手段 4。
 
 **思路**：cube-direct 提速的本质 = 砍掉 KV 的跨核同步（cube 自己 GM→L1 直拷，不过 vector gather / ws_kv / KV_READY）。swa 已这么做。CFA 的 cmp 也是 **dense 连续**（`gc0=(t-NI_ori)*BI+...`，cube 标量读 `cmp_block_table` 直拷），同样能 cube-direct。
 
