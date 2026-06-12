@@ -880,18 +880,32 @@ def build_sparse_attn_sharedkv(
                                         # from the (t-1)%2 L1 buffers, loaded by
                                         # MM1(t-1) the previous step.
                                         pb = (t - 1) % 2
+                                        # MM2 cube debarrier (same idea as MM1):
+                                        # replace the over-syncing barrier_all on
+                                        # the real cross-pipe deps with one targeted
+                                        # flag, and drop the redundant same-pipe
+                                        # barrier. Kept as barrier_all: the boundary
+                                        # after the P_READY wait (p L1 reuse + the
+                                        # acc_s_l0c/acc_o_l0c alias vs MM1), the
+                                        # split between the two accumulating gemms
+                                        # (same-pipe MAD ordering is automatic, but
+                                        # the L0C accumulate is left guarded for
+                                        # now), and the trailing boundary.
                                         T.wait_cross_flag(_FLAG_P_READY)
                                         T.barrier_all()
                                         T.copy(
                                             ws_p[cid, pb, 0:H_per_block, 0:BI_half],
                                             p_lo,
                                         )
-                                        T.barrier_all()
+                                        # copy_lo -> copy_hi: same MTE2 pipe, disjoint
+                                        # dst buffers -> in-order, no barrier needed.
                                         T.copy(
                                             ws_p[cid, pb, 0:H_per_block, BI_half:BI],
                                             p_hi,
                                         )
-                                        T.barrier_all()
+                                        # p copies (MTE2) -> gemm (MAD) reads p (RAW).
+                                        T.set_flag("mte2", "m", 0)
+                                        T.wait_flag("mte2", "m", 0)
                                         # P@V = sum over the two KV halves;
                                         # init=False accumulates the second half.
                                         T.gemm_v0(
@@ -901,7 +915,9 @@ def build_sparse_attn_sharedkv(
                                         T.gemm_v0(
                                             p_hi, kv_hi[pb, :, :], acc_o_l0c, init=False
                                         )
-                                        T.barrier_all()
+                                        # gemm (MAD) -> copy acc_o_l0c (FIX) reads it (RAW).
+                                        T.set_flag("m", "fix", 1)
+                                        T.wait_flag("m", "fix", 1)
                                         T.copy(
                                             acc_o_l0c,
                                             ws_o[cid, pb, 0:H_per_block, 0:D],
