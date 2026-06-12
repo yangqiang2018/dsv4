@@ -185,14 +185,16 @@ def build_sparse_attn_sharedkv(
     # generates them per chunk with createvecindex instead of reading a
     # host-synthesized cmp_indices array (mirrors the Ascend C CFA path).
     is_cfa = scenario == 2
-    # CORRECTNESS FALLBACK (§9 perf follow-up): cube-direct KV is verified on SWA
-    # *decode* (passes) but SWA *prefill* corrupts ~9% of outputs. Suspected
-    # kv_lo WAR race: cube-direct writes kv_lo directly (parity depth-2 only),
-    # bypassing the ws_kv double-buffering that guarded reuse on the old path, so
-    # chunk t+1's GM->L1 load can overwrite kv_lo[(t-1)%2] before MM2(t-1) reads
-    # it (decode's short pipeline never reaches the conflict; prefill's does).
-    # Forced off -> SWA uses the proven vector-gather path. Original gate (re-
-    # enable once the WAR race is fixed): cube_direct = NI_cmp == 0.
+    # CORRECTNESS FALLBACK (§9 perf follow-up): cube-direct SWA *prefill* corrupts
+    # ~9% of outputs. ROOT CAUSE (confirmed): the cube-direct 16-row GM->L1 copies
+    # do a single block-table lookup per pass (ori_KV[blk, rowc:rowc+16]), but
+    # prefill's window start (ori_left) is not block-aligned, so a pass with
+    # rowc = g0 % block > block-16 straddles two paged blocks yet reads only one
+    # -> wrong physical KV. AscendC's DataCopyPA splits at the boundary; we don't.
+    # A kernel-level split (commit f33240e, reverted) made it WORSE: our zN GM->L1
+    # codegen mis-addresses non-16-aligned runtime row offsets. The fix needs the
+    # boundary split inside the GM->L1 primitive (port DataCopyPA). Forced off ->
+    # SWA uses the proven vector-gather path. Re-enable: cube_direct = NI_cmp == 0.
     cube_direct = False
 
     H_per_block = gqa_group  # 64
