@@ -185,8 +185,15 @@ def build_sparse_attn_sharedkv(
     # generates them per chunk with createvecindex instead of reading a
     # host-synthesized cmp_indices array (mirrors the Ascend C CFA path).
     is_cfa = scenario == 2
-    # cube-direct KV verified on SWA only so far; cmp paths pending diagnosis.
-    cube_direct = NI_cmp == 0
+    # CORRECTNESS FALLBACK (§9 perf follow-up): cube-direct KV is verified on SWA
+    # *decode* (passes) but SWA *prefill* corrupts ~9% of outputs. Suspected
+    # kv_lo WAR race: cube-direct writes kv_lo directly (parity depth-2 only),
+    # bypassing the ws_kv double-buffering that guarded reuse on the old path, so
+    # chunk t+1's GM->L1 load can overwrite kv_lo[(t-1)%2] before MM2(t-1) reads
+    # it (decode's short pipeline never reaches the conflict; prefill's does).
+    # Forced off -> SWA uses the proven vector-gather path. Original gate (re-
+    # enable once the WAR race is fixed): cube_direct = NI_cmp == 0.
+    cube_direct = False
 
     H_per_block = gqa_group  # 64
     v_block = H_per_block // 2  # 32 -- each AIV handles half the heads
