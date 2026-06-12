@@ -8,27 +8,24 @@
 ## 0. 一句话现状
 
 - **目标**（用户定）：把 TileLang 版 sparse_attn_sharedkv 前向 perf 做到 AscendC 的 **80–100%**（当前基线 36.9ms ≈ 18.6%；AscendC 6.87ms）。
-- **HEAD**：dsv4 main = `a27c565`（kernel = cube-direct SWA + 逐行 SCFA/CFA 老路）。当前最佳态另存 branch `probe-current-9922`。
-- **编译器 fork**：`yangqiang2018/tilelang-ascend` 分支 `ascendc_pto`，HEAD = `52ad83a`（我们的 GM→L1 子块写补丁，净效果就这一个 commit）。
-- **验证状态**：**decode 三场景(scfa/swa/cfa) × 两 dtype(bf16/fp16) 全绿**。**prefill 全场景 <99.5% 借线**（scfa 99.22%）。
-- **⚠️ 最重要的结论**：**prefill 借线是 fork 环境回归，不是我们的内核/编译器工作**。Ground-truth 探针（`87df937`，把 kernel 换成 session 前"prefill 验过"的 1d-β `d9d6552`，同 fork 上跑）只有 **98.95%，比当前 99.22% 还差**。⇒ fork（领先旧 tilelang-ascend 37 commit）的上游改动改了数值，连旧基线都跌破阈值；decode 不敏感（全窗口 mask 全 1）所以全绿，prefill（部分窗口走 -inf 屏蔽）才暴露。
+- **HEAD**：dsv4 main = `6392480`（kernel = cube-direct SWA 暂 force-off 的 fallback + 逐行 SCFA/CFA 老路）。
+- **编译器 fork**：`yangqiang2018/tilelang-ascend` 分支 `ascendc_pto`，HEAD = `9a0d62d`（GM→L1 子块写补丁 `52ad83a` + #978 reduce-tmp 修复）。
+- **验证状态**：**decode 三场景 × 两 dtype 全绿**；**prefill 三场景(scfa/cfa/swa) 全绿**（swa 暂走老 vector 路径 fallback，见 §1）。
+- **✅ prefill 回归已解决**：真凶 = upstream **#978**(`65a22c5`)把我们 ascendc 路径的 reduce tmp 翻倍，撞极紧的手工 UB → 污染 prefill；修复 = fork 保持 `/2`(`9a0d62d`)。⚠️ 曾误判为 #1002(AscendWorkspaceReduction)——那是**旧-.so 假信号**(只改 Python 没 `pip install`)，已洗清。**教训：NPU 任何省事信号必须在干净重装 .so 上复现。**
 
 ---
 
-## 1. ⭐ 立刻要做（接手第一件事）：triage fork 的 prefill 数值回归
+## 1. ✅ 已解决：fork 的 prefill 数值回归（真凶 #978）
 
-**这是 ship 的 blocker，且与 perf 优化正交。** prefill 要重新过 99.5%，三条路（按推荐序）：
+**曾是 ship blocker，现已结案。** 真凶 = upstream **`65a22c5`(#978 "change ascendc reduce tmp buffer size")**：把 `allocate_tmp_buffer.cc` 的 `GetAscendCTmpBufferSize_`（我们 ascendc/auto 路径）`ascend_reduce` 分支 tmp 尺寸从 `args[3]*bytes()/2` 改成 `*bytes()`（翻倍）。我们 kernel 的 online-softmax reduce（`T.reduce_max`/`T.reduce_sum` on fp32 `acc_s_ub`）隐藏 tmp 翻倍，撞极紧的手工 UB 布局（`kernel.py:255-260`，只剩 ~13.7K tail）→ 布局移位/别名污染 prefill 的 -inf 路径；decode mask 全 1 不敏感。
 
-1. **bisect fork 的 37 个上游 commit**（`5d3fcc9` 是我们 fork 时的基线；旧 tilelang-ascend 上 1d-β prefill 是过的）。
-   - 容器里：`cd /app/data/tilelang-ascend && git log --oneline <旧基线>..5d3fcc9`（注意是 fork 基线之前的上游历史；fork 本身基于上游某点）。
-   - 高嫌疑：动 codegen 数值/round/cast/reduce tmp 的 commit。`git log --oneline --grep -iE "round|cast|precision|reduce|softmax|fp32|accum"`。
-   - 二分时用**最快的单 case**：`pytest ...-k "prefill and dtype0 and scfa" --runslow`（一次 ~几分钟）。
-2. **把 GM→L1 子块补丁打到原 0.1.9 源**（容器原装 tilelang 0.1.9，若它 prefill 过）。代价：要在 0.1.9 上重做 §3 的补丁（codegen 结构可能不同）。
-3. **暂以 decode 验证为准**，prefill 借线挂账，先推进 perf（cube-direct 的 SWA 收益用 decode + perf compare 量）。
+- **修复（已 ship）**：fork 保持 `/2` —— `9a0d62d`（`src/transform/allocate_tmp_buffer.cc`）。验证：decode 全绿 + scfa/cfa prefill 全绿。fork-local 取舍：上游那个 fp32 gemv 例子会回退，但不是我们的算子。
+- **⚠️ 定位教训（必读）**：曾误判为 #1002(`AscendWorkspaceReduction`)，因为"注释 `phase.py:72` → prefill pass"。那是**旧-.so 假信号**——只改 Python 没 `pip install`，跑的是重装前的 .so；干净重装后 pass-off 根本不修复（且该 pass 反而帮忙）。**NPU 任何省事信号必须在干净重装的 .so 上复现；真凶是靠"当前 fork 上逐个 revert 嫌疑 + 干净重装"定位的。** #1002 的 opt-out 全部撤回（dsv4 `d9dec74`、fork `2b2a3c3`）。
+- 已排除红鲱鱼：`1e763f4`(#1027 TROWSUM)是 `GetPTOTmpBufferSize_` pto 专用；`577d34c`(#1000 cast)只动 bf16→fp32 无损上转。完整 triage 见 `PREFILL_TRIAGE_NOTES.md`。
 
-**判据**：随便挑一个旧 fork commit（比如 `5d3fcc9`）checkout 编译装上、跑 1d-β prefill。若过 → 回归在 `5d3fcc9` 之后（但那是 fork HEAD，矛盾，说明回归更早）；若不过 → 回归在我们 fork 基线之前的上游。**最干净是直接 bisect 到具体 commit。**
+### ⏸ 遗留（下一棒，属 §9 perf）：cube-direct SWA prefill bug
 
-> 注意：我们的子块补丁（`52ad83a`）对 whole-block 路径**字节级等价**（SCFA/CFA 走的就是 whole-block），所以补丁本身不是 prefill 回归源——已用「探针 1d-β + 补丁 fork = 98.95%」证实。
+`swa_prefill` 走 cube-direct（`cube_direct=NI_cmp==0`，只有 swa 满足）时 **91% 错**；decode swa 用 cube-direct 却过 → GM→L1 子块写本身没问题，是 prefill 特有。**当前 `kernel.py` force `cube_direct=False`（`6392480`）让 swa 走老 vector 路径 fallback —— 正确但丢掉 cube-direct 提速。** 假设 = `kv_lo` WAR race：cube-direct 直写 `kv_lo`（只 parity depth-2 缓冲），绕过老路 ws_kv 的重用保护，chunk t+1 的 GM→L1 加载可能在 `MM2(t-1)` 还读 `kv_lo[(t-1)%2]` 时覆盖它（decode 流水短够不到，prefill 够得到）。已挂 spawn-task chip。修它 = 拿回 cube-direct 提速（~1.87ms vs 6.8ms），往 §9 的 80% 推。
 
 ---
 
@@ -93,15 +90,18 @@ S2b/S2c/FUSE/V2 四次独立实验全证：**核内 pipe 重叠机制全验通(p
 ## 7. commit 地图
 
 **dsv4 main**（可回退）：
-- `a27c565` **HEAD** docs(fork prefill 回归记录)
-- `356912c` 当前最佳 kernel（= cube-direct + 逐行；`probe-current-9922` 同此）
+- `6392480` **HEAD** force `cube_direct=False`（SWA prefill fallback；cube-direct WAR-race 待修，见 §1/§9）
+- `9012315`/`0a9d130` docs（prefill triage 校正到 #978）
+- `a27c565` docs(fork prefill 回归记录)
+- `356912c` cube-direct + 逐行 kernel（`probe-current-9922` 同此）
 - `1ee7873` 退回逐行 ori gather（95.69→99.22，FUSE-V0 是 prefill bug）
 - `88b9151`/`85ed7cb` 退回 FUSE-V1/V2 逐行 + 删 brc_tmp/mask_full
 - `cc06dfa` 修死锁（back-flag drain 改 `not cube_direct`）
 - `tag s2-forward-balance-36.9`(=`230a551`) **纯调度最优回退点 36.9ms**（cube-direct 之前，FUSE 之前）
 
 **fork ascendc_pto**（编译器，可回退到 `5d3fcc9` = 无补丁）：
-- `52ad83a` **HEAD** GM→L1 子块写最终补丁（净效果就这个）
+- `9a0d62d` **HEAD** #978 reduce-tmp 修复（`allocate_tmp_buffer.cc` 保持 `/2`）
+- `52ad83a` GM→L1 子块写补丁
 - `5d3fcc9` fork 基线（无我们的补丁）
 
 ---
@@ -117,10 +117,10 @@ S2b/S2c/FUSE/V2 四次独立实验全证：**核内 pipe 重叠机制全验通(p
 
 ---
 
-## 9. 通往 80% 的路线（prefill 回归解决后）
+## 9. 通往 80% 的路线（prefill 回归已解决）
 
-1. **解 prefill 回归**（§1）——前置，否则 cube-direct 验不了 prefill。
-2. **量 cube-direct SWA 收益**：prefill 三场景过 + `perf_compare swa_prefill`。SWA 把 KV 同步整删，应大跳（27.6% 起）。
+1. ✅ **解 prefill 回归** —— 已完成（§1，真凶 #978，fork `9a0d62d`）。
+2. **解 cube-direct SWA prefill bug + 量收益**（下一棒）：当前 swa 走老路 fallback（`cube_direct=False`）。先修 §1 遗留的 `kv_lo` WAR-race（chip 已挂）让 cube-direct swa prefill 过线、恢复 `cube_direct=NI_cmp==0`，再 `perf_compare swa_prefill` 量收益（SWA 把 KV 同步整删，应大跳，27.6% 起）。
 3. **扩 cube-direct 到 CFA cmp**（dense 连续，cube 标量读 cmp_block_table 直拷 GM→L1）。SCFA topK 离散留 vector。
 4. **若仍不够 80%**：跨核握手深度（ws_* 多缓冲 + cube 提前一拍，复刻 PreloadPipeline）——但注意 §5 的 lockstep 教训，单刀会共振，要整体重排工作分配。
 5. 每刀通用手段记进 tilelang-perf/pitfalls skill（源仓库 + 缓存两处，MEMORY 有约定）。
