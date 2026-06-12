@@ -1479,14 +1479,28 @@ def build_sparse_attn_sharedkv(
                                 T.wait_flag("v", "mte2", 0)
                                 T.wait_flag("v", "mte2", 1)
                                 # ---- normalize and write back ----
-                                for h_i in range(v_block):
-                                    T.barrier_all()
-                                    T.tile.div(
-                                        acc_o[h_i, :],
-                                        acc_o[h_i, :],
-                                        sumexp[h_i],
-                                    )
-                                    T.barrier_all()
+                                # cube_direct (swa/cfa, perf lever 2): drop the
+                                # per-head barriers -- the v_block divs are same-
+                                # VEC-pipe in-order on distinct acc_o rows, so the
+                                # 2*v_block barrier_all per slot are redundant
+                                # (another vector-bubble source). SCFA keeps the
+                                # barriered form (lockstep resonance).
+                                if cube_direct:
+                                    for h_i in range(v_block):
+                                        T.tile.div(
+                                            acc_o[h_i, :],
+                                            acc_o[h_i, :],
+                                            sumexp[h_i],
+                                        )
+                                else:
+                                    for h_i in range(v_block):
+                                        T.barrier_all()
+                                        T.tile.div(
+                                            acc_o[h_i, :],
+                                            acc_o[h_i, :],
+                                            sumexp[h_i],
+                                        )
+                                        T.barrier_all()
                                 T.copy(acc_o, acc_o_half)
                                 T.barrier_all()
                                 T.copy(
