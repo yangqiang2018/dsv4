@@ -821,6 +821,22 @@ def build_sparse_attn_sharedkv(
                                                 kv_hi[pa, :, :],
                                             )
                                             T.barrier_all()
+                                        # MM1 cube debarrier (perf lever 1): the
+                                        # two score gemms + their L0C->ws_score
+                                        # drains are a strictly serial MAD->FIX->
+                                        # MAD->FIX chain on the single acc_s_l0c.
+                                        # barrier_all over-synced it (also drained
+                                        # MTE2/MTE1), inflating the cube bubble
+                                        # (~34% of aicore_time, swa profile). Each
+                                        # internal sync is one targeted pipe flag:
+                                        # m->fix (gemm drains to copy) and fix->m
+                                        # (copy reads acc_s_l0c before the next
+                                        # gemm overwrites it, WAR). The boundary
+                                        # barrier_all is kept -- copy_hi(FIX) must
+                                        # finish before MM2 reuses L0C (acc_s_l0c /
+                                        # acc_o_l0c alias). Cube pipe flags live on
+                                        # AIC, disjoint from the V-scope's AIV flag
+                                        # ids.
                                         T.gemm_v0(
                                             q_l1,
                                             kv_lo[pa, :, :],
@@ -828,12 +844,16 @@ def build_sparse_attn_sharedkv(
                                             transpose_B=True,
                                             init=True,
                                         )
-                                        T.barrier_all()
+                                        T.set_flag("m", "fix", 0)  # gemm_lo -> copy_lo
+                                        T.wait_flag("m", "fix", 0)
                                         T.copy(
                                             acc_s_l0c,
                                             ws_score[cid, pa, 0:H_per_block, 0:BI_half],
                                         )
-                                        T.barrier_all()
+                                        T.set_flag(
+                                            "fix", "m", 1
+                                        )  # copy_lo -> gemm_hi WAR
+                                        T.wait_flag("fix", "m", 1)
                                         T.gemm_v0(
                                             q_l1,
                                             kv_hi[pa, :, :],
@@ -841,7 +861,8 @@ def build_sparse_attn_sharedkv(
                                             transpose_B=True,
                                             init=True,
                                         )
-                                        T.barrier_all()
+                                        T.set_flag("m", "fix", 2)  # gemm_hi -> copy_hi
+                                        T.wait_flag("m", "fix", 2)
                                         T.copy(
                                             acc_s_l0c,
                                             ws_score[
