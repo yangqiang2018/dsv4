@@ -1426,24 +1426,57 @@ def build_sparse_attn_sharedkv(
                                                 acc_o_ub,
                                             )
                                             T.barrier_all()
-                                            # Per-head rescale + merge (proven
-                                            # per-row form; FUSE-V2 reverted with
-                                            # the brc_tmp/mask_full aliasing that
-                                            # raced V2's acc_o_ub at prefill scale).
-                                            for h_i in range(MERGE_HEADS):
-                                                T.barrier_all()
-                                                T.tile.mul(
-                                                    acc_o[hbase + h_i, :],
-                                                    acc_o[hbase + h_i, :],
-                                                    alpha[pv2 * ub_len + hbase + h_i],
-                                                )
-                                                T.barrier_all()
+                                            # Per-head rescale + merge. cube_direct
+                                            # (swa/cfa, perf lever 2): drop the per-
+                                            # head barriers -- the mul/add are same-
+                                            # VEC-pipe in-order and acc_o_ub was
+                                            # already drained by the barrier above,
+                                            # so the ~3*MERGE_HEADS barrier_all per
+                                            # pass (a big slice of the vector bubble,
+                                            # swa profile) are redundant -- and fold
+                                            # the per-head add into one full-tile add
+                                            # (compile-time hbase slice). The rescale
+                                            # mul stays per-head (scalar alpha; the
+                                            # broadcast form is a later increment).
+                                            # SCFA keeps the barriered per-row form:
+                                            # in its lockstep regime debarrier
+                                            # resonates (skill FUSE-V2 / "broadcast
+                                            # row sub" notes).
+                                            if cube_direct:
+                                                for h_i in range(MERGE_HEADS):
+                                                    T.tile.mul(
+                                                        acc_o[hbase + h_i, :],
+                                                        acc_o[hbase + h_i, :],
+                                                        alpha[
+                                                            pv2 * ub_len + hbase + h_i
+                                                        ],
+                                                    )
                                                 T.tile.add(
-                                                    acc_o[hbase + h_i, :],
-                                                    acc_o[hbase + h_i, :],
-                                                    acc_o_ub[h_i, :],
+                                                    acc_o[
+                                                        hbase : hbase + MERGE_HEADS, :
+                                                    ],
+                                                    acc_o[
+                                                        hbase : hbase + MERGE_HEADS, :
+                                                    ],
+                                                    acc_o_ub,
                                                 )
-                                                T.barrier_all()
+                                            else:
+                                                for h_i in range(MERGE_HEADS):
+                                                    T.barrier_all()
+                                                    T.tile.mul(
+                                                        acc_o[hbase + h_i, :],
+                                                        acc_o[hbase + h_i, :],
+                                                        alpha[
+                                                            pv2 * ub_len + hbase + h_i
+                                                        ],
+                                                    )
+                                                    T.barrier_all()
+                                                    T.tile.add(
+                                                        acc_o[hbase + h_i, :],
+                                                        acc_o[hbase + h_i, :],
+                                                        acc_o_ub[h_i, :],
+                                                    )
+                                                    T.barrier_all()
 
                                 # 1d-beta drain: the last two selects set v->mte2
                                 # with no in-loop waiter (no prefetch in the final
