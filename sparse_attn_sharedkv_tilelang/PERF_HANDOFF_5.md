@@ -64,8 +64,20 @@
 
 ---
 
-## 5. 其它杠杆（CFA 之后）
+## 5. 其它杠杆（CFA 之后）— ⏸ 2026-06-12 决定收口于 SUCC9
 
-- **scfa 16.1%（最慢）**：topK 离散 gather，没法 cube-direct，是硬骨头。可能方向：优化离散 gather 的批量化（见 tilelang-perf skill 的批量 gather 手段），或减少其跨核 lockstep。
-- **§4#5 跨核 lockstep**（PERF_HANDOFF_3/4 §5）：核内 pipe 重叠已验通但 Duration 卡在跨核 lockstep（每 chunk 多个 cross-flag 接力）。cube-direct 砍 KV 同步就是动这个的有效刀；继续往"减跨核握手深度 / cube 提前一拍（PreloadPipeline）"走，但 §5 教训：lockstep 里单刀会共振，要整体重排工作分配。
-- 每刀通用手段记进 tilelang-perf/pitfalls skill（源仓库 + 缓存两处，MEMORY 有约定）。
+**状态**：cube-direct 这把高 ROI 的刀吃完（swa+cfa），干净杠杆用尽。剩余 gap 是结构性重写（§5 高风险共振区），用户拍板**暂停在 SUCC9**，不在本轮投入。下面是 profiling 定的根因图，供后续重启。
+
+**关键：swa 与 scfa 瓶颈完全不同（msprof PipeUtilization 实测，8K prefill, tilelang only）**：
+
+| | swa | scfa |
+|---|---|---|
+| Duration | 4.33ms | 43.0ms |
+| cube_util | **96%** | **64%** |
+| 两核 both-idle | ~5% | **~36%** |
+| vs AscendC | 37%（2.7×） | 16%（6×） |
+
+- **scfa = 跨核 lockstep**：64% util、36% 两核空等。**per-token 离散 gather** 让 vector 成长板（27.5ms：scalar 38% + gather mte2 31%），cube 饿死（41% 气泡，mac 仅 8.6%）。**注**：对照 AscendC 真源码（`ops-transformer/.../op_kernel/arch32/`），它 `sparseBlockSize=1`（host+kernel 都写死「固定为1」）也是 per-token，**没有块粒度银弹**；它快在 `PreloadPipeline`（cube 提前预取）的紧重叠 + `s2IdxArray` 批量算地址 + `DataCopyPad`，而我们是逐行展开 `T.copy`。方向：PreloadPipeline 式 gather 重叠 / 减跨核握手深度。
+- **swa ≠ lockstep**：两核都 ~95% 满载、几乎不互等。是**吞吐/串行链**瓶颈——只有 1 chunk，skew 流水无可重叠；每 slot 内 `cube MM1→[SCORE_READY]→vec softmax→[P_READY]→cube MM2→[PV_READY]→vec merge` 一条 4 接力串行链，且 `for slot in T.serial` **slot 间不流水** → 两核各 ~30% 内部气泡。vector softmax/merge 本身也重（vec 36% + scalar 27%）。方向：**跨 slot/query 维度流水重排**（让相邻 slot 相位互填气泡）。
+- **⚠️ 那 27% vector scalar 定位到 `kernel.py:1240` 的逐-head 广播减** `for h_i: acc_s_ub[h_i,:] -= m_i[h_i]`（32 次展开）。**别盲改**：向量化它 = §5/tilelang-perf skill 记录的「broadcast 行 sub」四大共振反例之一（scfa 上实测 +4.9ms，vec/scalar 降但 Duration 涨）；swa 上又被 cube≈vector 等长临界路径卡上限。
+- 每刀通用手段记进 tilelang-perf/pitfalls skill（源仓库 + 缓存两处，MEMORY 有约定）。cube-direct 已记为手段 4。
