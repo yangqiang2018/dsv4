@@ -10,11 +10,25 @@ block-boundary split, and the cmp masking are all identical to the 8K cases, so
 this is a faithful (just smaller) correctness gate -- and the golden costs ~100x
 less, so these cases run by DEFAULT (they are NOT marked ``slow``).
 
-Coverage at ``S1=256``: query positions 0..127 have a clamped (partial) sliding
-window and 128..255 a full 128-token window, so both the ori window clamp and
-the paged boundary split (``ori_left`` non-block-aligned for s in 129..255) are
-exercised; the cmp threshold ``floor((s+1)/cmp_ratio)`` ramps across positions,
-so cfa's dense cmp range and scfa's topk both see a non-trivial valid count.
+Coverage at ``S1=1024`` (chosen by a paged-block audit, see ``_FAST_S1``):
+
+* ori: 8 paged blocks. Positions 0..127 have a clamped (partial) window, 128..
+  1023 a full 128-token window whose ``ori_left`` is non-block-aligned, so the
+  paged block-boundary split (the is_subtile-dependent cube-direct path) fires
+  across many block crossings, not just the first.
+* scfa cmp: 2 paged blocks (``cmp_act_kv = S1/cmp_ratio = 256``). The topk
+  indices spread across both, so the discrete gather's block-table indirection
+  (``idx // cmp_block_size`` selecting distinct physical blocks) IS exercised --
+  this is the SCFA-specific path that an S1=256 shrink would have dropped
+  (cmp_act_kv=64 -> 1 block -> no inter-block indirection).
+* cfa cmp: 1 block -- but cfa's ``cmp_act_kv = S1/128`` is small at every size,
+  so the 8K suite is ALSO single-block here; nothing is lost vs --runslow.
+* metadata: ~43 query positions per core across all cores, so the multi-core
+  load-balanced scheduling is exercised (an S1=256 shrink under-fills cores).
+
+The only thing the 8K (--runslow) suite still adds over this is block-count
+*diversity* (64 ori / 16 scfa-cmp blocks vs 8 / 2 here) -- the same code paths
+with more distinct blocks, not new logic. Keep --runslow as the full-scale gate.
 
 The 8K cases in ``test_sparse_attn_sharedkv.py`` are untouched -- run them with
 ``--runslow`` before a release or when the tiling/shapes change. This file is
@@ -47,12 +61,19 @@ from test_sparse_attn_sharedkv import (  # noqa: E402
     requires_npu,
 )
 
-# Small S1 for the fast golden -- 2*BI keeps full prefill-path coverage (partial
-# + full windows, boundary split, ramping cmp threshold) while making the CPU
-# golden ~100x cheaper than the 8K cases. Bump it if a wider core spread is
-# wanted; correctness does not need the full 8K fan-out (that is covered by the
-# --runslow suite and the test_metadata_* cases).
-_FAST_S1 = 256
+# Small S1 for the fast golden. Chosen by a paged-block coverage audit, NOT just
+# "smallest that runs": S1 must be large enough that every paged-attention path
+# the 8K suite hits is still hit here.
+#   - scfa needs cmp_act_kv = S1/cmp_ratio > block_size2 (=128) so the topk
+#     indices span >= 2 cmp blocks and the discrete gather's block-table
+#     indirection is exercised. cmp_ratio=4 => S1 > 512; S1=1024 gives 2 blocks.
+#   - ori boundary split + multi-core scheduling want several blocks / a full
+#     core fan-out; S1=1024 gives 8 ori blocks and ~43 positions/core.
+# Golden cost stays small (~0.4-0.9s/case warm), so the loop is still ~100x
+# faster than 8K. Raising S1 only adds block-count diversity (covered by the
+# --runslow 8K gate); lowering below 1024 silently drops the scfa multi-block
+# gather -- do not.
+_FAST_S1 = 1024
 
 
 def _shrink(name: str, s1: int = _FAST_S1) -> dict:
