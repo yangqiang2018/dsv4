@@ -408,21 +408,20 @@ def build_sparse_attn_sharedkv(
                 # [GATHER_ROWS, 2*GATHER_ROWS).
                 kv_ub_multi = T.alloc_ub([2 * GATHER_ROWS, D], dtype)
                 # V1 softmax max-subtract broadcast scratch (perf lever 2).
-                # m_i [v_block] -> m_i_brd [v_block, BI] so the per-head
-                # subtract loop (v_block tiny scalar-fed VEC ops) collapses to one
-                # broadcast + one full-tile sub (the reference attention idiom).
-                # Used ONLY when cube_direct (swa/cfa) -- there the vector gather
-                # is off, so kv_ub_multi (32KB) is idle and m_i_brd (16KB fp32)
-                # aliases it for free (no UB-budget growth). SCFA keeps the
-                # per-head loop (it needs kv_ub_multi for the gather, and the
-                # broadcast resonates in its lockstep regime -- see tilelang-perf
-                # skill "broadcast row sub"). Declared ONLY for cube_direct:
-                # otherwise the m_i_brd<->kv_ub_multi alias perturbs SCFA's alias
-                # analysis (conservative syncs around its gather, measured +4ms),
-                # even though SCFA never writes m_i_brd. Keeping it out of SCFA's
-                # IR entirely leaves that path byte-identical.
-                if cube_direct:
-                    m_i_brd = T.alloc_ub([v_block, BI], accum_dtype)
+                # m_i [v_block] -> m_i_brd [v_block, BI] so the per-head subtract
+                # loop (v_block tiny scalar-fed VEC ops) collapses to one broadcast
+                # + one full-tile sub (the reference attention idiom). Used ONLY
+                # when cube_direct (swa/cfa); SCFA keeps the per-head loop (it needs
+                # kv_ub_multi for the gather, and the broadcast resonates in its
+                # lockstep -- tilelang-perf skill "broadcast row sub").
+                # Allocated unconditionally (tvmscript block-scopes a buffer
+                # declared inside `if cube_direct:`, so it would be invisible at the
+                # annotate/broadcast scopes). The ALIAS, not the alloc, is what hurt
+                # SCFA: annotating m_i_brd onto kv_ub_multi made the compiler add
+                # conservative syncs around SCFA's gather (+4ms). So only cube_direct
+                # annotates it onto the idle kv_ub_multi (below); for SCFA m_i_brd
+                # stays unannotated (auto-placed, NOT aliased to the gather buffer).
+                m_i_brd = T.alloc_ub([v_block, BI], accum_dtype)
                 # Mask double buffer [2, mask_w]: V0(t) writes parity t%2 while
                 # V1(t-1) reads parity (t-1)%2 in the same step. The row is
                 # padded to mask_w (32B) so both parity rows are 32B aligned; a
