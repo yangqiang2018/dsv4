@@ -1441,6 +1441,13 @@ def build_sparse_attn_sharedkv(
                                             # barriered form: debarrier resonates in
                                             # its lockstep (skill FUSE-V2 note).
                                             if cube_direct:
+                                                # per-head rescale (scalar alpha),
+                                                # then ONE full-tile add of the pass's
+                                                # MERGE_HEADS rows -- the range-slice
+                                                # dst acc_o[hbase:hbase+MERGE_HEADS, :]
+                                                # is now accepted by the tile op (fork
+                                                # cfeat-tile-op-region-slice), replacing
+                                                # MERGE_HEADS per-head adds with one op.
                                                 for h_i in range(MERGE_HEADS):
                                                     T.tile.mul(
                                                         acc_o[hbase + h_i, :],
@@ -1449,11 +1456,15 @@ def build_sparse_attn_sharedkv(
                                                             pv2 * ub_len + hbase + h_i
                                                         ],
                                                     )
-                                                    T.tile.add(
-                                                        acc_o[hbase + h_i, :],
-                                                        acc_o[hbase + h_i, :],
-                                                        acc_o_ub[h_i, :],
-                                                    )
+                                                T.tile.add(
+                                                    acc_o[
+                                                        hbase : hbase + MERGE_HEADS, :
+                                                    ],
+                                                    acc_o[
+                                                        hbase : hbase + MERGE_HEADS, :
+                                                    ],
+                                                    acc_o_ub,
+                                                )
                                             else:
                                                 for h_i in range(MERGE_HEADS):
                                                     T.barrier_all()
