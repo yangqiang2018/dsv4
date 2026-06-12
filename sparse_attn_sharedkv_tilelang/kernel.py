@@ -468,10 +468,6 @@ def build_sparse_attn_sharedkv(
                         # 32KB) are now separate buffers -- un-aliased so S2b.1 can
                         # keep both live without the within-core barriers.
                         kv_ub_multi: ub_addr["kv_ub_multi"],
-                        # m_i_brd aliases kv_ub_multi: only live when cube_direct
-                        # (gather off -> kv_ub_multi idle); 16KB fits its 32KB.
-                        # Keyed in only for cube_direct so SCFA's IR is unchanged.
-                        **({m_i_brd: ub_addr["kv_ub_multi"]} if cube_direct else {}),
                         mask_ub: ub_addr["mask_ub"],
                         mask_ub_2: ub_addr["mask_ub_2"],
                         mask_sel: ub_addr["mask_sel"],
@@ -479,6 +475,17 @@ def build_sparse_attn_sharedkv(
                         acc_o_half: ub_addr["acc_o_half"],
                     }
                 )
+                # m_i_brd (perf lever 2 broadcast scratch) aliases the
+                # cube_direct-idle kv_ub_multi. A SEPARATE call keyed only here
+                # keeps the buffer out of SCFA's IR entirely (SCFA must not see
+                # the alias -- it adds conservative syncs around its gather,
+                # measured +4ms). annotate_address accumulates: each call sets
+                # addresses for its listed buffers, leaving the rest as placed
+                # by the call above. A conditional dict-unpack inside the main
+                # literal is rejected by the tvmscript parser, so this is a
+                # plain second call under the compile-time cube_direct guard.
+                if cube_direct:
+                    T.annotate_address({m_i_brd: ub_addr["kv_ub_multi"]})
 
                 # ---- Read this AIC core's metadata row. ----
                 # Each row is FA_METADATA_SIZE int32 entries; layout
