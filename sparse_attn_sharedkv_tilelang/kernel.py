@@ -185,12 +185,15 @@ def build_sparse_attn_sharedkv(
     # generates them per chunk with createvecindex instead of reading a
     # host-synthesized cmp_indices array (mirrors the Ascend C CFA path).
     is_cfa = scenario == 2
-    # cube-direct KV for SWA (KV pulled GM->L1 by the cube, no vector gather).
-    # The SWA-prefill corruption was a paged-block-boundary bug: a 16-row pass
-    # whose window start (ori_left, not block-aligned) put g0 % block > block-16
-    # straddled two paged blocks but read only one -> wrong KV. Fixed in the
-    # cube-direct load below (AscendC DataCopyPA-style boundary split).
-    cube_direct = NI_cmp == 0
+    # CORRECTNESS FALLBACK (§9 perf follow-up): cube-direct KV is verified on SWA
+    # *decode* (passes) but SWA *prefill* corrupts ~9% of outputs. Suspected
+    # kv_lo WAR race: cube-direct writes kv_lo directly (parity depth-2 only),
+    # bypassing the ws_kv double-buffering that guarded reuse on the old path, so
+    # chunk t+1's GM->L1 load can overwrite kv_lo[(t-1)%2] before MM2(t-1) reads
+    # it (decode's short pipeline never reaches the conflict; prefill's does).
+    # Forced off -> SWA uses the proven vector-gather path. Original gate (re-
+    # enable once the WAR race is fixed): cube_direct = NI_cmp == 0.
+    cube_direct = False
 
     H_per_block = gqa_group  # 64
     v_block = H_per_block // 2  # 32 -- each AIV handles half the heads
@@ -548,71 +551,28 @@ def build_sparse_attn_sharedkv(
                                             # dst picked at COMPILE time (a TIR-var
                                             # ternary on gp is illegal): lo half then
                                             # hi half, 4x16 rows each.
-                                            # A 16-row pass may straddle a paged block
-                                            # boundary: prefill ori_left is not block-
-                                            # aligned, so g0 % block can be > block-16.
-                                            # Common case (whole pass in one block) keeps
-                                            # the compile-time 16-row copy; the straddle
-                                            # pass splits at the boundary (AscendC
-                                            # DataCopyPA form) so each part reads its own
-                                            # physical block. (decode's single window
-                                            # rarely straddles -> previously hidden.)
                                             for gp in range(BI_half // GATHER_ROWS):
                                                 g0 = (
                                                     ori_left + t * BI + gp * GATHER_ROWS
                                                 )
-                                                bidx = g0 // ori_block_size
+                                                blkc = ori_block_table[
+                                                    b_i, g0 // ori_block_size
+                                                ]
                                                 rowc = g0 % ori_block_size
-                                                if ori_block_size - rowc >= GATHER_ROWS:
-                                                    T.copy(
-                                                        ori_KV[
-                                                            ori_block_table[b_i, bidx],
-                                                            rowc : rowc + GATHER_ROWS,
-                                                            0,
-                                                            :,
-                                                        ],
-                                                        kv_lo[
-                                                            pa,
-                                                            gp * GATHER_ROWS : (gp + 1)
-                                                            * GATHER_ROWS,
-                                                            :,
-                                                        ],
-                                                    )
-                                                else:
-                                                    n0 = ori_block_size - rowc
-                                                    T.copy(
-                                                        ori_KV[
-                                                            ori_block_table[b_i, bidx],
-                                                            rowc : rowc + n0,
-                                                            0,
-                                                            :,
-                                                        ],
-                                                        kv_lo[
-                                                            pa,
-                                                            gp * GATHER_ROWS : gp
-                                                            * GATHER_ROWS
-                                                            + n0,
-                                                            :,
-                                                        ],
-                                                    )
-                                                    T.copy(
-                                                        ori_KV[
-                                                            ori_block_table[
-                                                                b_i, bidx + 1
-                                                            ],
-                                                            0 : GATHER_ROWS - n0,
-                                                            0,
-                                                            :,
-                                                        ],
-                                                        kv_lo[
-                                                            pa,
-                                                            gp * GATHER_ROWS + n0 : (
-                                                                gp + 1
-                                                            )
-                                                            * GATHER_ROWS,
-                                                            :,
-                                                        ],
-                                                    )
+                                                T.copy(
+                                                    ori_KV[
+                                                        blkc,
+                                                        rowc : rowc + GATHER_ROWS,
+                                                        0,
+                                                        :,
+                                                    ],
+                                                    kv_lo[
+                                                        pa,
+                                                        gp * GATHER_ROWS : (gp + 1)
+                                                        * GATHER_ROWS,
+                                                        :,
+                                                    ],
+                                                )
                                             for gp in range(BI_half // GATHER_ROWS):
                                                 g0 = (
                                                     ori_left
@@ -620,58 +580,24 @@ def build_sparse_attn_sharedkv(
                                                     + BI_half
                                                     + gp * GATHER_ROWS
                                                 )
-                                                bidx = g0 // ori_block_size
+                                                blkc = ori_block_table[
+                                                    b_i, g0 // ori_block_size
+                                                ]
                                                 rowc = g0 % ori_block_size
-                                                if ori_block_size - rowc >= GATHER_ROWS:
-                                                    T.copy(
-                                                        ori_KV[
-                                                            ori_block_table[b_i, bidx],
-                                                            rowc : rowc + GATHER_ROWS,
-                                                            0,
-                                                            :,
-                                                        ],
-                                                        kv_hi[
-                                                            pa,
-                                                            gp * GATHER_ROWS : (gp + 1)
-                                                            * GATHER_ROWS,
-                                                            :,
-                                                        ],
-                                                    )
-                                                else:
-                                                    n0 = ori_block_size - rowc
-                                                    T.copy(
-                                                        ori_KV[
-                                                            ori_block_table[b_i, bidx],
-                                                            rowc : rowc + n0,
-                                                            0,
-                                                            :,
-                                                        ],
-                                                        kv_hi[
-                                                            pa,
-                                                            gp * GATHER_ROWS : gp
-                                                            * GATHER_ROWS
-                                                            + n0,
-                                                            :,
-                                                        ],
-                                                    )
-                                                    T.copy(
-                                                        ori_KV[
-                                                            ori_block_table[
-                                                                b_i, bidx + 1
-                                                            ],
-                                                            0 : GATHER_ROWS - n0,
-                                                            0,
-                                                            :,
-                                                        ],
-                                                        kv_hi[
-                                                            pa,
-                                                            gp * GATHER_ROWS + n0 : (
-                                                                gp + 1
-                                                            )
-                                                            * GATHER_ROWS,
-                                                            :,
-                                                        ],
-                                                    )
+                                                T.copy(
+                                                    ori_KV[
+                                                        blkc,
+                                                        rowc : rowc + GATHER_ROWS,
+                                                        0,
+                                                        :,
+                                                    ],
+                                                    kv_hi[
+                                                        pa,
+                                                        gp * GATHER_ROWS : (gp + 1)
+                                                        * GATHER_ROWS,
+                                                        :,
+                                                    ],
+                                                )
                                             T.barrier_all()
                                         else:
                                             if False and is_cfa:
