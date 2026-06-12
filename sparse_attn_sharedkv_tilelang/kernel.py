@@ -407,6 +407,17 @@ def build_sparse_attn_sharedkv(
                 # too. The ping-pong halves are rows [0,GATHER_ROWS) and
                 # [GATHER_ROWS, 2*GATHER_ROWS).
                 kv_ub_multi = T.alloc_ub([2 * GATHER_ROWS, D], dtype)
+                # V1 softmax max-subtract broadcast scratch (perf lever 2).
+                # m_i [v_block] -> m_i_brd [v_block, BI] so the per-head
+                # subtract loop (v_block tiny scalar-fed VEC ops) collapses to one
+                # broadcast + one full-tile sub (the reference attention idiom).
+                # Used ONLY when cube_direct (swa/cfa) -- there the vector gather
+                # is off, so kv_ub_multi (32KB) is idle and m_i_brd (16KB fp32)
+                # aliases it for free (no UB-budget growth). SCFA keeps the
+                # per-head loop (it needs kv_ub_multi for the gather, and the
+                # broadcast resonates in its lockstep regime -- see tilelang-perf
+                # skill "broadcast row sub").
+                m_i_brd = T.alloc_ub([v_block, BI], accum_dtype)
                 # Mask double buffer [2, mask_w]: V0(t) writes parity t%2 while
                 # V1(t-1) reads parity (t-1)%2 in the same step. The row is
                 # padded to mask_w (32B) so both parity rows are 32B aligned; a
@@ -452,6 +463,9 @@ def build_sparse_attn_sharedkv(
                         # 32KB) are now separate buffers -- un-aliased so S2b.1 can
                         # keep both live without the within-core barriers.
                         kv_ub_multi: ub_addr["kv_ub_multi"],
+                        # m_i_brd aliases kv_ub_multi: only live when cube_direct
+                        # (gather off -> kv_ub_multi idle); 16KB fits its 32KB.
+                        m_i_brd: ub_addr["kv_ub_multi"],
                         mask_ub: ub_addr["mask_ub"],
                         mask_ub_2: ub_addr["mask_ub_2"],
                         mask_sel: ub_addr["mask_sel"],
@@ -1274,12 +1288,25 @@ def build_sparse_attn_sharedkv(
                                                 ],
                                             )
 
-                                            for h_i in range(v_block):
-                                                T.tile.sub(
-                                                    acc_s_ub[h_i, :],
-                                                    acc_s_ub[h_i, :],
-                                                    m_i[h_i],
-                                                )
+                                            # Softmax max-subtract. cube_direct
+                                            # (swa/cfa): one broadcast m_i[v_block]->
+                                            # [v_block,BI] + one full-tile sub (the
+                                            # reference idiom), replacing v_block
+                                            # scalar-fed VEC ops -> cuts the per-head
+                                            # scalar loads (27% aiv_scalar, swa
+                                            # profile). SCFA keeps the per-head loop
+                                            # (kv_ub_multi busy; broadcast resonates
+                                            # in lockstep).
+                                            if cube_direct:
+                                                T.tile.broadcast(m_i_brd, m_i)
+                                                T.tile.sub(acc_s_ub, acc_s_ub, m_i_brd)
+                                            else:
+                                                for h_i in range(v_block):
+                                                    T.tile.sub(
+                                                        acc_s_ub[h_i, :],
+                                                        acc_s_ub[h_i, :],
+                                                        m_i[h_i],
+                                                    )
                                             T.tile.exp(acc_s_ub, acc_s_ub)
                                             T.reduce_sum(
                                                 acc_s_ub,
