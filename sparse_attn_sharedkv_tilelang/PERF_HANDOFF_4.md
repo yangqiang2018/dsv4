@@ -25,7 +25,10 @@
 
 ### ⏸ 遗留（下一棒，属 §9 perf）：cube-direct SWA prefill bug
 
-`swa_prefill` 走 cube-direct（`cube_direct=NI_cmp==0`，只有 swa 满足）时 **91% 错**；decode swa 用 cube-direct 却过 → GM→L1 子块写本身没问题，是 prefill 特有。**当前 `kernel.py` force `cube_direct=False`（`6392480`）让 swa 走老 vector 路径 fallback —— 正确但丢掉 cube-direct 提速。** 假设 = `kv_lo` WAR race：cube-direct 直写 `kv_lo`（只 parity depth-2 缓冲），绕过老路 ws_kv 的重用保护，chunk t+1 的 GM→L1 加载可能在 `MM2(t-1)` 还读 `kv_lo[(t-1)%2]` 时覆盖它（decode 流水短够不到，prefill 够得到）。已挂 spawn-task chip。修它 = 拿回 cube-direct 提速（~1.87ms vs 6.8ms），往 §9 的 80% 推。
+`swa_prefill` 走 cube-direct（`cube_direct=NI_cmp==0`，只有 swa 满足）时 **91% 错**；`cube_direct=False`（老 vector 路径）→ PASS。**当前 `kernel.py` force `cube_direct=False`（fallback，`e26d2fb`）—— 正确但丢掉 cube-direct 提速。**
+- **根因（确认）= paged block 边界读错**：cube-direct 的 16 行 GM→L1 拷贝每 pass 只查一次 block table，但 prefill 窗口起点 `ori_left` 非 block 对齐，`rowc=g0%block > block-16` 的那个 pass 跨 2 个分页 block 却只读一个 → 读错物理 KV。对照 AscendC `DataCopyPA`（while 循环"一次只处理一个 Block"、边界分段，`sparse_attn_sharedkv_common.h`）实锤。decode 单 query 错的元素少 → 蒙过。（早先的 kv_lo WAR-race 假设**是错的**：cube 顺序执行 MM1(t)→MM2(t-1)，parity depth-2 够，无 race。）
+- **(a) kernel 级拆分已试 + 退回**（`f33240e`→revert）：把跨界 pass 拆两段，codegens 但**更糟 73.8%**——zN GM→L1 codegen 对非 16 对齐 runtime 行偏移写错位。
+- **正解 = (b)**：把边界分段移植进 GM→L1 primitive（port `DataCopyPA`：fork 模板+codegen+binding，runtime split 在 C++ 内部、dst fractal 编译期传入）。大改、本地不可测、需多轮 NPU 迭代。已挂 chip `task_f68dd090`。修它 = 拿回 ~1.87ms vs 6.8ms（80% 杠杆）。
 
 ---
 
@@ -90,7 +93,7 @@ S2b/S2c/FUSE/V2 四次独立实验全证：**核内 pipe 重叠机制全验通(p
 ## 7. commit 地图
 
 **dsv4 main**（可回退）：
-- `6392480` **HEAD** force `cube_direct=False`（SWA prefill fallback；cube-direct WAR-race 待修，见 §1/§9）
+- `e26d2fb` **HEAD** cube-direct SWA fallback（`cube_direct=False`）+ 根因注释更正（paged block 边界，非 WAR-race）；`f33240e` kernel 级拆分尝试已 revert（`50328f1`）
 - `9012315`/`0a9d130` docs（prefill triage 校正到 #978）
 - `a27c565` docs(fork prefill 回归记录)
 - `356912c` cube-direct + 逐行 kernel（`probe-current-9922` 同此）
@@ -120,7 +123,7 @@ S2b/S2c/FUSE/V2 四次独立实验全证：**核内 pipe 重叠机制全验通(p
 ## 9. 通往 80% 的路线（prefill 回归已解决）
 
 1. ✅ **解 prefill 回归** —— 已完成（§1，真凶 #978，fork `9a0d62d`）。
-2. **解 cube-direct SWA prefill bug + 量收益**（下一棒）：当前 swa 走老路 fallback（`cube_direct=False`）。先修 §1 遗留的 `kv_lo` WAR-race（chip 已挂）让 cube-direct swa prefill 过线、恢复 `cube_direct=NI_cmp==0`，再 `perf_compare swa_prefill` 量收益（SWA 把 KV 同步整删，应大跳，27.6% 起）。
+2. **修 cube-direct SWA prefill + 量收益**（下一棒，大改）：根因=paged block 边界读错（详见 §1 遗留），正解=移植 AscendC `DataCopyPA` 成 paged GM→L1 primitive（边界分段在模板内部）；kernel 级拆分已证走不通。修好恢复 `cube_direct=NI_cmp==0`，再 `perf_compare swa_prefill` 量收益（应大跳，27.6% 起）。chip `task_f68dd090` 已备完整上下文。
 3. **扩 cube-direct 到 CFA cmp**（dense 连续，cube 标量读 cmp_block_table 直拷 GM→L1）。SCFA topK 离散留 vector。
 4. **若仍不够 80%**：跨核握手深度（ws_* 多缓冲 + cube 提前一拍，复刻 PreloadPipeline）——但注意 §5 的 lockstep 教训，单刀会共振，要整体重排工作分配。
 5. 每刀通用手段记进 tilelang-perf/pitfalls skill（源仓库 + 缓存两处，MEMORY 有约定）。
