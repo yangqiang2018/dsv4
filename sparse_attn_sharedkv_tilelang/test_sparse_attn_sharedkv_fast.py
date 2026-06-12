@@ -108,7 +108,9 @@ FAST_SCENARIOS = {
 
 @requires_npu
 @pytest.mark.parametrize("case_name", list(FAST_SCENARIOS.keys()))
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+# bf16 only (dtype0) for the fast loop -- it is the Ascend C reference dtype.
+# fp16 is extra coverage and stays in the full 8K (--runslow) gate.
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_sparse_attn_sharedkv_fast(case_name, dtype):
     """Small-shape prefill correctness -- same code paths as the 8K suite, fast golden."""
     # Imported lazily so collection works on hosts without tilelang installed.
