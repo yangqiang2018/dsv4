@@ -83,6 +83,23 @@
 
 **预期**：16 标量 mul/pass → 1 brcb + 1 row_muls/pass，降 V2 vector scalar（§3.5 ③「轻量 vector idiom」第一刀）；perf 增益中等，但正解 lever-3A + 攒 2 个编译器特性。
 
+### 3.6 实测进展（第一轮失败，根因 = `call_extern` 被 codegen 丢弃）
+
+第一轮上 NPU：rescale **整个没了** —— dump `grep -c "brcb|row_muls" = 0`，V2 merge 只剩 `AscendC::Add(acc_o, acc_o, acc_o_ub)`，没有 rescale mul（SWA fast 这里其实 >1 chunk，所以缺 rescale 就红 ~96-97%）。踩坑链：
+1. row_muls C++ 模板编译装上了（`.so` 不报错 = C++ 写对了）。
+2. BufferLoad handling（brcb src / row_muls dst-src0 是 range slice）—— 已加。
+3. alpha_brd8 placement —— **红鲱鱼**：annotate 到 kv_ub_multi+16KB，失败率只微动（96.27→97.06）。因为 brcb 被丢 → alpha_brd8 是死 buffer，失败率动只是布局扰动。
+4. **真根因**：`brcb`/`row_muls` 走 `T.call_extern`，**这套 Ascend codegen 直接丢弃 call_extern**。能用的 tile op 全是**注册的 `tl.ascend_*` builtin**。**brcb 当初的「NOT implemented」警告就是这意思**（C++ 模板在、TIR codegen 没接）。
+
+**剩余修法（.cc，要重装 .so）—— 镜像 `ascend_broadcast`（已定位 4 处）**：
+1. `src/op/ascend.h`（~169 行旁）：`TVM_DLL const Op &ascend_brcb();` + `ascend_row_muls();`
+2. `src/op/ascend.cc`（~1116 行旁）：`TIR_DEFINE_TL_BUILTIN(ascend_brcb).set_num_inputs(-1).set_attr<TCallEffectKind>("TCallEffectKind", Integer(CallEffectKind::kOpaque));` + row_muls 同。
+3. `src/target/codegen_ascend.cc`（~563 行旁的 if-else 链）：`else if (op->op.same_as(tl::ascend_brcb())) { BrcbCodegen(op); }` + 写 `BrcbCodegen`/`RowMulsCodegen` 发 `tl::ascend::brcb<T>(...)` / `tl::ascend::row_muls<T>(...)`（镜像 `BroadcastOpCodegen`）。
+4. `tilelang/language/ascend_tile.py`：brcb/row_muls 改用 `tir.call_intrin("handle", tir.op.Op.get("tl.ascend_brcb"), ...)`（dtype 由 codegen 的 `<T>` 出，去掉字符串拼）。
+5. 重装 .so → dump 确认 `tl::ascend::brcb`/`row_muls` 出现在生成码 → fast+decode+perf → 打 tag。
+
+**现状**：kernel 已回退 per-head 绿（`9333fda` == `b68dffa`）；fork 留着 row_muls C++ 模板 + Python wrapper + BufferLoad（inert，等 builtin 注册）。kernel-side rescale（alpha_brd8 + brcb/row_muls 调用）等 builtin 接上再重贴（git `bb643fc` 有原版）。
+
 ## 4. 编译器修改纪律（用户定，必守）
 
 - **兼容性铁律**：改编译器**必须 additive / 向后兼容**，别破坏现有路径（Buffer/BufferRegion 等已有分支原样保留），**别影响其他用 tilelang 写算子/用编译器的人**。`d789b93` 范例：只**新加** BufferLoad 分支。
