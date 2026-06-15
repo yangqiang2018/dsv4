@@ -422,6 +422,15 @@ def build_sparse_attn_sharedkv(
                 # annotates it onto the idle kv_ub_multi (below); for SCFA m_i_brd
                 # stays unannotated (auto-placed, NOT aliased to the gather buffer).
                 m_i_brd = T.alloc_ub([v_block, BI], accum_dtype)
+                # V2 merge rescale broadcast scratch (perf lever 3-A): the
+                # pass's MERGE_HEADS alpha scalars -> alpha_brd [MERGE_HEADS, D]
+                # so the per-head rescale collapses to one broadcast + one wide
+                # mul. Same cube_direct-only alias discipline as m_i_brd: alloc
+                # unconditional (tvmscript block-scoping), aliased onto the idle
+                # kv_ub_multi ONLY under cube_direct (below). [MERGE_HEADS,D] fp32
+                # = 32KB = exactly kv_ub_multi; time-shares it with m_i_brd
+                # (V1(t-1) uses m_i_brd, V2(t-2) alpha_brd -- barrier-separated).
+                alpha_brd = T.alloc_ub([MERGE_HEADS, D], accum_dtype)
                 # Mask double buffer [2, mask_w]: V0(t) writes parity t%2 while
                 # V1(t-1) reads parity (t-1)%2 in the same step. The row is
                 # padded to mask_w (32B) so both parity rows are 32B aligned; a
@@ -474,17 +483,24 @@ def build_sparse_attn_sharedkv(
                         acc_o_half: ub_addr["acc_o_half"],
                     }
                 )
-                # m_i_brd (perf lever 2 broadcast scratch) aliases the
+                # m_i_brd and alpha_brd (V1/V2 broadcast scratches) alias the
                 # cube_direct-idle kv_ub_multi. A SEPARATE call keyed only here
-                # keeps the buffer out of SCFA's IR entirely (SCFA must not see
-                # the alias -- it adds conservative syncs around its gather,
-                # measured +4ms). annotate_address accumulates: each call sets
-                # addresses for its listed buffers, leaving the rest as placed
-                # by the call above. A conditional dict-unpack inside the main
-                # literal is rejected by the tvmscript parser, so this is a
-                # plain second call under the compile-time cube_direct guard.
+                # keeps them out of SCFA's IR entirely (SCFA must not see the
+                # alias -- it adds conservative syncs around its gather, measured
+                # +4ms). annotate_address accumulates: each call sets addresses
+                # for its listed buffers, leaving the rest as placed by the call
+                # above. A conditional dict-unpack inside the main literal is
+                # rejected by the tvmscript parser, so this is a plain second
+                # call under the compile-time cube_direct guard. Both alias the
+                # SAME kv_ub_multi addr (32KB): their live ranges are disjoint
+                # (m_i_brd in V1, alpha_brd in V2), so time-sharing is safe.
                 if cube_direct:
-                    T.annotate_address({m_i_brd: ub_addr["kv_ub_multi"]})
+                    T.annotate_address(
+                        {
+                            m_i_brd: ub_addr["kv_ub_multi"],
+                            alpha_brd: ub_addr["kv_ub_multi"],
+                        }
+                    )
 
                 # ---- Read this AIC core's metadata row. ----
                 # Each row is FA_METADATA_SIZE int32 entries; layout
@@ -1426,48 +1442,48 @@ def build_sparse_attn_sharedkv(
                                                 acc_o_ub,
                                             )
                                             T.barrier_all()
-                                            # Per-head rescale + merge. cube_direct
-                                            # (swa/cfa, perf lever 2): drop the per-
-                                            # head barrier_all -- the mul (rescale by
-                                            # scalar alpha) and add are same-VEC-pipe
-                                            # in-order, distinct/RAW rows, and acc_o_ub
-                                            # was already drained by the barrier above
-                                            # -- so the ~3*MERGE_HEADS barriers/pass (a
-                                            # big slice of the vector bubble, swa
-                                            # profile) are redundant. Ops stay per-head
-                                            # single-row (acc_o[h,:]); the coalesced
-                                            # range-slice add was reverted (see the
-                                            # if-block below). SCFA keeps the
-                                            # barriered form: debarrier resonates in
-                                            # its lockstep (skill FUSE-V2 note).
+                                            # Rescale + merge. cube_direct (swa/cfa):
+                                            # drop the per-head barrier_all -- the
+                                            # rescale and add are same-VEC-pipe in-order
+                                            # over distinct/RAW rows, and acc_o_ub was
+                                            # drained by the barrier above, so the
+                                            # ~3*MERGE_HEADS barriers/pass (a big slice
+                                            # of the swa vector bubble) are redundant.
+                                            # SCFA keeps the barriered per-head form:
+                                            # debarrier resonates in its lockstep (skill
+                                            # FUSE-V2 note).
                                             if cube_direct:
-                                                # Per-head rescale (scalar alpha) + add.
-                                                # The coalesced full-tile add
-                                                #   acc_o[hbase:hbase+MERGE_HEADS, :] += acc_o_ub
-                                                # (one wide VEC op via fork range-slice
-                                                # support d789b93) was tried in fa63798 and
-                                                # REVERTED: it regressed decode (swa 97.3 /
-                                                # cfa 98.5% vs 99.5% req, max rel err 2.0).
-                                                # binary_op emits the SAME intrinsic as this
-                                                # loop (ascend_add, ptr=acc_o+hbase*D,
-                                                # size=MERGE_HEADS*D, src=acc_o_ub) -- so it
-                                                # is NOT a lowering bug. The single wide read
-                                                # of acc_o_ub drains slower than the 16 narrow
-                                                # reads and races the next pass's
-                                                # T.copy(ws_o, acc_o_ub) (MTE2 WAR, unguarded
-                                                # in the debarriered path); decode hits it
-                                                # because it runs many V2-merge passes. Re-
-                                                # coalescing would need an explicit drain
-                                                # after the add; the win is marginal, so the
-                                                # per-head form stays.
+                                                # perf lever 3-A: the MERGE_HEADS scalar-
+                                                # fed rescale muls collapse to ONE
+                                                # broadcast of the pass's alpha slice ->
+                                                # [MERGE_HEADS, D] + ONE wide full-tile
+                                                # mul (range-slice via fork BufferLoad
+                                                # support). This wide mul is SAFE where
+                                                # the fa63798 wide ADD was not: broadcast,
+                                                # mul and the aliased alpha_brd are all
+                                                # VEC-pipe with NO MTE2 writer -> no cross-
+                                                # pass WAR. The ADD stays per-head because
+                                                # acc_o_ub IS overwritten by the next
+                                                # pass's T.copy (MTE2); a wide read of it
+                                                # races that copy (the reverted bug).
+                                                # alpha_brd aliases the cube_direct-idle
+                                                # kv_ub_multi, time-shared with V1's
+                                                # m_i_brd across barriered phases.
+                                                abase = pv2 * ub_len + hbase
+                                                T.tile.broadcast(
+                                                    alpha_brd,
+                                                    alpha[abase : abase + MERGE_HEADS],
+                                                )
+                                                T.tile.mul(
+                                                    acc_o[
+                                                        hbase : hbase + MERGE_HEADS, :
+                                                    ],
+                                                    acc_o[
+                                                        hbase : hbase + MERGE_HEADS, :
+                                                    ],
+                                                    alpha_brd,
+                                                )
                                                 for h_i in range(MERGE_HEADS):
-                                                    T.tile.mul(
-                                                        acc_o[hbase + h_i, :],
-                                                        acc_o[hbase + h_i, :],
-                                                        alpha[
-                                                            pv2 * ub_len + hbase + h_i
-                                                        ],
-                                                    )
                                                     T.tile.add(
                                                         acc_o[hbase + h_i, :],
                                                         acc_o[hbase + h_i, :],
