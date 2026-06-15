@@ -1435,19 +1435,31 @@ def build_sparse_attn_sharedkv(
                                             # -- so the ~3*MERGE_HEADS barriers/pass (a
                                             # big slice of the vector bubble, swa
                                             # profile) are redundant. Ops stay per-head
-                                            # single-row (acc_o[h,:]; a range slice
-                                            # acc_o[a:b,:] is rejected by the tile op
-                                            # as a BufferLoad). SCFA keeps the
+                                            # single-row (acc_o[h,:]); the coalesced
+                                            # range-slice add was reverted (see the
+                                            # if-block below). SCFA keeps the
                                             # barriered form: debarrier resonates in
                                             # its lockstep (skill FUSE-V2 note).
                                             if cube_direct:
-                                                # per-head rescale (scalar alpha),
-                                                # then ONE full-tile add of the pass's
-                                                # MERGE_HEADS rows -- the range-slice
-                                                # dst acc_o[hbase:hbase+MERGE_HEADS, :]
-                                                # is now accepted by the tile op (fork
-                                                # cfeat-tile-op-region-slice), replacing
-                                                # MERGE_HEADS per-head adds with one op.
+                                                # Per-head rescale (scalar alpha) + add.
+                                                # The coalesced full-tile add
+                                                #   acc_o[hbase:hbase+MERGE_HEADS, :] += acc_o_ub
+                                                # (one wide VEC op via fork range-slice
+                                                # support d789b93) was tried in fa63798 and
+                                                # REVERTED: it regressed decode (swa 97.3 /
+                                                # cfa 98.5% vs 99.5% req, max rel err 2.0).
+                                                # binary_op emits the SAME intrinsic as this
+                                                # loop (ascend_add, ptr=acc_o+hbase*D,
+                                                # size=MERGE_HEADS*D, src=acc_o_ub) -- so it
+                                                # is NOT a lowering bug. The single wide read
+                                                # of acc_o_ub drains slower than the 16 narrow
+                                                # reads and races the next pass's
+                                                # T.copy(ws_o, acc_o_ub) (MTE2 WAR, unguarded
+                                                # in the debarriered path); decode hits it
+                                                # because it runs many V2-merge passes. Re-
+                                                # coalescing would need an explicit drain
+                                                # after the add; the win is marginal, so the
+                                                # per-head form stays.
                                                 for h_i in range(MERGE_HEADS):
                                                     T.tile.mul(
                                                         acc_o[hbase + h_i, :],
@@ -1456,15 +1468,11 @@ def build_sparse_attn_sharedkv(
                                                             pv2 * ub_len + hbase + h_i
                                                         ],
                                                     )
-                                                T.tile.add(
-                                                    acc_o[
-                                                        hbase : hbase + MERGE_HEADS, :
-                                                    ],
-                                                    acc_o[
-                                                        hbase : hbase + MERGE_HEADS, :
-                                                    ],
-                                                    acc_o_ub,
-                                                )
+                                                    T.tile.add(
+                                                        acc_o[hbase + h_i, :],
+                                                        acc_o[hbase + h_i, :],
+                                                        acc_o_ub[h_i, :],
+                                                    )
                                             else:
                                                 for h_i in range(MERGE_HEADS):
                                                     T.barrier_all()
