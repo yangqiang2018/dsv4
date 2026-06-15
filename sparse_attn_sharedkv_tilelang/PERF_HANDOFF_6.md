@@ -42,10 +42,27 @@
 ## 3. 下一步 lever（按优先级）
 
 - **A. V2 rescale mul broadcast 向量化 —— ⚠️ 已试，被 AscendC Broadcast 宽-dst 卡住（暂搁）**。逐-head `acc_o[h]*=alpha[h]` → broadcast `alpha[MERGE_HEADS]`→`[MERGE_HEADS,D]` + full-tile mul。编译器已就绪（fork `1a70fed` 让 `broadcast` 吃 BufferLoad 切片，**dump 实锤 lowering 正确**：axis=1 / extent `[16,512]` / src-ptr=`alpha+(pv2*32+mp*16)` 全对，buffer 地址也不重叠）。**但 dsv4 `b30b447` 上 NPU prefill 回归 swa/cfa ~87%**（max rel 2.0）。根因（dump + 失败算术坐实）：**AscendC `Broadcast` 不填满 512-宽 dst，每行尾部 ~一个 64-block 留旧值** → `4257616/65536 行 ≈ 65/512 列错 = 12.7%`。V1 softmax broadcast 只 128 宽（`m_i_brd[32,128]`）→ 阈值下、填满、所以一直没事。**要成立得先解 Broadcast 宽-dst（compiler/库层调查，不是 kernel 侧）** —— 或换 `brcb` / 把 D 切 ≤128 列块广播（变复杂、收益打折）。已回退 `9b073f5`，per-head 形式留着。
-- **B. KV 滑窗复用**（cube `mte2` 22%，830us）。swa 相邻 query token 窗口重叠 127/128，我们每 slot 重载整窗，AscendC 复用。复杂（L1 滑窗管理）；且被 vector 平衡卡（要配 A 一起两核同降才动 Duration）。
+- **B. KV 滑窗复用 —— ⚠️ 作废（前提错，见 §3.5）**。Ascend C **没有** KV 滑窗复用：grouped kernel，KV 每 (group×window) 只流式读一次。cube mte2 22% 是 KV 流式（被流水/L1-ring 隐藏），不是冗余重载。别去做 L1 滑窗。
 - **C. 编译器：内存规划器**（腾 UB）。kernel 顶到 178.3K/192K 是**这版**布局撑的（不是物理上限，AscendC 同硬件留得出空间）。更紧的 hidden-tmp / liveness 复用 → 腾出空间给 broadcast buffer + 跨 slot 双缓冲 → **解锁最大的杠杆**（V2 mul broadcast 无需 time-share、跨 slot 流水填气泡）。大 codegen 改（.cc，要重装 .so）。
 
 **瓶颈画像（swa profile，post §2）**：Duration 3.93ms，两核各 ~95% util、~25% 内部气泡；vector 略长板（pipe-sum 2.83 vs cube 2.72）。**要 80%（≤2.375ms）得：vector 削（A）+ cube 削（B，KV 复用）+ 消气泡（跨 slot 流水）三者叠加，且都卡 UB/L1 资源墙 → 所以走编译器破墙（C）**。诚实说：纯 kernel 侧便宜刀快用尽，~50% 一带是 kernel 侧天花板，破 80% 要 C。
+
+## 3.5 Ascend C SWA 性能方案蓝本（源码研究 2026-06-15，4 agent 交叉验证）
+
+读了 `ops-transformer/experimental/attention/sparse_attn_sharedkv/op_kernel/arch32/swa_*` 全套（kernel/cube/vector + op_host/tiling）。**两条纠正了之前的误解：**
+
+1. **没有 KV 滑窗复用 —— §3-B 前提错，作废**。这是 grouped/prefill kernel：一个 M-block = 整个 query group，SWA 窗口每个 (group×window) **只流式读一次、读完即弃**，相邻 query token 不复用 KV 窗口。真正「载一次复用多次」的是 **Q**（每 group 载一次 L1，所有 KV chunk 复用，最后一个 n-loop 才放槽；`swa_block_cube.h:545-589`）。所以 cube mte2 22% 不是冗余重载，是 KV 流式 + 被流水 / L1-ring 隐藏。
+2. **rescale 用 `Brcb`+`RowMuls`，不是 `Broadcast` —— lever-3A 的正解**。`alpha=exp(m_prev-m_new)` 由 `SoftmaxFlashV2`（config `SOFTMAX_OUTPUT_WITHOUT_BRC`）直接输出成**每行标量 `[rows,1]`**（`swa_block_vector.h:353`）；rescale = `Brcb`（每行标量铺成 1 个 32B / 8-fp32 block，`:687`）+ 自定义 `RowMuls`（`Mul` src1 stride-0，按 64-fp32 repeat 走完 512 列 **+ 显式标量尾段 remainder**，`:691,:769-848`）。**那个 remainder 正是我们 `Broadcast([16,512])` 缺的尾巴 64 列** → lever-3A 正确复刻 = `Brcb` + 带 remainder 的 strided mul，**全程不用 AscendC Broadcast**。
+
+**Ascend C SWA 核心优化（按 perf 权重）：**
+
+- **① 全局 3-深跨核软件流水（headline，我们最大的 gap）**：一条 `PreloadPipeline`（`swa_kernel.h:741-769`），3-slot task ring（`extraInfo[3]`，`gloop%3`），`gloop` 单调计数 **跨 query slot / batch 永不 reset**。一 step 内：cube 做 MM1(n)‖MM2(n-1)，vector 做 softmax(n-1)‖merge(n-2)，**3 个 (slot,chunk) task 同时在飞**。**只在 core 的最后一个 task 才 drain**（`extraLoop=isEnd?PRELOAD_NUM:0`，`:726`），**slot 边界不 flush** → slot k 尾 chunk 和 slot k+1 头 chunk 在同一 ring 重叠。GM workspace 按 `loop%PRELOAD_NUM`(=2) 双缓冲。c:v=**1:2 MIX**（1 cube 配 2 vector，每个 256 行 M-tile 两 AIV 对半分；`.cpp:48`）。**我们的港：V0(t)/V1(t-1)/V2(t-2) 跨 chunk 流水已有，但每 slot flush（「slot 间不流水」），c:v 是 1:1。**
+- **② cube/vector 内存分治 —— §3-C 的真相**：Ascend C 是 MIX kernel，**GEMM operand + 其双缓冲全在 cube 独占的 L1（QP×4=256K + KV×3=192K = 448/512K）+ L0（A/B/C 各 ×2 ping-pong）**；UB（192K，用 176.5K，~8% 余量，**和我们一样满**）只装 vector 的 softmax/merge working set。**「余量」不在 UB，在 cube 的 L1/L0**。所以 §3-C 不是「省 UB」，是「GEMM 双缓冲别占 UB + cube 侧 KV-L1 做 3-深 ring 预取」。
+- **③ 轻量 vector 工作（降 pipe-sum）**：`SoftmaxFlashV2` 融合 max-sub/exp/sum；Brcb-rescale；`actualColumnCount==0` 快路径跳全-mask chunk（`:356,:584`）；**unitFlag 融合 L0C drain**（最后 K-slice 翻 `unitFlag 0b10→0b11`，fixpipe 重叠下一 mmad，无显式 PipeBarrier，`swa_block_cube.h:577-581`）；持久 event id（一次 alloc）。
+
+**Tile/常量对照**：Ascend C s2BaseSize=**512**（cube 内 N_SPLIT 128×4）、M_SPLIT=128、K_L1_SPLIT=256/K_L0=128、D_SPLIT=256、mBaseSize=gSize=64、headDim=512 固定、c:v=1:2。我们 BI=128。
+
+**修正后破 80% 路线（取代上面 §3-A/B/C 旧框架）**：(a) chunk 流水**延伸到跨 slot**（去 per-slot flush，slot loop 喂同一 skewed pipeline）→ 填 ~25% bubble（约到 ~55%）；(b) **vector work 复刻 Ascend C 轻量 idiom**（Brcb rescale、融合 softmax、全-mask 快路径、unitFlag drain）→ 降 pipe-sum 才上 80%。**两者都要；本 session 那种发明式单-op 微优化不是路。** 便宜先做 = Brcb rescale（顺带正解 lever-3A、降 vector scalar），大头 = 跨-slot 流水。
 
 ## 4. 编译器修改纪律（用户定，必守）
 
