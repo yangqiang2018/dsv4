@@ -491,7 +491,18 @@ def build_sparse_attn_sharedkv(
                 # literal is rejected by the tvmscript parser, so this is a
                 # plain second call under the compile-time cube_direct guard.
                 if cube_direct:
-                    T.annotate_address({m_i_brd: ub_addr["kv_ub_multi"]})
+                    T.annotate_address(
+                        {
+                            m_i_brd: ub_addr["kv_ub_multi"],
+                            # alpha_brd8 (V2 rescale brcb scratch, 512B) -> upper
+                            # half of the idle kv_ub_multi, disjoint from m_i_brd's
+                            # lower 16KB. Without this it is auto-placed and collides
+                            # with a live buffer (the brcb write corrupts it ->
+                            # prefill red even though the NI_total=1 rescale is a
+                            # 0*alpha no-op). cube_direct-only so SCFA never sees it.
+                            alpha_brd8: ub_addr["kv_ub_multi"] + 16 * KB,
+                        }
+                    )
 
                 # ---- Read this AIC core's metadata row. ----
                 # Each row is FA_METADATA_SIZE int32 entries; layout
