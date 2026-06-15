@@ -8,7 +8,7 @@
 ## 0. 一句话现状
 
 - **目标**（用户定）：TileLang 前向 perf 做到 AscendC 的 **80–100%**。**需要就改编译器**（fork `yangqiang2018/tilelang-ascend` 是我们的）。
-- **perf**（`perf_compare`，sharedkv 列，perf%=AscendC/TileLang，越高越接近；忽略 metadata 算子）：**swa 41.4% / cfa 48.7% / scfa 16.3%**（最后完整验证 = dsv4 `e6f2b65`；现 HEAD `b68dffa` kernel 逻辑与之逐字节一致 —— §1 那刀回退了）。
+- **perf**（`perf_compare`，sharedkv 列，perf%=AscendC/TileLang，越高越接近；忽略 metadata 算子）：**swa 41.4% / cfa 48.7% / scfa 16.3%**（最后完整验证 = dsv4 `e6f2b65`；现 HEAD `9b073f5` kernel 逻辑与之逐字节一致 —— V2 merge 向量化两刀 `fa63798`(wide-add) + `b30b447`(broadcast-mul) 都回退了，见 §3-A/§6/§7）。
 - 自 SUCC9（swa 37.0 / cfa 42.8 / scfa 15.9）以来，靠 cube debarrier + V1/V2/normalize 向量化/debarrier 把 **swa +4.4、cfa +5.9** 推上来；scfa（lockstep + 离散 gather）基本平。
 
 ## 1. 最后一刀已验：V2 full-tile add 回归 decode → 已回退（dsv4 `b68dffa`）
@@ -41,7 +41,7 @@
 
 ## 3. 下一步 lever（按优先级）
 
-- **A. V2 rescale mul 也 broadcast 向量化**（接 §1）。逐-head `acc_o[h]*=alpha[h]` → broadcast `alpha[pass 的 MERGE_HEADS 个]`→`[MERGE_HEADS,D]` + full-tile mul（range-slice 现在能用了）。broadcast buffer `[MERGE_HEADS,D]`=32KB，**time-share `kv_ub_multi`**：V1 用 `m_i_brd`(16KB) 用完，V2 接着用同一块（V1(t-1)/V2(t-2) 是顺序相位，VEC pipe in-order 安全）。这刀砍 vector scalar 的大头。**注意（fa63798 教训，见 §1/§7）**：broadcast + full-tile mul 是 range-slice 宽 op，要么 broadcast buffer 不跨 pass 复用、要么宽 op 后补一条 drain/flag——否则跟 §7 的跨-pass WAR 同病（窄 op 时序碰巧掩盖、合宽就暴露）。
+- **A. V2 rescale mul broadcast 向量化 —— ⚠️ 已试，被 AscendC Broadcast 宽-dst 卡住（暂搁）**。逐-head `acc_o[h]*=alpha[h]` → broadcast `alpha[MERGE_HEADS]`→`[MERGE_HEADS,D]` + full-tile mul。编译器已就绪（fork `1a70fed` 让 `broadcast` 吃 BufferLoad 切片，**dump 实锤 lowering 正确**：axis=1 / extent `[16,512]` / src-ptr=`alpha+(pv2*32+mp*16)` 全对，buffer 地址也不重叠）。**但 dsv4 `b30b447` 上 NPU prefill 回归 swa/cfa ~87%**（max rel 2.0）。根因（dump + 失败算术坐实）：**AscendC `Broadcast` 不填满 512-宽 dst，每行尾部 ~一个 64-block 留旧值** → `4257616/65536 行 ≈ 65/512 列错 = 12.7%`。V1 softmax broadcast 只 128 宽（`m_i_brd[32,128]`）→ 阈值下、填满、所以一直没事。**要成立得先解 Broadcast 宽-dst（compiler/库层调查，不是 kernel 侧）** —— 或换 `brcb` / 把 D 切 ≤128 列块广播（变复杂、收益打折）。已回退 `9b073f5`，per-head 形式留着。
 - **B. KV 滑窗复用**（cube `mte2` 22%，830us）。swa 相邻 query token 窗口重叠 127/128，我们每 slot 重载整窗，AscendC 复用。复杂（L1 滑窗管理）；且被 vector 平衡卡（要配 A 一起两核同降才动 Duration）。
 - **C. 编译器：内存规划器**（腾 UB）。kernel 顶到 178.3K/192K 是**这版**布局撑的（不是物理上限，AscendC 同硬件留得出空间）。更紧的 hidden-tmp / liveness 复用 → 腾出空间给 broadcast buffer + 跨 slot 双缓冲 → **解锁最大的杠杆**（V2 mul broadcast 无需 time-share、跨 slot 流水填气泡）。大 codegen 改（.cc，要重装 .so）。
 
@@ -51,7 +51,7 @@
 
 - **兼容性铁律**：改编译器**必须 additive / 向后兼容**，别破坏现有路径（Buffer/BufferRegion 等已有分支原样保留），**别影响其他用 tilelang 写算子/用编译器的人**。`d789b93` 范例：只**新加** BufferLoad 分支。
 - **每个特性 NPU 验过 → 打 `cfeat-<slug>` annotated tag**（why/what 写成可提 issue 的程度），`git push origin <tag>`。**供日后逐个提 issue 到上游 `tile-ai/tilelang-ascend`**。
-- 已打 4 个（前 3 追溯）：`cfeat-gm-l1-subblock-write`(52ad83a)、`cfeat-reduce-tmp-half`(9a0d62d)、`cfeat-is-subtile-runtime-extent`(025ef5c)；**待打** `cfeat-tile-op-region-slice`(d789b93，§1 验过再打)。
+- 已打 4 个（前 3 追溯）：`cfeat-gm-l1-subblock-write`(52ad83a)、`cfeat-reduce-tmp-half`(9a0d62d)、`cfeat-is-subtile-runtime-extent`(025ef5c)。**两个 BufferLoad-切片特性 `d789b93`(binary/unary) + `1a70fed`(broadcast) 都 lowering 正确但无 green kernel user**——用它们的 levers（`fa63798` wide-add 跨-pass WAR、`b30b447` broadcast-mul AscendC 宽-dst）**都因别的原因回退了** → **都没打 tag**；等有 NPU 验过的 user 再打。两者 additive/inert，留着（§3-A 一旦解了 Broadcast 宽-dst 就能用）。
 - **fork = `/Users/yzmac/Documents/WorkContent/tilelang-ascend`**（唯一一份；`dsv4/tilelang-ascend` 重复 clone 已删；坏过的留作 `tilelang-ascend.broken` 可删）。改 .py 容器 `git pull` 即生效；改 .cc/.h 才 `USE_ASCEND=True pip install -e . --no-build-isolation` 重装。
 
 ## 5. 环境 / 命令
@@ -64,9 +64,9 @@
 
 ## 6. commit 地图
 
-**dsv4 main**（HEAD `b68dffa`）：`b68dffa` 回退 `fa63798`（V2 full-tile add 跨-pass WAR 回归 decode；逻辑回到 `e6f2b65`）← `fa63798`（**已回退**）← `e6f2b65` normalize debarrier ← `532a2d9`/`7e55000` V2 merge debarrier ← `c4a75fc`/`3640c2b`/`70f784e` V1 向量化的 scfa-不回归修复（m_i_brd 别名/scoping/parse 几轮）← `f26da2f` V1 max-subtract 向量化 ← `30341dd` cube MM2 debarrier ← `0043a37` cube MM1 debarrier ← `83544be` handoff_5 §5 profiling ← `20be4ea`/`cc6c02e`(SUCC9) CFA cube-direct。
+**dsv4 main**（HEAD `9b073f5`，== `b68dffa` 逻辑）：`9b073f5` 回退 `b30b447`（V2 rescale broadcast；AscendC Broadcast 不填满 512-宽 dst，prefill 回归 12.7%）← `b30b447`（**已回退**，lever 3-A）← `30b92de` docs ← `b68dffa` 回退 `fa63798`（V2 full-tile add 跨-pass WAR 回归 decode；逻辑回到 `e6f2b65`）← `fa63798`（**已回退**）← `e6f2b65` normalize debarrier ← `532a2d9`/`7e55000` V2 merge debarrier ← `c4a75fc`/`3640c2b`/`70f784e` V1 向量化的 scfa-不回归修复（m_i_brd 别名/scoping/parse 几轮）← `f26da2f` V1 max-subtract 向量化 ← `30341dd` cube MM2 debarrier ← `0043a37` cube MM1 debarrier ← `83544be` handoff_5 §5 profiling ← `20be4ea`/`cc6c02e`(SUCC9) CFA cube-direct。
 
-**fork ascendc_pto**（HEAD `d789b93`，待验）：`d789b93` tile op 吃 BufferLoad 切片（`_handle_buffer_load`）← `025ef5c` is_subtile runtime-extent ← `9a0d62d` reduce-tmp /2 ← `52ad83a` GM→L1 子块写。
+**fork ascendc_pto**（HEAD `1a70fed`）：`1a70fed` `broadcast` 吃 BufferLoad 切片（lowering dump 验证正确；用它的 lever 3-A 因 AscendC Broadcast 宽-dst 回退，无 green user、未 tag）← `d789b93` tile op（binary/unary）吃 BufferLoad 切片（`_handle_buffer_load`；用它的 fa63798 回退，无 green user）← `025ef5c` is_subtile runtime-extent ← `9a0d62d` reduce-tmp /2 ← `52ad83a` GM→L1 子块写。
 
 ## 7. 关键坑（本 session 血泪，别重蹈）
 
@@ -76,4 +76,6 @@
 - **debarrier/broadcast 只在 cube_direct gate**，scfa（lockstep）保留——否则共振（局部赚而 Duration 涨，§5 四连证）。
 - **编译器源码 working tree 坏了也能从对象库读**：`git show <ref>:path`；坏 checkout 直接重 clone（`--no-recurse-submodules`，改 .py 用不上 submodule）。
 - **把 debarrier 的逐行 VEC op 合并成一条宽 op，会暴露被窄 op 时序掩盖的跨-pass WAR**（fa63798 血泪）：16 条 `acc_o[h]+=acc_o_ub[h]` 合成一条 `acc_o[hbase:hbase+16]+=acc_o_ub`，intrinsic 完全等价（已核 `binary_op`），但宽读 `acc_o_ub` 排空慢，与下一 pass 的 `T.copy(...,acc_o_ub)`(MTE2) 抢 → **decode 回归 97-98%**（prefill 跑得少没踩到）。合宽 op 时补 drain/flag，或别跨 pass 复用同一 buffer。已回退 `b68dffa`。**判读**：失败比例 1-3%、两个 dtype 都崩、max rel err 2.0 整齐 → 结构性 bug 不是尾噪声；fast 套件绿不代表覆盖（V2 merge 要 `t>=2` 多 chunk 才跑，decode 才压满）。
+- **AscendC `Broadcast` 不填满宽 dst（512）—— 每行尾部留旧值**（lever 3-A 血泪）：broadcast `[N]`→`[N,512]`(axis=1) 只填了 ~前 448 列，最后 ~64-block 留上一次的值 → rescale 乘了错的 alpha → prefill swa/cfa ~87%（`4257616/65536 行 ≈ 65/512 列错 = 12.7%`，max rel 2.0）。**128 宽（V1 softmax `m_i_brd[32,128]`）填得满、没事**；512 宽崩。lowering 正确（`get_kernel_source` dump 实锤 axis/extent/ptr 全对、buffer 地址不重叠）—— 是 AscendC Broadcast op 本身的宽-dst 上限。要做宽广播得先查它（或切 ≤128 列块）。已回退 `9b073f5`。
+- **`get_kernel_source()` dump 大法 + 失败算术 这次立功**（[[reference-get-kernel-source]]）：先 dump 排除 lowering（broadcast 的 axis/extent/ptr、buffer 地址全对）→ 锁定不是 codegen；再用「失败元素数 / 行数 = 每行错几列」（65/512）直接指向「按列尾部没填」。**本地无 NPU 时，dump + 失败形态比盲改快得多**——写完改动先 dump 验同步/extent/地址，别盲烧 NPU。
 - 每刀通用手段记进 tilelang-perf/pitfalls skill（源仓库 + 缓存两处，MEMORY 有约定）。
