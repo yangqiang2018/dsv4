@@ -422,6 +422,13 @@ def build_sparse_attn_sharedkv(
                 # annotates it onto the idle kv_ub_multi (below); for SCFA m_i_brd
                 # stays unannotated (auto-placed, NOT aliased to the gather buffer).
                 m_i_brd = T.alloc_ub([v_block, BI], accum_dtype)
+                # V2 rescale scratch (perf lever, replicate Ascend C RowMuls):
+                # brcb writes the pass's MERGE_HEADS alpha scalars here as
+                # [MERGE_HEADS, 8] (one 32B block per head), then row_muls reads
+                # each row's block to scale acc_o. Tiny (MERGE_HEADS*8*4 = 512B),
+                # auto-placed in the UB tail; cube_direct only (SCFA keeps the
+                # per-head scalar mul, never references this).
+                alpha_brd8 = T.alloc_ub([MERGE_HEADS, 8], accum_dtype)
                 # Mask double buffer [2, mask_w]: V0(t) writes parity t%2 while
                 # V1(t-1) reads parity (t-1)%2 in the same step. The row is
                 # padded to mask_w (32B) so both parity rows are 32B aligned; a
@@ -484,7 +491,18 @@ def build_sparse_attn_sharedkv(
                 # literal is rejected by the tvmscript parser, so this is a
                 # plain second call under the compile-time cube_direct guard.
                 if cube_direct:
-                    T.annotate_address({m_i_brd: ub_addr["kv_ub_multi"]})
+                    T.annotate_address(
+                        {
+                            m_i_brd: ub_addr["kv_ub_multi"],
+                            # alpha_brd8 (V2 rescale brcb scratch, 512B) -> upper
+                            # half of the idle kv_ub_multi, disjoint from m_i_brd's
+                            # lower 16KB. Without this it is auto-placed and collides
+                            # with a live buffer (the brcb write corrupts it ->
+                            # prefill red even though the NI_total=1 rescale is a
+                            # 0*alpha no-op). cube_direct-only so SCFA never sees it.
+                            alpha_brd8: ub_addr["kv_ub_multi"] + 16 * KB,
+                        }
+                    )
 
                 # ---- Read this AIC core's metadata row. ----
                 # Each row is FA_METADATA_SIZE int32 entries; layout
@@ -1441,33 +1459,46 @@ def build_sparse_attn_sharedkv(
                                             # barriered form: debarrier resonates in
                                             # its lockstep (skill FUSE-V2 note).
                                             if cube_direct:
-                                                # Per-head rescale (scalar alpha) + add.
-                                                # The coalesced full-tile add
-                                                #   acc_o[hbase:hbase+MERGE_HEADS, :] += acc_o_ub
-                                                # (one wide VEC op via fork range-slice
-                                                # support d789b93) was tried in fa63798 and
-                                                # REVERTED: it regressed decode (swa 97.3 /
-                                                # cfa 98.5% vs 99.5% req, max rel err 2.0).
-                                                # binary_op emits the SAME intrinsic as this
-                                                # loop (ascend_add, ptr=acc_o+hbase*D,
-                                                # size=MERGE_HEADS*D, src=acc_o_ub) -- so it
-                                                # is NOT a lowering bug. The single wide read
-                                                # of acc_o_ub drains slower than the 16 narrow
-                                                # reads and races the next pass's
-                                                # T.copy(ws_o, acc_o_ub) (MTE2 WAR, unguarded
-                                                # in the debarriered path); decode hits it
-                                                # because it runs many V2-merge passes. Re-
-                                                # coalescing would need an explicit drain
-                                                # after the add; the win is marginal, so the
-                                                # per-head form stays.
+                                                # Rescale acc_o[h,:] *= alpha[h], then
+                                                # per-head add. perf lever (§3.5 ③,
+                                                # replicate Ascend C RowMuls): the
+                                                # MERGE_HEADS scalar muls collapse to one
+                                                # brcb (alpha slice -> [MERGE_HEADS,8]
+                                                # block) + one row_muls (strided Mul that
+                                                # broadcasts each row's block across all D
+                                                # cols, issuing exactly D/64 repeats so the
+                                                # full row is written). This is the CORRECT
+                                                # rescale vectorization: the two earlier
+                                                # tries both regressed -- fa63798 (one wide
+                                                # range-slice ADD) hit a cross-pass WAR on
+                                                # acc_o_ub (decode), b30b447 (AscendC
+                                                # Broadcast alpha -> [MERGE_HEADS,D]) hit
+                                                # AscendC Broadcast's wide-dst bug (last
+                                                # 64-col block stale, prefill ~87%). The ADD
+                                                # stays per-head: acc_o_ub IS overwritten by
+                                                # the next pass's T.copy (MTE2); a wide read
+                                                # races that copy (the fa63798 bug).
+                                                abase = pv2 * ub_len + hbase
+                                                T.tile.brcb(
+                                                    alpha_brd8,
+                                                    alpha[abase : abase + MERGE_HEADS],
+                                                    (MERGE_HEADS + 7) // 8,
+                                                    1,
+                                                    8,
+                                                )
+                                                T.tile.row_muls(
+                                                    acc_o[
+                                                        hbase : hbase + MERGE_HEADS, :
+                                                    ],
+                                                    acc_o[
+                                                        hbase : hbase + MERGE_HEADS, :
+                                                    ],
+                                                    alpha_brd8,
+                                                    MERGE_HEADS,
+                                                    D,
+                                                    D,
+                                                )
                                                 for h_i in range(MERGE_HEADS):
-                                                    T.tile.mul(
-                                                        acc_o[hbase + h_i, :],
-                                                        acc_o[hbase + h_i, :],
-                                                        alpha[
-                                                            pv2 * ub_len + hbase + h_i
-                                                        ],
-                                                    )
                                                     T.tile.add(
                                                         acc_o[hbase + h_i, :],
                                                         acc_o[hbase + h_i, :],
