@@ -64,6 +64,25 @@
 
 **修正后破 80% 路线（取代上面 §3-A/B/C 旧框架）**：(a) chunk 流水**延伸到跨 slot**（去 per-slot flush，slot loop 喂同一 skewed pipeline）→ 填 ~25% bubble（约到 ~55%）；(b) **vector work 复刻 Ascend C 轻量 idiom**（Brcb rescale、融合 softmax、全-mask 快路径、unitFlag drain）→ 降 pipe-sum 才上 80%。**两者都要；本 session 那种发明式单-op 微优化不是路。** 便宜先做 = Brcb rescale（顺带正解 lever-3A、降 vector scalar），大头 = 跨-slot 流水。
 
+## 3.6 下一步 build：Brcb rescale（用户选定 2026-06-15；跨-slot 大手术暂缓）
+
+复刻 Ascend C 的 rescale（§3.5 第 2 条），正解 lever-3A 的 Broadcast 宽-dst 墙、降 V2 vector scalar。**用户在「跨-slot 大手术 vs Brcb」里选了 Brcb（受控、可验、攒 tag）**；跨-slot 流水（前提 `acc_o`→GM，all-or-nothing 多轮高风险、本地不能验）记为大项目待启。
+
+**关键事实（已查）**：
+- fork `brcb` 的 **C++ runtime 已存在**（`src/tl_templates/ascend/common.h:789` → `AscendC::Brcb`）；只是 Python wrapper（`ascend_tile.py:716`）挂着**过时的「NOT implemented」假警告**。un-stub 即可。
+- `Broadcast`（`common.h:834`）是**纯转发 `AscendC::Broadcast`**，宽-dst bug 在**厂商库里、我们改不了** → 必须走 brcb+RowMuls 绕开（Ascend C 就是这么做的，全程不碰 Broadcast）。
+- Ascend C `RowMuls` = `swa_block_vector.h:769-848`：逐行 `AscendC::Mul`，`BinaryRepeatParams` 的 `src1BlkStride=0/src1RepStride=0`（把 brcb 出的 8-lane block 沿列广播）+ 列分 `dLoop=actualCol/64` 个 repeat **+ `dRemain` 尾段**。我们 col=512 → `dLoop=8, dRemain=0`（512 是 64 整数倍，**根本不需要尾段**；Broadcast 之所以崩是它内部 mis-tile，RowMuls 老实发 8 个 repeat 就填满了）。
+
+**实现清单（改 .h → `USE_ASCEND=True pip install -e . --no-build-isolation` 重装 .so）**：
+1. **un-stub** `ascend_tile.py` `brcb`（去假警告；C++ 已在）。
+2. **加 `row_muls` runtime 模板**到 `common.h`，照搬 `RowMuls`（fp32：`repeatElementNum=64, blockElementNum=8`；`columnCount<256*8` 分支；`dLoop<=dealRowCount` 走列-repeat；带 `dRemain` 尾段以防非-512 配置）。
+3. 加 `row_muls` Python wrapper（`call_extern "tl::ascend::row_muls<T>"`，传 dst/src0/src1 ptr + dealRowCount/columnCount/actualColumnCount）。
+4. **kernel**（V2 merge cube_direct）：逐-head rescale mul → `brcb(alpha_brd8[MERGE_HEADS,8], alpha[abase:abase+MERGE_HEADS], rep=MERGE_HEADS, blk=1, rep_stride=8)` + `row_muls(acc_o[hbase:hbase+MERGE_HEADS,:], 同, alpha_brd8, MERGE_HEADS, D, D)`；**add 保持逐-head**（acc_o_ub 的跨-pass WAR，§7）。`alpha_brd8`(=MERGE_HEADS*8*4=512B) 别名 idle `kv_ub_multi`。
+5. **验**：重装 .so → `get_kernel_source` dump 核 row_muls 发了 8 个 repeat 填满 512 → fast + decode + perf。
+6. 绿后打 tag：`cfeat-brcb-enable`、`cfeat-row-muls`（攒着提 issue）。
+
+**预期**：16 标量 mul/pass → 1 brcb + 1 row_muls/pass，降 V2 vector scalar（§3.5 ③「轻量 vector idiom」第一刀）；perf 增益中等，但正解 lever-3A + 攒 2 个编译器特性。
+
 ## 4. 编译器修改纪律（用户定，必守）
 
 - **兼容性铁律**：改编译器**必须 additive / 向后兼容**，别破坏现有路径（Buffer/BufferRegion 等已有分支原样保留），**别影响其他用 tilelang 写算子/用编译器的人**。`d789b93` 范例：只**新加** BufferLoad 分支。
