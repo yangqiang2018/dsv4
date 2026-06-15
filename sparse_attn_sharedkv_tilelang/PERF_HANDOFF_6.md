@@ -7,7 +7,7 @@
 
 ## 0. 一句话现状
 
-- **目标**（用户定）：TileLang 前向 perf 做到 AscendC 的 **80–100%**。**需要就改编译器**（fork `yangqiang2018/tilelang-ascend` 是我们的）。
+- **目标**（用户定，北极星）：**完全复刻 Ascend C 这个算子的计算逻辑 + 性能优化方案**，让 TileLang 前向 perf 做到 AscendC 的 **80–100%**。**Ascend C 源码是蓝本** —— perf 缺口靠「它怎么优化就怎么复刻」，**别自己发明 kernel 侧小技巧**（本 session 发明的 V2-merge wide-add / broadcast-mul 两刀都撞编译器/硬件墙回退了；§3-B KV 复用 / §3-C 内存布局才是复刻 Ascend C 的省内存 + 流水方案）。**过不去就改编译器**（fork `yangqiang2018/tilelang-ascend` 是我们的；修 bug / 加特性，每个 NPU 验过的成功改动打 `cfeat-*` annotated tag，**攒着一起给官方 `tile-ai/tilelang-ascend` 提 issue / 需求** —— 见 §4）。
 - **perf**（`perf_compare`，sharedkv 列，perf%=AscendC/TileLang，越高越接近；忽略 metadata 算子）：**swa 41.4% / cfa 48.7% / scfa 16.3%**（最后完整验证 = dsv4 `e6f2b65`；现 HEAD `9b073f5` kernel 逻辑与之逐字节一致 —— V2 merge 向量化两刀 `fa63798`(wide-add) + `b30b447`(broadcast-mul) 都回退了，见 §3-A/§6/§7）。
 - 自 SUCC9（swa 37.0 / cfa 42.8 / scfa 15.9）以来，靠 cube debarrier + V1/V2/normalize 向量化/debarrier 把 **swa +4.4、cfa +5.9** 推上来；scfa（lockstep + 离散 gather）基本平。
 
