@@ -1486,20 +1486,14 @@ def build_sparse_attn_sharedkv(
                                                     1,
                                                     8,
                                                 )
-                                                # Sync brcb -> row_muls and row_muls ->
-                                                # add: Ascend C has PipeBarrier<PIPE_V>
-                                                # between Brcb/RowMuls/Add (swa_block_
-                                                # vector.h:689/692). Brcb is NOT safely
-                                                # in-order with the following Mul the way
-                                                # the scalar muls were, so the debarriered
-                                                # form read a stale alpha_brd8 -> wrong
-                                                # rescale (worse than no rescale). Use the
-                                                # VEC-only pipe_barrier (== AscendC
-                                                # PipeBarrier<PIPE_V>), NOT barrier_all
-                                                # (full PIPE_ALL drain). Same-pipe (both
-                                                # VEC), so a pipe barrier -- not a cross-
-                                                # pipe set/wait_flag.
-                                                T.pipe_barrier("v")
+                                                # DIAGNOSTIC: full barrier_all at the 3
+                                                # spots Ascend C has PipeBarrier<PIPE_V>
+                                                # (after brcb/row_muls/add). pipe_barrier
+                                                # ("v") got swa 90->97 but a per-rescale
+                                                # residual remains; this isolates sync-vs-
+                                                # bug. If green, refine back to the light
+                                                # pipe_barrier("v").
+                                                T.barrier_all()
                                                 T.tile.row_muls(
                                                     acc_o[
                                                         hbase : hbase + MERGE_HEADS, :
@@ -1512,13 +1506,14 @@ def build_sparse_attn_sharedkv(
                                                     D,
                                                     D,
                                                 )
-                                                T.pipe_barrier("v")
+                                                T.barrier_all()
                                                 for h_i in range(MERGE_HEADS):
                                                     T.tile.add(
                                                         acc_o[hbase + h_i, :],
                                                         acc_o[hbase + h_i, :],
                                                         acc_o_ub[h_i, :],
                                                     )
+                                                T.barrier_all()
                                             else:
                                                 for h_i in range(MERGE_HEADS):
                                                     T.barrier_all()
