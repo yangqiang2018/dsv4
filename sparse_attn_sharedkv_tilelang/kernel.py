@@ -1486,6 +1486,17 @@ def build_sparse_attn_sharedkv(
                                                     1,
                                                     8,
                                                 )
+                                                # Sync brcb -> row_muls and row_muls ->
+                                                # add: Ascend C has PipeBarrier<PIPE_V>
+                                                # between Brcb/RowMuls/Add (swa_block_
+                                                # vector.h:689/692). Brcb is NOT safely
+                                                # in-order with the following Mul the way
+                                                # the scalar muls were, so the debarriered
+                                                # form read a stale alpha_brd8 -> wrong
+                                                # rescale (worse than no rescale). barrier_
+                                                # all is heavier than PIPE_V but is the
+                                                # only VEC-drain primitive exposed.
+                                                T.barrier_all()
                                                 T.tile.row_muls(
                                                     acc_o[
                                                         hbase : hbase + MERGE_HEADS, :
@@ -1498,6 +1509,7 @@ def build_sparse_attn_sharedkv(
                                                     D,
                                                     D,
                                                 )
+                                                T.barrier_all()
                                                 for h_i in range(MERGE_HEADS):
                                                     T.tile.add(
                                                         acc_o[hbase + h_i, :],
