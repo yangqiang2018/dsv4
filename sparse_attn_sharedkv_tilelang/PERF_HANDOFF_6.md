@@ -135,6 +135,8 @@
 
 **诚实建议**：C 是破 50→80% 唯一路,但是 kernel 最大改、高风险、本地全验不了。**只在确认冲 80% 且愿投容器带宽时才值得**;否则当前 swa~42/cfa~49（vector 刀干净收官 + 6 cfeat tag）是体面停点。若上,严格 S1→S2→S3、每阶段数值验绿再走,把 all-or-nothing 压到 S3。
 
+**S1 进度（用户拍板「上 C」→ Plan agent 设计 → 已实现，dsv4 `8595d49`，build-gated 未验）**：acc_o→GM 已落地，**cube_direct only，SCFA 逐字不变**（每处 `if cube_direct:<GM> else:<原样>`；审计过每个 bare `acc_o[...]` 都只在 SCFA else）。关键设计（Plan agent）：**`vid` 是 grid 轴**（`T.Kernel(...) as (cid,vid)`，vid∈{0,1}），故 `ws_acc_o[core_num,H_per_block,D]` 镜像 ws_o、按 `vid*v_block` 切；**`cube_direct` 是编译期 bool**，所以一个编译出的 kernel 只含一条路——cube_direct trace 上 acc_o 是死 UB、SCFA trace 上 ws_acc_o 是没用到的 arg，两路干净分离、无运行时 dual-path。形态：新 GM workspace `ws_acc_o`（单缓冲，workspace_idx 加 17，api.py 不用改=auto-alloc）+ 32KB 工作 tile `acc_o_work`（复用 acc_o 空出的 UB，cube_direct-only annotate）；merge 每 MERGE_HEADS pass load ws_acc_o→acc_o_work、rescale+add、store 回；fill 用 tile 清零写 GM；normalize **折进 writeback**（per-pass load/div/cast→Output，normalized acc_o 无其他 consumer）；**all-barrier_all 同步形（subsume 了 A2 的 eid-2 flag）,S3 再 lighten**。数值应 IDENTICAL（只搬存储、没加 overlap、slot 仍串行→单缓冲 ws_acc_o 不跨-slot 在飞）。**容器验**：① smoke=jit 容不容忍 SCFA trace 上没用的 `ws_acc_o` arg（唯一新条件,build 一个 CFA + 一个 SCFA 配置）② fast ③ **`-k "decode and dtype0"`=真 gate**（merge WAR 类 fa63798/b30b447 只 decode 压满,fast 绿不够）。预期 perf **中性偏降**（多 GM DMA、还没 overlap,增益在 S3）。**下一步**：S1 容器验绿 → S2（ws_acc_o 加 slot-parity `2` 维 + sumexp/m_i/workspaces slot-parity + 真正腾 acc_o 的 64KB）。
+
 ## 4. 编译器修改纪律（用户定，必守）
 
 - **兼容性铁律**：改编译器**必须 additive / 向后兼容**，别破坏现有路径（Buffer/BufferRegion 等已有分支原样保留），**别影响其他用 tilelang 写算子/用编译器的人**。`d789b93` 范例：只**新加** BufferLoad 分支。
