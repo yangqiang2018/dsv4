@@ -1492,10 +1492,16 @@ def build_sparse_attn_sharedkv(
                                                 # PIPE_V (pipe_barrier "v"). The add->next-
                                                 # pass T.copy(ws_o, acc_o_ub) is a VEC->MTE2
                                                 # WAR on acc_o_ub (the fa63798 hazard, which
-                                                # the row_muls timing newly exposes) -> needs
-                                                # a full barrier (cross-pipe), not PIPE_V.
-                                                # Diagnostic: 3x barrier_all green; PIPE_V x2
-                                                # alone = 97% (missed the WAR).
+                                                # the row_muls timing newly exposes). PIPE_V
+                                                # can't guard it (it is VEC->MTE2, not VEC->
+                                                # VEC; x2 PIPE_V alone = 97%, missed the WAR).
+                                                # barrier_all works but also cross-core / all-
+                                                # pipe drains -- unneeded here (no cube op
+                                                # waits on the merge). §3.7 A2: lighten to a
+                                                # v->mte2 flag (eid 2; 0/1 are the prefetch
+                                                # ping-pong) -- it stalls only MTE2 until VEC
+                                                # retires, and MTE2 is in-order so the next mp
+                                                # pass's T.copy(ws_o -> acc_o_ub) load waits.
                                                 T.pipe_barrier("v")
                                                 T.tile.row_muls(
                                                     acc_o[
@@ -1516,7 +1522,8 @@ def build_sparse_attn_sharedkv(
                                                         acc_o[hbase + h_i, :],
                                                         acc_o_ub[h_i, :],
                                                     )
-                                                T.barrier_all()
+                                                T.set_flag("v", "mte2", 2)
+                                                T.wait_flag("v", "mte2", 2)
                                             else:
                                                 for h_i in range(MERGE_HEADS):
                                                     T.barrier_all()
