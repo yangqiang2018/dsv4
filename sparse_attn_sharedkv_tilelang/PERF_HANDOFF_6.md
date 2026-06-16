@@ -80,8 +80,8 @@
 
 **A. 收尾/小修（快）**：
 1. **复测 scfa**（14.9 vs 旧 16.3）：scfa 走 per-head barriered（非 cube_direct），brcb/row_muls 不碰它，应是噪声 —— 重跑 `perf_compare` 确认；若真降，查 `alpha_brd8` 无条件 alloc（512B）有没有扰动 scfa 布局。
-2. **3rd 同步轻量化**：V2 merge 那个 `barrier_all()`（adds→copy 的 acc_o_ub WAR）换成 `T.set_flag("v","mte2",eid)`/`T.wait_flag`（精确跨-pipe flag，eid 别撞现有；只守 acc_o_ub、不全核 drain）→ 抠一点 perf，绿了验。
-3. **补 tag**：`d789b93`（binary/unary BufferLoad）现在有 green user 了（brcb/row_muls 用 `_handle_buffer_load`）→ 可打 `cfeat-tile-op-bufferload`。`1a70fed`（broadcast BufferLoad）仍无 green user（lever-3A 回退）、先不打。
+2. **3rd 同步轻量化 — ✅ 已实现（committed `d877ee4`，本地；PENDING NPU verify + push）**：V2 merge 那个 `barrier_all()`（adds→copy 的 acc_o_ub WAR）已换成 `T.set_flag("v","mte2",2)` + `T.wait_flag("v","mte2",2)`（eid 2 free，0/1 是 prefetch ping-pong；back-to-back 平衡、无 event leak；只守 acc_o_ub 的 VEC→MTE2 WAR、不全核 drain —— cube 不读 acc_o/acc_o_ub，P@V handoff 走 cross_flags 不靠这条 barrier；MTE2 in-order 故下个 mp 的 `T.copy(ws_o→acc_o_ub)` 自动后置）。**本地 py_compile + ruff 绿；NPU 未验** —— 按 fa63798 教训这 WAR 只 decode 压满，必跑 `test_..._fast` + `-k "decode and dtype0"` + `perf_compare` 才能 ship；红就回退成 `T.barrier_all()` 一行。push 被 auto-mode classifier 挡（直推 main），等用户授权后 `git push origin main`。
+3. **补 tag — ✅ 已做**：`d789b93`（tile-op BufferLoad operand）已打 `cfeat-tile-op-bufferload` 并 push 到 fork。green user = brcb/row_muls 复用 `_handle_buffer_load`（§3.6 ship 绿，brcb src / row_muls dst-src0 都是 BufferLoad 切片）。tag message 已注明：binary/unary 的 BufferLoad **分支本身**仍无直接 green user（其 fa63798 user 因跨-pass WAR 回退、非 BufferLoad lowering 之过），但 helper 经 brcb/row_muls 已 NPU 验。`1a70fed`（broadcast BufferLoad）仍无 green user（lever-3A 回退）、不打。
 
 **B. 继续复刻 §3.5 ③ 轻量 vector idiom（中，降 pipe-sum）**：Ascend C 的 `SoftmaxFlashV2` 融合 max-sub/exp/sum；`actualColumnCount==0` 全-mask chunk 快路径（`swa_block_vector.h:356/584`）；cube unitFlag 融合 fixpipe drain（`swa_block_cube.h:577`）。逐条复刻、NPU 验、攒 tag。
 
@@ -112,7 +112,7 @@
 
 - **兼容性铁律**：改编译器**必须 additive / 向后兼容**，别破坏现有路径（Buffer/BufferRegion 等已有分支原样保留），**别影响其他用 tilelang 写算子/用编译器的人**。`d789b93` 范例：只**新加** BufferLoad 分支。
 - **每个特性 NPU 验过 → 打 `cfeat-<slug>` annotated tag**（why/what 写成可提 issue 的程度），`git push origin <tag>`。**供日后逐个提 issue 到上游 `tile-ai/tilelang-ascend`**。
-- 已打 4 个（前 3 追溯）：`cfeat-gm-l1-subblock-write`(52ad83a)、`cfeat-reduce-tmp-half`(9a0d62d)、`cfeat-is-subtile-runtime-extent`(025ef5c)。**两个 BufferLoad-切片特性 `d789b93`(binary/unary) + `1a70fed`(broadcast) 都 lowering 正确但无 green kernel user**——用它们的 levers（`fa63798` wide-add 跨-pass WAR、`b30b447` broadcast-mul AscendC 宽-dst）**都因别的原因回退了** → **都没打 tag**；等有 NPU 验过的 user 再打。两者 additive/inert，留着（§3-A 一旦解了 Broadcast 宽-dst 就能用）。
+- 已打 5 个：`cfeat-gm-l1-subblock-write`(52ad83a)、`cfeat-reduce-tmp-half`(9a0d62d)、`cfeat-is-subtile-runtime-extent`(025ef5c)、`cfeat-brcb-row-muls`(d7add81，§3.6)、**`cfeat-tile-op-bufferload`(d789b93，本 session §3.7 A3)**。`d789b93`（tile-op 吃 BufferLoad 切片）的 green user 经 brcb/row_muls 复用 `_handle_buffer_load` 坐实（binary/unary 分支的**直接** user `fa63798` 因跨-pass WAR 回退，但 helper 本身已 NPU 验，tag message 已注明）。**仍没打：`1a70fed`(broadcast BufferLoad)** —— 唯一 user（`b30b447` broadcast-mul）因 AscendC 宽-dst bug 回退、无 green user；additive/inert，留着（§3-A 一旦解了 Broadcast 宽-dst 就能用）。
 - **fork = `/Users/yzmac/Documents/WorkContent/tilelang-ascend`**（唯一一份；`dsv4/tilelang-ascend` 重复 clone 已删；坏过的留作 `tilelang-ascend.broken` 可删）。改 .py 容器 `git pull` 即生效；改 .cc/.h 才 `USE_ASCEND=True pip install -e . --no-build-isolation` 重装。
 
 ## 5. 环境 / 命令
