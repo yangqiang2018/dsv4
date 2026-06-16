@@ -139,6 +139,18 @@
 **⚠️ C 真实风险画像（S1 验后必读）**：S1+S2 是**纯成本**,所有恢复+增益**全压在 S3**。S3 成 → 约 swa 55；S3 砸 → 停在比 baseline 还差的 ~35,要**整体回退 C**（acc_o 这套 GM 改动全撤）。即「花 15-25 轮赌 S3,赢到 ~55、输则倒退」。
 **下一步**：checkpoint —— 续做 S2（ws_acc_o 加 slot-parity `2` 维 + sumexp/m_i/workspaces slot-parity + 真正腾 acc_o 的 64KB；仍纯成本、可验绿）再 S3,还是就此打住/回退,由用户拍板。
 
+## 3.9 S3（跨-slot 流水）设计 pass（2026-06-16，Plan agent + 审核，本地、未动代码）—— 结论:full flat-gloop 重写、ROI 差、建议回退 S1
+
+**核心结构发现:skew-in-place 不可能,S3 = 从零把主循环改成 Ascend C 的 flat `gloop`（PreloadPipeline）。** 原因(强证据):`T.Scope("C")/T.Scope("V")` 是**整函数**分区标记 —— CombineCV 把函数体塌成正好**两个顶层程序**(cube 一个 / vector 一个),各自跑自己那份**串行 `for slot`**,只靠 cross-flag 会合。所以**没法在嵌套结构里 skew 相邻 slot**(cube 的 MM1(k+1) 和 vector 的 V2(k) 要在同一墙钟时刻跑不同 slot,而两程序 SeqStmt 模型只能用 flat task-dispatch 表达)。要跨-slot 叠只能像 Ascend C:一个 flat `for gloop`(遍历所有 slot×chunk task、单调不 reset)+ 3-深 ring(`extraInfo[g%3]`:Mm1(g)‖Vec1(g-1)/Mm2(g-1)‖Vec2(g-2))+ `isValid` 门控做 prologue/epilogue + 末尾 `extraLoop` 全局 drain。
+
+**parity**:`ws_acc_o`/`sumexp`/`m_i` 加 slot-parity `2` 维(`g%2` 索引);`alpha` + `ws_kv/score/p/o` 把现有 chunk-parity `t%2` **重新解释成 gloop-parity `g%2`**(GM 不扩、只换索引);**`acc_o_work` 保持单缓冲**(parity 放 GM 不放 UB tile —— UB tile-op 操作数上的 Var-parity 正踩 `:1499`「no Var-offset range slice」坑;GM copy 的 region 容 Var 索引、绕过)。
+
+**cross-flag**:4 个 forward flag 从 per-slot 移到 per-gloop、各包 task-validity `if`(= Ascend C `isValid`);**死锁雷区**(`kernel.py:1259` 记载 +2/slot leak 死锁 prefill)靠「validity 是 flag 发不发射的唯一真相 + 数 set==wait/flag」避免;**prefill(多 slot 抓 leak)+ decode(单 slot 抓 race)两套都得每步跑**,漏一种 test 群必 ship 潜在 hang。drain 全局一次(末尾 `extraLoop=PRELOAD_NUM`)。
+
+**sub-stage(强制,无本地验)**:S2(parity-add,inert,可验 byte-identical,~3-5 轮)→ **S3a(1-深 tail overlap,硬 gate:slot k 的 normalize+writeback 叠 slot k+1 的 V0+MM1;连 S1 的 −7 都收不回就 abort+回退,~5-8 轮)** → S3b(full flat gloop + S1 全 barrier_all 换 flag,~8-12 轮高方差)。
+
+**诚实 ROI(Plan agent + 我都认同)**:技术可行(Ascend C 是实证、无需新编译器特性),但 **~16-25 高方差轮、死锁雷区活的、本地全验不了**;且即使**成功也就 ~50-55、不是 80**(vector 便宜刀已证用尽,§3.6/3.7;§3 早写 ~50% 是 kernel 侧天花板)。S1 已把 swa 压到 35.6,所有恢复全押 S3b;**S3b 砸 = 整套 acc_o→GM(S1+S2+S3)全回退、~20 轮换回原点**。**建议:除非 80% 是硬承诺 + 愿投专门容器带宽 + 接受可能全回退,否则回退 S1 到干净里程碑(swa 42.4 / cfa 49.9、vector 刀收官、6 cfeat tag)是诚实终点。**
+
 ## 4. 编译器修改纪律（用户定，必守）
 
 - **兼容性铁律**：改编译器**必须 additive / 向后兼容**，别破坏现有路径（Buffer/BufferRegion 等已有分支原样保留），**别影响其他用 tilelang 写算子/用编译器的人**。`d789b93` 范例：只**新加** BufferLoad 分支。
