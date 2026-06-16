@@ -1612,6 +1612,13 @@ def build_sparse_attn_sharedkv(
                                                         :,
                                                     ],
                                                 )
+                                                # S1 FIX: this store (MTE3 reads
+                                                # acc_o_work) must finish before the next
+                                                # mp pass's load (MTE2 writes acc_o_work)
+                                                # -- a cross-pass WAR on the shared working
+                                                # tile. The post-loads barrier_all is AFTER
+                                                # the next load (too late), so drain here.
+                                                T.barrier_all()
                                             else:
                                                 for h_i in range(MERGE_HEADS):
                                                     T.barrier_all()
@@ -1673,6 +1680,11 @@ def build_sparse_attn_sharedkv(
                                             acc_o_work,
                                             acc_o_half[hb : hb + MERGE_HEADS, :],
                                         )
+                                        # S1 FIX: cast (VEC reads acc_o_work) must finish
+                                        # before the next hp pass's load (MTE2 writes
+                                        # acc_o_work) -- the same cross-pass WAR on the
+                                        # working tile as the merge store.
+                                        T.barrier_all()
                                     T.barrier_all()
                                     T.copy(
                                         acc_o_half,
