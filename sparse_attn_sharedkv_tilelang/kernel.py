@@ -380,7 +380,15 @@ def build_sparse_attn_sharedkv(
                 # below, cube_direct-only, so SCFA's IR never sees the alias). The
                 # 64KB is genuinely reclaimed in S2. Allocated unconditionally
                 # (tvmscript block-scopes a buffer declared inside `if cube_direct:`).
+                # Q4: double-buffered. The merge/normalize sub-tile the v_block heads
+                # into N_MERGE_PASS passes; with TWO work tiles (acc_o_work for even
+                # passes, acc_o_work2 for odd) the next pass's GM load (MTE2) overlaps
+                # this pass's rescale/div (VEC) + store (MTE3) under precise pipe flags
+                # instead of S1's barrier_all walls (which serialized DMA-vs-VEC on the
+                # bottleneck vector core -- the -7). The two 32KB tiles fill the freed
+                # 64KB acc_o slot exactly (0..32KB, 32..64KB), cube_direct-only.
                 acc_o_work = T.alloc_ub([MERGE_HEADS, D], accum_dtype)
+                acc_o_work2 = T.alloc_ub([MERGE_HEADS, D], accum_dtype)
                 # P@V merge load buffer, sub-tiled (S2b.0) to MERGE_HEADS heads =
                 # [16, D] = 32KB; V2 merges v_block heads in N_MERGE_PASS passes.
                 acc_o_ub = T.alloc_ub([MERGE_HEADS, D], accum_dtype)
@@ -518,7 +526,10 @@ def build_sparse_attn_sharedkv(
                             alpha_exp: ub_addr["kv_ub_multi"] + 16 * KB + 512,
                             # S1: acc_o is GM-resident on this trace, so its 64KB UB
                             # region is dead -- acc_o_work (32KB) reuses its low half.
+                            # Q4: acc_o_work2 (32KB) takes the high half, so the two
+                            # double-buffer tiles fill the whole dead 64KB acc_o slot.
                             acc_o_work: ub_addr["acc_o"],
+                            acc_o_work2: ub_addr["acc_o"] + 32 * KB,
                         }
                     )
 
@@ -1503,9 +1514,19 @@ def build_sparse_attn_sharedkv(
                                         for mp in range(N_MERGE_PASS):
                                             hbase = mp * MERGE_HEADS
                                             if cube_direct:
-                                                # S1: load this pass's accumulator from
-                                                # GM (ws_acc_o) into the working tile;
-                                                # rescaled + added + stored back below.
+                                                # Q4: debarrier the GM round-trip. wbuf =
+                                                # the pass's double-buffer tile (acc_o_work
+                                                # even / acc_o_work2 odd, in the freed 64KB
+                                                # acc_o slot). buf(mp%2) is untouched by the
+                                                # prior pass, so this load (MTE2) overlaps
+                                                # that pass's rescale (VEC) + store (MTE3) --
+                                                # what S1's barrier_all walls forbade (the
+                                                # DMA-vs-VEC serialization that cost the -7
+                                                # on the bottleneck vector core). mp is a
+                                                # Python int so (..)[mp%2] picks the buffer
+                                                # object at trace time (no Var index).
+                                                wbuf = (acc_o_work, acc_o_work2)[mp % 2]
+                                                # L_acc(mp): GM ws_acc_o -> wbuf (MTE2).
                                                 T.copy(
                                                     ws_acc_o[
                                                         cid,
@@ -1516,55 +1537,44 @@ def build_sparse_attn_sharedkv(
                                                         + MERGE_HEADS,
                                                         :,
                                                     ],
-                                                    acc_o_work,
+                                                    wbuf,
                                                 )
-                                            T.copy(
-                                                ws_o[
-                                                    cid,
-                                                    pv2,
-                                                    vid * v_block + hbase : vid
-                                                    * v_block
-                                                    + hbase
-                                                    + MERGE_HEADS,
-                                                    :,
-                                                ],
-                                                acc_o_ub,
-                                            )
-                                            T.barrier_all()
-                                            # Per-head rescale + merge. cube_direct
-                                            # (swa/cfa, perf lever 2): drop the per-
-                                            # head barrier_all -- the mul (rescale by
-                                            # scalar alpha) and add are same-VEC-pipe
-                                            # in-order, distinct/RAW rows, and acc_o_ub
-                                            # was already drained by the barrier above
-                                            # -- so the ~3*MERGE_HEADS barriers/pass (a
-                                            # big slice of the vector bubble, swa
-                                            # profile) are redundant. Ops stay per-head
-                                            # single-row (acc_o[h,:]); the coalesced
-                                            # range-slice add was reverted (see the
-                                            # if-block below). SCFA keeps the
-                                            # barriered form: debarrier resonates in
-                                            # its lockstep (skill FUSE-V2 note).
-                                            if cube_direct:
-                                                # Rescale acc_o[h,:] *= alpha[h], then
-                                                # per-head add. perf lever (§3.5 ③,
-                                                # replicate Ascend C RowMuls): the
-                                                # MERGE_HEADS scalar muls collapse to one
-                                                # brcb (alpha slice -> [MERGE_HEADS,8]
-                                                # block) + one row_muls (strided Mul that
-                                                # broadcasts each row's block across all D
-                                                # cols, issuing exactly D/64 repeats so the
-                                                # full row is written). This is the CORRECT
-                                                # rescale vectorization: the two earlier
-                                                # tries both regressed -- fa63798 (one wide
-                                                # range-slice ADD) hit a cross-pass WAR on
-                                                # acc_o_ub (decode), b30b447 (AscendC
-                                                # Broadcast alpha -> [MERGE_HEADS,D]) hit
-                                                # AscendC Broadcast's wide-dst bug (last
-                                                # 64-col block stale, prefill ~87%). The ADD
-                                                # stays per-head: acc_o_ub IS overwritten by
-                                                # the next pass's T.copy (MTE2); a wide read
-                                                # races that copy (the fa63798 bug).
+                                                # acc_o_ub stays single-buffered (UB budget;
+                                                # AscendC also single-buffers the P@V output
+                                                # accumulator). WAR: the prev pass's add
+                                                # (VEC) must finish reading acc_o_ub before
+                                                # this L_o (MTE2) overwrites it. v->mte2 eid
+                                                # 2 (0/1 are the score-prefetch ping-pong);
+                                                # set @mp0, waited here @mp1 -> balanced.
+                                                if mp >= 1:
+                                                    T.wait_flag("v", "mte2", 2)
+                                                # L_o(mp): GM ws_o -> acc_o_ub (MTE2).
+                                                T.copy(
+                                                    ws_o[
+                                                        cid,
+                                                        pv2,
+                                                        vid * v_block + hbase : vid
+                                                        * v_block
+                                                        + hbase
+                                                        + MERGE_HEADS,
+                                                        :,
+                                                    ],
+                                                    acc_o_ub,
+                                                )
+                                                # loads (MTE2) -> rescale (VEC) RAW. Both
+                                                # loads are MTE2 (in-order) so one flag after
+                                                # the second covers both; per-buf eid 2/3.
+                                                T.set_flag("mte2", "v", 2 + mp % 2)
+                                                T.wait_flag("mte2", "v", 2 + mp % 2)
+                                                # Rescale wbuf *= alpha (brcb + row_muls,
+                                                # replicate Ascend C RowMuls) then per-head
+                                                # add wbuf += acc_o_ub. brcb->row_muls->add
+                                                # are VEC->VEC RAW -> light pipe_barrier("v")
+                                                # (Ascend C swa_block_vector.h 689/692).
+                                                # chunk 0 has acc_o=0 so the rescale is a
+                                                # no-op. The ADD stays per-head: a wide read
+                                                # of acc_o_ub races its next-pass reload
+                                                # (the fa63798 cross-pass WAR).
                                                 abase = pv2 * ub_len + hbase
                                                 T.tile.brcb(
                                                     alpha_brd8,
@@ -1573,17 +1583,10 @@ def build_sparse_attn_sharedkv(
                                                     1,
                                                     8,
                                                 )
-                                                # Sync: brcb->row_muls and row_muls->add are
-                                                # VEC->VEC RAW -> light PIPE_V (pipe_barrier
-                                                # "v"), matching Ascend C swa_block_vector.h
-                                                # 689/692/694-696. S1: the rescale now runs on
-                                                # the GM-resident accumulator's working tile
-                                                # acc_o_work (loaded above); the post-add sync
-                                                # + GM store-back are below.
                                                 T.pipe_barrier("v")
                                                 T.tile.row_muls(
-                                                    acc_o_work,
-                                                    acc_o_work,
+                                                    wbuf,
+                                                    wbuf,
                                                     alpha_brd8,
                                                     MERGE_HEADS,
                                                     D,
@@ -1592,21 +1595,27 @@ def build_sparse_attn_sharedkv(
                                                 T.pipe_barrier("v")
                                                 for h_i in range(MERGE_HEADS):
                                                     T.tile.add(
-                                                        acc_o_work[h_i, :],
-                                                        acc_o_work[h_i, :],
+                                                        wbuf[h_i, :],
+                                                        wbuf[h_i, :],
                                                         acc_o_ub[h_i, :],
                                                     )
-                                                # S1: adds (VEC) done -> drain before the MTE3
-                                                # store reads acc_o_work, and before the next
-                                                # pass's MTE2 loads (WAR on acc_o_work + the
-                                                # fa63798 WAR on acc_o_ub). All-barrier_all in
-                                                # S1 (supersedes A2's eid-2 v->mte2 lightening,
-                                                # now subsumed); lighten to flags in S3 under
-                                                # profiling. Then store the merged accumulator
-                                                # back to GM.
-                                                T.barrier_all()
+                                                # add (VEC) done reading acc_o_ub -> free it
+                                                # for pass mp+1's L_o (WAR). Set only when a
+                                                # next pass exists (set @mp0, wait @mp1 ->
+                                                # balanced, no event leak into the next slot
+                                                # -- the :1259 +2/slot deadlock class).
+                                                if mp < N_MERGE_PASS - 1:
+                                                    T.set_flag("v", "mte2", 2)
+                                                # add (VEC) -> store (MTE3) RAW, per-buf eid.
+                                                T.set_flag("v", "mte3", 1 + mp % 2)
+                                                T.wait_flag("v", "mte3", 1 + mp % 2)
+                                                # S(mp): wbuf -> GM ws_acc_o (MTE3). No
+                                                # trailing barrier_all: wbuf=buf(mp%2) is not
+                                                # reused until the next slot (phase barriers
+                                                # cover it), and the V2->tail GM RAW + buf
+                                                # WAR are drained by the tail-entry barrier.
                                                 T.copy(
-                                                    acc_o_work,
+                                                    wbuf,
                                                     ws_acc_o[
                                                         cid,
                                                         slot % 2,
@@ -1617,14 +1626,24 @@ def build_sparse_attn_sharedkv(
                                                         :,
                                                     ],
                                                 )
-                                                # S1 FIX: this store (MTE3 reads
-                                                # acc_o_work) must finish before the next
-                                                # mp pass's load (MTE2 writes acc_o_work)
-                                                # -- a cross-pass WAR on the shared working
-                                                # tile. The post-loads barrier_all is AFTER
-                                                # the next load (too late), so drain here.
-                                                T.barrier_all()
                                             else:
+                                                # SCFA: UB accumulator, unchanged. Lockstep
+                                                # resonates with debarrier, so keep the L_o
+                                                # load + per-head barriered mul/add (skill
+                                                # FUSE-V2 note). Byte-identical to S1/S2.
+                                                T.copy(
+                                                    ws_o[
+                                                        cid,
+                                                        pv2,
+                                                        vid * v_block + hbase : vid
+                                                        * v_block
+                                                        + hbase
+                                                        + MERGE_HEADS,
+                                                        :,
+                                                    ],
+                                                    acc_o_ub,
+                                                )
+                                                T.barrier_all()
                                                 for h_i in range(MERGE_HEADS):
                                                     T.barrier_all()
                                                     T.tile.mul(
@@ -1661,8 +1680,20 @@ def build_sparse_attn_sharedkv(
                                 # accepted S1 perf cost. SCFA keeps the barriered UB
                                 # form (lockstep resonance), unchanged.
                                 if cube_direct:
+                                    # Q4: debarrier the normalize+writeback GM round-trip.
+                                    # wbuf = double-buffer tile (acc_o_work even / acc_o_
+                                    # work2 odd) so pass hp+1's GM load (MTE2) overlaps pass
+                                    # hp's div+cast (VEC); the casts feed one batched Output
+                                    # write. S1 walled every leg with barrier_all, which
+                                    # serialized DMA-vs-VEC on the bottleneck vector core.
+                                    # Entry barrier: V2's stores (MTE3 -> ws_acc_o) must
+                                    # land before these loads (MTE2 <- ws_acc_o) [GM RAW],
+                                    # and V2's work-tile reads drain before the bufs reuse.
+                                    T.barrier_all()
                                     for hp in range(N_MERGE_PASS):
                                         hb = hp * MERGE_HEADS
+                                        wbuf = (acc_o_work, acc_o_work2)[hp % 2]
+                                        # L(hp): GM ws_acc_o -> wbuf (MTE2).
                                         T.copy(
                                             ws_acc_o[
                                                 cid,
@@ -1672,26 +1703,29 @@ def build_sparse_attn_sharedkv(
                                                 + MERGE_HEADS,
                                                 :,
                                             ],
-                                            acc_o_work,
+                                            wbuf,
                                         )
-                                        T.barrier_all()
+                                        # L (MTE2) -> div (VEC) RAW, per-buf eid 2/3.
+                                        T.set_flag("mte2", "v", 2 + hp % 2)
+                                        T.wait_flag("mte2", "v", 2 + hp % 2)
                                         for h_i in range(MERGE_HEADS):
                                             T.tile.div(
-                                                acc_o_work[h_i, :],
-                                                acc_o_work[h_i, :],
+                                                wbuf[h_i, :],
+                                                wbuf[h_i, :],
                                                 sumexp[hb + h_i],
                                             )
-                                        T.barrier_all()
+                                        # div -> cast: VEC->VEC RAW (light pipe_barrier).
+                                        T.pipe_barrier("v")
+                                        # cast fp32->bf16 into this pass's Output slice.
                                         T.copy(
-                                            acc_o_work,
+                                            wbuf,
                                             acc_o_half[hb : hb + MERGE_HEADS, :],
                                         )
-                                        # S1 FIX: cast (VEC reads acc_o_work) must finish
-                                        # before the next hp pass's load (MTE2 writes
-                                        # acc_o_work) -- the same cross-pass WAR on the
-                                        # working tile as the merge store.
-                                        T.barrier_all()
-                                    T.barrier_all()
+                                    # casts (VEC) -> Output write (MTE3) RAW. Both casts
+                                    # wrote disjoint acc_o_half slices (no inter-pass WAR);
+                                    # one flag after the loop covers them (VEC in-order).
+                                    T.set_flag("v", "mte3", 1)
+                                    T.wait_flag("v", "mte3", 1)
                                     T.copy(
                                         acc_o_half,
                                         Output[
