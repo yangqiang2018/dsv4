@@ -321,7 +321,7 @@ def build_sparse_attn_sharedkv(
     # C contract (``softmax_lse`` is a REQUIRED output, gated at the
     # attribute level) and gives every caller (training reverse,
     # online-softmax composition, etc.) the value for free.
-    @tilelang.jit(out_idx=[11, 12], workspace_idx=[13, 14, 15, 16])
+    @tilelang.jit(out_idx=[11, 12], workspace_idx=[13, 14, 15, 16, 17])
     def _make():
         @T.prim_func
         def sparse_attn_sharedkv(
@@ -345,6 +345,12 @@ def build_sparse_attn_sharedkv(
             ws_score: T.Tensor([core_num, 2, H_per_block, BI], accum_dtype),  # type: ignore[valid-type]
             ws_p: T.Tensor([core_num, 2, H_per_block, BI], dtype),  # type: ignore[valid-type]
             ws_o: T.Tensor([core_num, 2, H_per_block, D], accum_dtype),  # type: ignore[valid-type]
+            # S1 (cross-slot pipeline): acc_o's persistent store moves UB -> GM
+            # (single-buffer for now; slot-parity double-buffer is S2). Mirrors
+            # ws_o's [core_num, H_per_block, D] per-core layout; each AIV indexes
+            # its half by vid*v_block. cube_direct (swa/cfa) only -- on the SCFA
+            # trace this arg is unreferenced (acc_o stays the UB accumulator).
+            ws_acc_o: T.Tensor([core_num, H_per_block, D], accum_dtype),  # type: ignore[valid-type]
         ):
             with T.Kernel(core_num, is_npu=True) as (cid, vid):
                 # ---- L1 / L0 (cube). ----
@@ -365,6 +371,14 @@ def build_sparse_attn_sharedkv(
 
                 # ---- UB (vector). ----
                 acc_o = T.alloc_ub([v_block, D], accum_dtype)
+                # S1: cube_direct working tile for the GM-resident acc_o. The
+                # merge/normalize load a MERGE_HEADS pass from ws_acc_o into this,
+                # operate, store back -- so acc_o's 64KB UB is dead on the
+                # cube_direct trace and this 32KB tile reuses its low half (annotated
+                # below, cube_direct-only, so SCFA's IR never sees the alias). The
+                # 64KB is genuinely reclaimed in S2. Allocated unconditionally
+                # (tvmscript block-scopes a buffer declared inside `if cube_direct:`).
+                acc_o_work = T.alloc_ub([MERGE_HEADS, D], accum_dtype)
                 # P@V merge load buffer, sub-tiled (S2b.0) to MERGE_HEADS heads =
                 # [16, D] = 32KB; V2 merges v_block heads in N_MERGE_PASS passes.
                 acc_o_ub = T.alloc_ub([MERGE_HEADS, D], accum_dtype)
@@ -500,6 +514,9 @@ def build_sparse_attn_sharedkv(
                             softmax_tmp: ub_addr["kv_ub_multi"],
                             alpha_brd8: ub_addr["kv_ub_multi"] + 16 * KB,
                             alpha_exp: ub_addr["kv_ub_multi"] + 16 * KB + 512,
+                            # S1: acc_o is GM-resident on this trace, so its 64KB UB
+                            # region is dead -- acc_o_work (32KB) reuses its low half.
+                            acc_o_work: ub_addr["acc_o"],
                         }
                     )
 
@@ -975,7 +992,30 @@ def build_sparse_attn_sharedkv(
                                     Sinks[vid * v_block : vid * v_block + v_block],
                                     m_i,
                                 )
-                                T.tile.fill(acc_o, 0.0)
+                                # S1: seed acc_o = 0. cube_direct (swa/cfa) keeps the
+                                # accumulator in GM (ws_acc_o), so zero each MERGE_HEADS
+                                # pass via the working tile and store to GM; SCFA keeps
+                                # the UB accumulator. (Single-buffer GM is safe: the slot
+                                # loop is still serial, so ws_acc_o[cid] is never in
+                                # flight across slots -- that becomes S2's parity dim.)
+                                if cube_direct:
+                                    for hp in range(N_MERGE_PASS):
+                                        hb = hp * MERGE_HEADS
+                                        T.tile.fill(acc_o_work, 0.0)
+                                        T.barrier_all()
+                                        T.copy(
+                                            acc_o_work,
+                                            ws_acc_o[
+                                                cid,
+                                                vid * v_block + hb : vid * v_block
+                                                + hb
+                                                + MERGE_HEADS,
+                                                :,
+                                            ],
+                                        )
+                                    T.barrier_all()
+                                else:
+                                    T.tile.fill(acc_o, 0.0)
                                 T.tile.fill(sumexp, 1.0)
                                 T.barrier_all()
 
@@ -1459,6 +1499,21 @@ def build_sparse_attn_sharedkv(
                                         # acc_o[hbase+h_i] (no Var-offset range slice).
                                         for mp in range(N_MERGE_PASS):
                                             hbase = mp * MERGE_HEADS
+                                            if cube_direct:
+                                                # S1: load this pass's accumulator from
+                                                # GM (ws_acc_o) into the working tile;
+                                                # rescaled + added + stored back below.
+                                                T.copy(
+                                                    ws_acc_o[
+                                                        cid,
+                                                        vid * v_block + hbase : vid
+                                                        * v_block
+                                                        + hbase
+                                                        + MERGE_HEADS,
+                                                        :,
+                                                    ],
+                                                    acc_o_work,
+                                                )
                                             T.copy(
                                                 ws_o[
                                                     cid,
@@ -1514,30 +1569,17 @@ def build_sparse_attn_sharedkv(
                                                     1,
                                                     8,
                                                 )
-                                                # Sync (matches Ascend C swa_block_vector.h
-                                                # 689/692/694-696): brcb->row_muls and
-                                                # row_muls->add are VEC->VEC RAW -> light
-                                                # PIPE_V (pipe_barrier "v"). The add->next-
-                                                # pass T.copy(ws_o, acc_o_ub) is a VEC->MTE2
-                                                # WAR on acc_o_ub (the fa63798 hazard, which
-                                                # the row_muls timing newly exposes). PIPE_V
-                                                # can't guard it (it is VEC->MTE2, not VEC->
-                                                # VEC; x2 PIPE_V alone = 97%, missed the WAR).
-                                                # barrier_all works but also cross-core / all-
-                                                # pipe drains -- unneeded here (no cube op
-                                                # waits on the merge). §3.7 A2: lighten to a
-                                                # v->mte2 flag (eid 2; 0/1 are the prefetch
-                                                # ping-pong) -- it stalls only MTE2 until VEC
-                                                # retires, and MTE2 is in-order so the next mp
-                                                # pass's T.copy(ws_o -> acc_o_ub) load waits.
+                                                # Sync: brcb->row_muls and row_muls->add are
+                                                # VEC->VEC RAW -> light PIPE_V (pipe_barrier
+                                                # "v"), matching Ascend C swa_block_vector.h
+                                                # 689/692/694-696. S1: the rescale now runs on
+                                                # the GM-resident accumulator's working tile
+                                                # acc_o_work (loaded above); the post-add sync
+                                                # + GM store-back are below.
                                                 T.pipe_barrier("v")
                                                 T.tile.row_muls(
-                                                    acc_o[
-                                                        hbase : hbase + MERGE_HEADS, :
-                                                    ],
-                                                    acc_o[
-                                                        hbase : hbase + MERGE_HEADS, :
-                                                    ],
+                                                    acc_o_work,
+                                                    acc_o_work,
                                                     alpha_brd8,
                                                     MERGE_HEADS,
                                                     D,
@@ -1546,12 +1588,30 @@ def build_sparse_attn_sharedkv(
                                                 T.pipe_barrier("v")
                                                 for h_i in range(MERGE_HEADS):
                                                     T.tile.add(
-                                                        acc_o[hbase + h_i, :],
-                                                        acc_o[hbase + h_i, :],
+                                                        acc_o_work[h_i, :],
+                                                        acc_o_work[h_i, :],
                                                         acc_o_ub[h_i, :],
                                                     )
-                                                T.set_flag("v", "mte2", 2)
-                                                T.wait_flag("v", "mte2", 2)
+                                                # S1: adds (VEC) done -> drain before the MTE3
+                                                # store reads acc_o_work, and before the next
+                                                # pass's MTE2 loads (WAR on acc_o_work + the
+                                                # fa63798 WAR on acc_o_ub). All-barrier_all in
+                                                # S1 (supersedes A2's eid-2 v->mte2 lightening,
+                                                # now subsumed); lighten to flags in S3 under
+                                                # profiling. Then store the merged accumulator
+                                                # back to GM.
+                                                T.barrier_all()
+                                                T.copy(
+                                                    acc_o_work,
+                                                    ws_acc_o[
+                                                        cid,
+                                                        vid * v_block + hbase : vid
+                                                        * v_block
+                                                        + hbase
+                                                        + MERGE_HEADS,
+                                                        :,
+                                                    ],
+                                                )
                                             else:
                                                 for h_i in range(MERGE_HEADS):
                                                     T.barrier_all()
@@ -1577,19 +1637,51 @@ def build_sparse_attn_sharedkv(
                                 T.wait_flag("v", "mte2", 0)
                                 T.wait_flag("v", "mte2", 1)
                                 # ---- normalize and write back ----
-                                # cube_direct (swa/cfa, perf lever 2): drop the
-                                # per-head barriers -- the v_block divs are same-
-                                # VEC-pipe in-order on distinct acc_o rows, so the
-                                # 2*v_block barrier_all per slot are redundant
-                                # (another vector-bubble source). SCFA keeps the
-                                # barriered form (lockstep resonance).
+                                # cube_direct (swa/cfa): S1 -- acc_o is GM-resident.
+                                # Per MERGE_HEADS pass, load from ws_acc_o, divide by
+                                # sumexp (normalize), cast fp32->bf16 into this pass's
+                                # slice of acc_o_half; then one batched Output write.
+                                # The normalize is FOLDED into writeback -- the
+                                # normalized acc_o has no other consumer (LSE reads
+                                # sumexp/m_i, not acc_o), so no store-back to ws_acc_o.
+                                # S1 re-adds the load/div/cast RAW barriers that the UB
+                                # debarrier dropped (the GM round-trip needs them);
+                                # accepted S1 perf cost. SCFA keeps the barriered UB
+                                # form (lockstep resonance), unchanged.
                                 if cube_direct:
-                                    for h_i in range(v_block):
-                                        T.tile.div(
-                                            acc_o[h_i, :],
-                                            acc_o[h_i, :],
-                                            sumexp[h_i],
+                                    for hp in range(N_MERGE_PASS):
+                                        hb = hp * MERGE_HEADS
+                                        T.copy(
+                                            ws_acc_o[
+                                                cid,
+                                                vid * v_block + hb : vid * v_block
+                                                + hb
+                                                + MERGE_HEADS,
+                                                :,
+                                            ],
+                                            acc_o_work,
                                         )
+                                        T.barrier_all()
+                                        for h_i in range(MERGE_HEADS):
+                                            T.tile.div(
+                                                acc_o_work[h_i, :],
+                                                acc_o_work[h_i, :],
+                                                sumexp[hb + h_i],
+                                            )
+                                        T.barrier_all()
+                                        T.copy(
+                                            acc_o_work,
+                                            acc_o_half[hb : hb + MERGE_HEADS, :],
+                                        )
+                                    T.barrier_all()
+                                    T.copy(
+                                        acc_o_half,
+                                        Output[
+                                            t_i,
+                                            vid * v_block : vid * v_block + v_block,
+                                            :,
+                                        ],
+                                    )
                                 else:
                                     for h_i in range(v_block):
                                         T.barrier_all()
@@ -1599,16 +1691,16 @@ def build_sparse_attn_sharedkv(
                                             sumexp[h_i],
                                         )
                                         T.barrier_all()
-                                T.copy(acc_o, acc_o_half)
-                                T.barrier_all()
-                                T.copy(
-                                    acc_o_half,
-                                    Output[
-                                        t_i,
-                                        vid * v_block : vid * v_block + v_block,
-                                        :,
-                                    ],
-                                )
+                                    T.copy(acc_o, acc_o_half)
+                                    T.barrier_all()
+                                    T.copy(
+                                        acc_o_half,
+                                        Output[
+                                            t_i,
+                                            vid * v_block : vid * v_block + v_block,
+                                            :,
+                                        ],
+                                    )
 
                                 # ---- LSE epilogue ----
                                 # lse[h] = m_i[h] + ln(sumexp[h])
