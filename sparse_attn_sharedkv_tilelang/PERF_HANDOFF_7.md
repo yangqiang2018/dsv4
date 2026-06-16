@@ -8,7 +8,7 @@
 - **目标（用户北极星）**：复刻 Ascend C 这个算子的计算逻辑 + 性能方案，让 swa 前向做到 AscendC 的 **80–100%**。Ascend C 源码是蓝本，别发明 kernel 侧小技巧；过不去改 fork 编译器（`yangqiang2018/tilelang-ascend`，NPU 验过的成功改动打 `cfeat-*` annotated tag，攒着提上游 issue）。
 - **诚实天花板**：vector 侧便宜刀**已用尽**（brcb/row_muls rescale、SoftmaxFlashV2 fused softmax 都 NPU 验过 = perf 中性，见 _6 §3.6/3.7）。**~50% 是 kernel 侧天花板**。破它只剩 **C（跨-slot 软件流水）**。**注意：即使 C 全成也就 ~55，够不着北极星 80**——80 还得叠 cube 侧（_6 §3.5② L1-ring 预取，又一大改）。**用户已知情拍板「硬上 C」**（知道 ~16-25 容器轮、最好 ~55、砸了全回退）。
 - **perf 现状**：swa **35.6** / cfa **42.3** / scfa 15.0（S1+S2 后）。**比 C 前 baseline swa 42.4 / cfa 49.9 降了 ~7**——这是 S1 把 acc_o 挪 GM 的纯 DMA 成本，**所有恢复+增益押在 S3**。
-- **进度**：S1 ✅、S2 ✅ 都容器验绿。**S3a 证伪 → 改做 Q4（见 §0.5），已实现+push（`78d78fe`），待容器验。**
+- **进度**：S1 ✅、S2 ✅、**Q4 ✅ 容器验绿但 perf 基本没动**（swa 35.0/cfa 43.7，−7 没收回；证实 intra-slot debarrier 不够、要 cross-slot S3b，见 §0.5）。**当前仍 BELOW baseline，决策点：回退 vs S3b vs profile，待用户拍板。**
 
 ## 0.5 UPDATE 2026-06-16：S3a 前提证伪 → 改做 Q4（debarrier+双缓冲），已 push 待验
 
@@ -21,8 +21,16 @@
 - **V2 merge**：per-pass barrier_all → `mte2→v`(loads RAW) / `v→mte3`(store RAW) / `v→mte2 eid2`(acc_o_ub 单缓冲 WAR，set@mp0/wait@mp1 平衡)。
 - **tail**：tail-entry barrier_all（V2→tail GM RAW + buf WAR）+ per-pass flag（`mte2→v` RAW、`pipe_barrier v` div→cast、`v→mte3` casts→Output）。
 - **Q4 eid {mte2→v 2,3; v→mte3 1,2; v→mte2 2} 与 score 机器 {v→mte2 0,1; mte2→v 0,1; v→mte3 0} 不交**。flag 平衡 + WAR/RAW 覆盖**已独立审计**（SWA+CFA 脚本验平衡、SCFA 字节同一、双缓冲地址不重叠）。
-- **预期**：swa 35.6→~40-42 / cfa 42.3→~49（回收 −7）。**这是 S3b（flat gloop）的必要地基**（证明 GM accumulator 能跑到 baseline）。诚实：即使全成也就回 baseline；破 baseline→~55 仍需 S3b，~55→80 vector 便宜刀已尽够不着。
-- **容器三验（待跑）**：① fast（抓 leak）② **`-k "decode and dtype0"`（抓 debarrier WAR race，本刀头号风险）** ③ perf_compare。**砸了怎么判**：decode 红=漏 RAW/WAR flag（查 acc_o_ub WAR / 双缓冲）；prefill hang=flag leak（审计说平衡，复查）；绿但 perf 没动=overlap 没兑现（2-pass 流水太短 / load 不是瓶颈），回退或转 S3b。
+- **预期（已证伪）**：原以为 swa 35.6→~40-42 / cfa 42.3→~49。
+
+### ✅ Q4 容器验结果（2026-06-16）：GREEN 但 perf 基本没动 —— 证实 intra-slot debarrier 不够
+
+- **green**：fast(swa/cfa/scfa prefill) + `decode and dtype0` 全过 —— **flag 方案数值正确**（无 race、无 deadlock，acc_o_ub WAR + 双缓冲 + 跨 phase 同步都对）。**首推有个 build error**（`(tuple)[mp%2]`:range loop 的 mp 是 TIR Var、不能索引 Python 元组;`if cube_direct` 是编译期分支故 scfa build 跳过没踩到、swa/cfa 踩到 —— 第二推 `1a11be7` 手动展开 2-pass 修好）。
+- **perf**：swa 35.6→**35.0**（持平/噪声内）/ cfa 42.3→**43.7**（+1.4，passes 多故略有收益）/ scfa 15.2（不变）。**−7 没收回。**
+- **结论（重要）**：**−7 的真因不是 intra-slot 的 barrier_all 串行化**（debarrier 了也没回来）。S1 给 vector 每 slot 加的 ~8 个 GM round-trip(seed 2 store / V2 2 load+2 store / tail 2 load)是 **GM 延迟**;单 slot 的 VEC 计算量**不够遮**这些 DMA(2-pass 流水只藏得下一两个 load)。要遮全得靠**跨-slot 把 DMA 铺到邻居 slot 的 VEC 下**(Ascend C PreloadPipeline 的 softmax(n-1)‖merge(n-2) 跨-task 交织) = **S3b**。这反而**印证了原 handoff 的 cross-slot 论点**(我之前对 intra-slot 能不能救持怀疑、现已实证不能)。cfa +1.4 是因为 chunk 多、intra-slot overlap 有点用,但离 −6 差得远。
+- **当前态:swa 35 / cfa 43.7,仍 BELOW baseline(42.4/49.9)。保留 Q4 而不上 S3b = 严格劣于 baseline → 不上 S3b 就该整体回退。**
+- **决策点(待用户拍板)**:**(A) 回退 S1+S2+Q4 到 baseline 42.4/49.9**(诚实终点:80 这条路够不着 —— vector 便宜刀尽、intra-slot 已证不够、S3b 最好也就 ~55、cube L1-ring 又一大改);**(B) 上 S3b**(flat gloop 跨-slot 重写,~8-12 高方差轮、all-or-nothing、最好 ~55 仍非 80、可能 regress/hang);(C) 先 profile 确认瓶颈再定(便宜)。
+- **容器三验命令**:① fast(leak)② `-k "decode and dtype0"`(race)③ perf_compare。
 
 **§1 的 S3a 设计 ⚠️ SUPERSEDED（保留作分析记录，别再照做）。**
 
