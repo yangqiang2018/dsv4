@@ -407,21 +407,23 @@ def build_sparse_attn_sharedkv(
                 # too. The ping-pong halves are rows [0,GATHER_ROWS) and
                 # [GATHER_ROWS, 2*GATHER_ROWS).
                 kv_ub_multi = T.alloc_ub([2 * GATHER_ROWS, D], dtype)
-                # V1 softmax max-subtract broadcast scratch (perf lever 2).
-                # m_i [v_block] -> m_i_brd [v_block, BI] so the per-head subtract
-                # loop (v_block tiny scalar-fed VEC ops) collapses to one broadcast
-                # + one full-tile sub (the reference attention idiom). Used ONLY
-                # when cube_direct (swa/cfa); SCFA keeps the per-head loop (it needs
-                # kv_ub_multi for the gather, and the broadcast resonates in its
-                # lockstep -- tilelang-perf skill "broadcast row sub").
-                # Allocated unconditionally (tvmscript block-scopes a buffer
-                # declared inside `if cube_direct:`, so it would be invisible at the
-                # annotate/broadcast scopes). The ALIAS, not the alloc, is what hurt
-                # SCFA: annotating m_i_brd onto kv_ub_multi made the compiler add
-                # conservative syncs around SCFA's gather (+4ms). So only cube_direct
-                # annotates it onto the idle kv_ub_multi (below); for SCFA m_i_brd
-                # stays unannotated (auto-placed, NOT aliased to the gather buffer).
-                m_i_brd = T.alloc_ub([v_block, BI], accum_dtype)
+                # V1 softmax fused-op scratch (perf lever, replicate Ascend C
+                # SoftmaxFlashV2): the cube_direct V1 softmax fuses the manual
+                # max-subtract / exp / row-sum / running-state rescale chain into one
+                # T.tile.softmax_flashv2. softmax_tmp is its uint8 working buffer
+                # (SoftMaxFlashV2TilingFunc tiles within tmp.GetSize()); alpha_exp
+                # receives the per-row rescale alpha = exp(prev_max - new_max), stashed
+                # to the flat alpha[] for V2. Both cube_direct ONLY (SCFA keeps the
+                # manual per-head chain). Allocated unconditionally (tvmscript
+                # block-scopes a buffer declared inside `if cube_direct:`, so it would
+                # be invisible at the annotate/use scopes); only cube_direct ANNOTATES
+                # them (below) onto the idle kv_ub_multi -- softmax_tmp reuses the 16KB
+                # the removed m_i_brd broadcast scratch held (the fused op does the
+                # max-subtract internally, so no broadcast buffer is needed). The ALIAS
+                # (not the alloc) is what perturbs SCFA (conservative syncs around its
+                # gather, +4ms), so SCFA leaves both auto-placed, never aliased.
+                softmax_tmp = T.alloc_ub([16 * KB], "uint8")
+                alpha_exp = T.alloc_ub([ub_len], accum_dtype)
                 # V2 rescale scratch (perf lever, replicate Ascend C RowMuls):
                 # brcb writes the pass's MERGE_HEADS alpha scalars here as
                 # [MERGE_HEADS, 8] (one 32B block per head), then row_muls reads
@@ -481,26 +483,23 @@ def build_sparse_attn_sharedkv(
                         acc_o_half: ub_addr["acc_o_half"],
                     }
                 )
-                # m_i_brd (perf lever 2 broadcast scratch) aliases the
-                # cube_direct-idle kv_ub_multi. A SEPARATE call keyed only here
-                # keeps the buffer out of SCFA's IR entirely (SCFA must not see
-                # the alias -- it adds conservative syncs around its gather,
-                # measured +4ms). annotate_address accumulates: each call sets
-                # addresses for its listed buffers, leaving the rest as placed
-                # by the call above. A conditional dict-unpack inside the main
-                # literal is rejected by the tvmscript parser, so this is a
-                # plain second call under the compile-time cube_direct guard.
+                # softmax_tmp / alpha_brd8 / alpha_exp (cube_direct V1-softmax +
+                # V2-rescale scratch) alias the cube_direct-idle kv_ub_multi. A
+                # SEPARATE call keyed only here keeps them out of SCFA's IR entirely
+                # (SCFA must not see the alias -- it adds conservative syncs around its
+                # gather, measured +4ms). annotate_address accumulates: each call sets
+                # addresses for its listed buffers, leaving the rest as placed by the
+                # call above. A conditional dict-unpack inside the main literal is
+                # rejected by the tvmscript parser, so this is a plain second call under
+                # the compile-time cube_direct guard. Layout in the 32KB idle
+                # kv_ub_multi: softmax_tmp [0, 16KB), alpha_brd8 [16KB, 16KB+512B),
+                # alpha_exp [16KB+512B, +128B) -- all disjoint.
                 if cube_direct:
                     T.annotate_address(
                         {
-                            m_i_brd: ub_addr["kv_ub_multi"],
-                            # alpha_brd8 (V2 rescale brcb scratch, 512B) -> upper
-                            # half of the idle kv_ub_multi, disjoint from m_i_brd's
-                            # lower 16KB. Without this it is auto-placed and collides
-                            # with a live buffer (the brcb write corrupts it ->
-                            # prefill red even though the NI_total=1 rescale is a
-                            # 0*alpha no-op). cube_direct-only so SCFA never sees it.
+                            softmax_tmp: ub_addr["kv_ub_multi"],
                             alpha_brd8: ub_addr["kv_ub_multi"] + 16 * KB,
+                            alpha_exp: ub_addr["kv_ub_multi"] + 16 * KB + 512,
                         }
                     )
 
@@ -1291,64 +1290,93 @@ def build_sparse_attn_sharedkv(
                                                 softmax_scale,
                                             )
 
-                                            T.reduce_max(acc_s_ub, m_i, dim=-1)
-                                            # m_i = max(m_i_prev, m_i): the dst must
-                                            # be the LAST operand. T.tile.max in the
-                                            # form T.tile.max(m_i, m_i, m_i_prev)
-                                            # silently drops m_i_prev, leaving m_i at
-                                            # the chunk-local max -- the running max
-                                            # carried in m_i_prev was lost, which is
-                                            # the chunk-2 ori->cmp divergence. This
-                                            # dst-last form matches the verified
-                                            # example_online_softmax.py.
-                                            T.tile.max(m_i, m_i_prev, m_i)
-                                            T.tile.sub(m_i_prev, m_i_prev, m_i)
-                                            T.tile.exp(m_i_prev, m_i_prev)
-                                            # Stash the rescale factor alpha = exp(m_prev
-                                            # - m_new) into this chunk's parity HALF of the
-                                            # flat alpha buffer so V2 of the same chunk
-                                            # (which runs 2 pipeline steps later) applies
-                                            # it; m_i_prev itself is overwritten by the
-                                            # next chunk's V1. Var-offset 1D slice (same
-                                            # form as the gather's ws_kv vid-slice write).
-                                            T.copy(
-                                                m_i_prev,
-                                                alpha[
-                                                    pv1 * ub_len : pv1 * ub_len + ub_len
-                                                ],
-                                            )
-
-                                            # Softmax max-subtract. cube_direct
-                                            # (swa/cfa): one broadcast m_i[v_block]->
-                                            # [v_block,BI] + one full-tile sub (the
-                                            # reference idiom), replacing v_block
-                                            # scalar-fed VEC ops -> cuts the per-head
-                                            # scalar loads (27% aiv_scalar, swa
-                                            # profile). SCFA keeps the per-head loop
-                                            # (kv_ub_multi busy; broadcast resonates
-                                            # in lockstep).
                                             if cube_direct:
-                                                T.tile.broadcast(m_i_brd, m_i)
-                                                T.tile.sub(acc_s_ub, acc_s_ub, m_i_brd)
+                                                # Fused online softmax (replicate Ascend
+                                                # C SoftmaxFlashV2Compute, swa_block_
+                                                # vector.h:349-355): ONE op does the
+                                                # max-subtract + exp + row-sum + running-
+                                                # state rescale that the manual chain
+                                                # (SCFA else) spreads over ~8 VEC passes
+                                                # -- the §3.5 (3) vector-idiom lever.
+                                                # SoftmaxFlashV2 double-buffers the
+                                                # running max/sum (in != out): seed prev
+                                                # max into m_i_prev (the copy above) and
+                                                # prev sum into sumexp_i_ub here. Outputs:
+                                                # new max -> m_i, new sum -> sumexp, P ->
+                                                # acc_s_ub (in place), per-row alpha =
+                                                # exp(prev - new) -> alpha_exp (stashed to
+                                                # the flat alpha[] for V2, like the manual
+                                                # m_i_prev stash). The sink seed (m_i <-
+                                                # Sinks, sumexp <- 1.0) flows in as the
+                                                # chunk-0 prev state, so the sink lands in
+                                                # the denominator correctly. scores were
+                                                # pre-scaled above (Ascend C runs Muls /
+                                                # ElewiseCompute before SoftmaxFlashV2).
+                                                T.copy(sumexp, sumexp_i_ub)
+                                                T.tile.softmax_flashv2(
+                                                    acc_s_ub,
+                                                    sumexp,
+                                                    m_i,
+                                                    alpha_exp,
+                                                    sumexp_i_ub,
+                                                    m_i_prev,
+                                                    softmax_tmp,
+                                                    v_block,
+                                                    BI,
+                                                    BI,
+                                                )
+                                                T.copy(
+                                                    alpha_exp,
+                                                    alpha[
+                                                        pv1 * ub_len : pv1 * ub_len
+                                                        + ub_len
+                                                    ],
+                                                )
                                             else:
+                                                T.reduce_max(acc_s_ub, m_i, dim=-1)
+                                                # m_i = max(m_i_prev, m_i): dst must be
+                                                # the LAST operand. T.tile.max(m_i, m_i,
+                                                # m_i_prev) silently drops m_i_prev,
+                                                # leaving m_i at the chunk-local max --
+                                                # the running max in m_i_prev is lost
+                                                # (chunk-2 ori->cmp divergence). dst-last
+                                                # matches the verified online-softmax ref.
+                                                T.tile.max(m_i, m_i_prev, m_i)
+                                                T.tile.sub(m_i_prev, m_i_prev, m_i)
+                                                T.tile.exp(m_i_prev, m_i_prev)
+                                                # Stash alpha = exp(m_prev - m_new) into
+                                                # this chunk's parity half of the flat
+                                                # alpha buffer so V2 (2 steps later)
+                                                # applies it; m_i_prev is overwritten by
+                                                # the next chunk's V1.
+                                                T.copy(
+                                                    m_i_prev,
+                                                    alpha[
+                                                        pv1 * ub_len : pv1 * ub_len
+                                                        + ub_len
+                                                    ],
+                                                )
+                                                # SCFA max-subtract: per-head scalar-fed
+                                                # sub (lockstep -- a broadcast/fused op
+                                                # resonates here, so SCFA keeps the loop).
                                                 for h_i in range(v_block):
                                                     T.tile.sub(
                                                         acc_s_ub[h_i, :],
                                                         acc_s_ub[h_i, :],
                                                         m_i[h_i],
                                                     )
-                                            T.tile.exp(acc_s_ub, acc_s_ub)
-                                            T.reduce_sum(
-                                                acc_s_ub,
-                                                sumexp_i_ub,
-                                                dim=-1,
-                                            )
-                                            T.tile.mul(sumexp, sumexp, m_i_prev)
-                                            T.tile.add(
-                                                sumexp,
-                                                sumexp,
-                                                sumexp_i_ub,
-                                            )
+                                                T.tile.exp(acc_s_ub, acc_s_ub)
+                                                T.reduce_sum(
+                                                    acc_s_ub,
+                                                    sumexp_i_ub,
+                                                    dim=-1,
+                                                )
+                                                T.tile.mul(sumexp, sumexp, m_i_prev)
+                                                T.tile.add(
+                                                    sumexp,
+                                                    sumexp,
+                                                    sumexp_i_ub,
+                                                )
                                             # The acc_o rescale lives in V2 now (alpha was
                                             # stashed above); V1 never touches acc_o, so
                                             # V1(t-1) and V2(t-2) run in one pipeline step
