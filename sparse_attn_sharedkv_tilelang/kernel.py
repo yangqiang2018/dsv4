@@ -1493,10 +1493,13 @@ def build_sparse_attn_sharedkv(
                                                 # in-order with the following Mul the way
                                                 # the scalar muls were, so the debarriered
                                                 # form read a stale alpha_brd8 -> wrong
-                                                # rescale (worse than no rescale). barrier_
-                                                # all is heavier than PIPE_V but is the
-                                                # only VEC-drain primitive exposed.
-                                                T.barrier_all()
+                                                # rescale (worse than no rescale). Use the
+                                                # VEC-only pipe_barrier (== AscendC
+                                                # PipeBarrier<PIPE_V>), NOT barrier_all
+                                                # (full PIPE_ALL drain). Same-pipe (both
+                                                # VEC), so a pipe barrier -- not a cross-
+                                                # pipe set/wait_flag.
+                                                T.pipe_barrier("v")
                                                 T.tile.row_muls(
                                                     acc_o[
                                                         hbase : hbase + MERGE_HEADS, :
@@ -1509,7 +1512,7 @@ def build_sparse_attn_sharedkv(
                                                     D,
                                                     D,
                                                 )
-                                                T.barrier_all()
+                                                T.pipe_barrier("v")
                                                 for h_i in range(MERGE_HEADS):
                                                     T.tile.add(
                                                         acc_o[hbase + h_i, :],
