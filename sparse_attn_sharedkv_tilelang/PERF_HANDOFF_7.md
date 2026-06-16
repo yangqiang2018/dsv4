@@ -8,9 +8,25 @@
 - **目标（用户北极星）**：复刻 Ascend C 这个算子的计算逻辑 + 性能方案，让 swa 前向做到 AscendC 的 **80–100%**。Ascend C 源码是蓝本，别发明 kernel 侧小技巧；过不去改 fork 编译器（`yangqiang2018/tilelang-ascend`，NPU 验过的成功改动打 `cfeat-*` annotated tag，攒着提上游 issue）。
 - **诚实天花板**：vector 侧便宜刀**已用尽**（brcb/row_muls rescale、SoftmaxFlashV2 fused softmax 都 NPU 验过 = perf 中性，见 _6 §3.6/3.7）。**~50% 是 kernel 侧天花板**。破它只剩 **C（跨-slot 软件流水）**。**注意：即使 C 全成也就 ~55，够不着北极星 80**——80 还得叠 cube 侧（_6 §3.5② L1-ring 预取，又一大改）。**用户已知情拍板「硬上 C」**（知道 ~16-25 容器轮、最好 ~55、砸了全回退）。
 - **perf 现状**：swa **35.6** / cfa **42.3** / scfa 15.0（S1+S2 后）。**比 C 前 baseline swa 42.4 / cfa 49.9 降了 ~7**——这是 S1 把 acc_o 挪 GM 的纯 DMA 成本，**所有恢复+增益押在 S3**。
-- **进度**：S1 ✅、S2 ✅ 都容器验绿。**S3a 是下一步实现**（第一个真 overlap + 硬 gate）。
+- **进度**：S1 ✅、S2 ✅ 都容器验绿。**S3a 证伪 → 改做 Q4（见 §0.5），已实现+push（`78d78fe`），待容器验。**
 
-## 1. 立刻干：S3a（vector deferred-tail skew，硬 gate）
+## 0.5 UPDATE 2026-06-16：S3a 前提证伪 → 改做 Q4（debarrier+双缓冲），已 push 待验
+
+**两条独立 dataflow 分析（本人 + Plan agent，读全代码）一致证伪 S3a 对 SWA 的前提**：
+1. **已验硬事实**：`T.barrier_all()` → `pipe_barrier(PIPE_ALL)` = **核内全 pipe 屏障**（非跨核，查 fork `codegen_ascend_pto.cc`）。SWA cube_direct **cube 自己拉 KV**（`kernel.py:~627`），`wait_cross_flag(KV_READY)` 在 `:~874` 的 dead else —— cube 启 MM1 不等 vector。
+2. **瓶颈是 vector，cube 空转**：S1 给 vector 加了 ~10 个 GM round-trip（seed 存 / V2 load+store / tail load），每个被 `barrier_all` 墙隔开 → **DMA 与 VEC 强制串行**。**周期 ≈ vector 忙时；−7 = vector 侧被串行化的 GM 延迟**。
+3. **S3a（跨-slot tail 重排）动不了 vector 忙时**：重排不减 vector 总忙时；它想要的「cube MM1(slot) ‖ vector tail(slot−1)」**本来就免费存在**（cube 在 tail 期间本就空转）；且把 tail 排在 V1(slot+1) 前 → P_READY 产得更晚，cube 跑不了更前。预测 ~34-36，**过不了自己硬 gate**。
+
+**Q4 = 真因杠杆（已实现，commit `78d78fe`，cube_direct only，SCFA byte-identical）**：把 S1 那些 `barrier_all` 墙换成精确 pipe flag + **双缓冲 `acc_o_work`**（新增 `acc_o_work2`，两块 32KB 填满腾出的 64KB acc_o 槽），让 pass mp+1 的 GM load(MTE2) 叠 pass mp 的 rescale/div(VEC)+store(MTE3)。复刻 Ascend C 的 overlapped `vec2ResGm`（GM 驻留不是 −7，串行化才是）。
+- **V2 merge**：per-pass barrier_all → `mte2→v`(loads RAW) / `v→mte3`(store RAW) / `v→mte2 eid2`(acc_o_ub 单缓冲 WAR，set@mp0/wait@mp1 平衡)。
+- **tail**：tail-entry barrier_all（V2→tail GM RAW + buf WAR）+ per-pass flag（`mte2→v` RAW、`pipe_barrier v` div→cast、`v→mte3` casts→Output）。
+- **Q4 eid {mte2→v 2,3; v→mte3 1,2; v→mte2 2} 与 score 机器 {v→mte2 0,1; mte2→v 0,1; v→mte3 0} 不交**。flag 平衡 + WAR/RAW 覆盖**已独立审计**（SWA+CFA 脚本验平衡、SCFA 字节同一、双缓冲地址不重叠）。
+- **预期**：swa 35.6→~40-42 / cfa 42.3→~49（回收 −7）。**这是 S3b（flat gloop）的必要地基**（证明 GM accumulator 能跑到 baseline）。诚实：即使全成也就回 baseline；破 baseline→~55 仍需 S3b，~55→80 vector 便宜刀已尽够不着。
+- **容器三验（待跑）**：① fast（抓 leak）② **`-k "decode and dtype0"`（抓 debarrier WAR race，本刀头号风险）** ③ perf_compare。**砸了怎么判**：decode 红=漏 RAW/WAR flag（查 acc_o_ub WAR / 双缓冲）；prefill hang=flag leak（审计说平衡，复查）；绿但 perf 没动=overlap 没兑现（2-pass 流水太短 / load 不是瓶颈），回退或转 S3b。
+
+**§1 的 S3a 设计 ⚠️ SUPERSEDED（保留作分析记录，别再照做）。**
+
+## 1. ~~立刻干：S3a（vector deferred-tail skew，硬 gate）~~ ⚠️ SUPERSEDED（见 §0.5，前提证伪 → 改做 Q4）
 
 **目标**：overlap **slot k 的 normalize+writeback**（vector 尾，正是 S1 加重的那段 cube 空泡）和 **slot k+1 的 cube MM1**。**只盯 SWA（NI_total=1）**；CFA 的 chunk-skew × slot-skew 交互更复杂，留 S3b。
 
