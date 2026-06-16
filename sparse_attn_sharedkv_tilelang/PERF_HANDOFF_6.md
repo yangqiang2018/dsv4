@@ -8,7 +8,7 @@
 ## 0. 一句话现状
 
 - **目标**（用户定，北极星）：**完全复刻 Ascend C 这个算子的计算逻辑 + 性能优化方案**，让 TileLang 前向 perf 做到 AscendC 的 **80–100%**。**Ascend C 源码是蓝本** —— perf 缺口靠「它怎么优化就怎么复刻」，**别自己发明 kernel 侧小技巧**（本 session 发明的 V2-merge wide-add / broadcast-mul 两刀都撞编译器/硬件墙回退了；§3-B KV 复用 / §3-C 内存布局才是复刻 Ascend C 的省内存 + 流水方案）。**过不去就改编译器**（fork `yangqiang2018/tilelang-ascend` 是我们的；修 bug / 加特性，每个 NPU 验过的成功改动打 `cfeat-*` annotated tag，**攒着一起给官方 `tile-ai/tilelang-ascend` 提 issue / 需求** —— 见 §4）。
-- **perf**（`perf_compare`，sharedkv 列，perf%=AscendC/TileLang，越高越接近；忽略 metadata 算子）：**swa 41.4% / cfa 48.7% / scfa 16.3%**（最后完整验证 = dsv4 `e6f2b65`；现 HEAD `9b073f5` kernel 逻辑与之逐字节一致 —— V2 merge 向量化两刀 `fa63798`(wide-add) + `b30b447`(broadcast-mul) 都回退了，见 §3-A/§6/§7）。
+- **perf**（`perf_compare`，sharedkv 列，perf%=AscendC/TileLang，越高越接近；忽略 metadata 算子）：**swa 42.7% / cfa 49.1% / scfa ~15-16%**（HEAD `27d274c`，**brcb/row_muls V2 rescale 向量化已 green + ship**，见 §3.6；scfa 14.9 vs 旧 16.3 大概率噪声、新 session 复测）。旧 baseline swa 41.4 / cfa 48.7（`e6f2b65`）；V2-merge 向量化前两刀 `fa63798`(wide-add)/`b30b447`(broadcast-mul) 回退，第三刀 brcb/row_muls 成了。
 - 自 SUCC9（swa 37.0 / cfa 42.8 / scfa 15.9）以来，靠 cube debarrier + V1/V2/normalize 向量化/debarrier 把 **swa +4.4、cfa +5.9** 推上来；scfa（lockstep + 离散 gather）基本平。
 
 ## 1. 最后一刀已验：V2 full-tile add 回归 decode → 已回退（dsv4 `b68dffa`）
@@ -64,22 +64,30 @@
 
 **修正后破 80% 路线（取代上面 §3-A/B/C 旧框架）**：(a) chunk 流水**延伸到跨 slot**（去 per-slot flush，slot loop 喂同一 skewed pipeline）→ 填 ~25% bubble（约到 ~55%）；(b) **vector work 复刻 Ascend C 轻量 idiom**（Brcb rescale、融合 softmax、全-mask 快路径、unitFlag drain）→ 降 pipe-sum 才上 80%。**两者都要；本 session 那种发明式单-op 微优化不是路。** 便宜先做 = Brcb rescale（顺带正解 lever-3A、降 vector scalar），大头 = 跨-slot 流水。
 
-## 3.6 下一步 build：Brcb rescale（用户选定 2026-06-15；跨-slot 大手术暂缓）
+## 3.6 ✅ Brcb rescale 已 ship（green，swa 41.4→42.7 / cfa 48.7→49.1，HEAD `27d274c`）
 
-复刻 Ascend C 的 rescale（§3.5 第 2 条），正解 lever-3A 的 Broadcast 宽-dst 墙、降 V2 vector scalar。**用户在「跨-slot 大手术 vs Brcb」里选了 Brcb（受控、可验、攒 tag）**；跨-slot 流水（前提 `acc_o`→GM，all-or-nothing 多轮高风险、本地不能验）记为大项目待启。
+复刻 Ascend C 的 V2 rescale（§3.5 第 2 条）成了：16 个逐-head 标量 mul → 1 `brcb` + 1 `row_muls`/pass（§3.5 ③「轻量 vector idiom」第一刀）。fork tag `cfeat-brcb-row-muls`(`d7add81`)。
 
-**关键事实（已查）**：
-- fork `brcb` 的 **C++ runtime 已存在**（`src/tl_templates/ascend/common.h:789` → `AscendC::Brcb`）；只是 Python wrapper（`ascend_tile.py:716`）挂着**过时的「NOT implemented」假警告**。un-stub 即可。
-- `Broadcast`（`common.h:834`）是**纯转发 `AscendC::Broadcast`**，宽-dst bug 在**厂商库里、我们改不了** → 必须走 brcb+RowMuls 绕开（Ascend C 就是这么做的，全程不碰 Broadcast）。
-- Ascend C `RowMuls` = `swa_block_vector.h:769-848`：逐行 `AscendC::Mul`，`BinaryRepeatParams` 的 `src1BlkStride=0/src1RepStride=0`（把 brcb 出的 8-lane block 沿列广播）+ 列分 `dLoop=actualCol/64` 个 repeat **+ `dRemain` 尾段**。我们 col=512 → `dLoop=8, dRemain=0`（512 是 64 整数倍，**根本不需要尾段**；Broadcast 之所以崩是它内部 mis-tile，RowMuls 老实发 8 个 repeat 就填满了）。
+**最终 kernel 形态**（cube_direct V2 merge）：`brcb(alpha_brd8[16,8], alpha[abase:abase+16], 2,1,8)` → `pipe_barrier("v")` → `row_muls(acc_o[hbase:hbase+16,:], 同, alpha_brd8, 16,512,512)` → `pipe_barrier("v")` → 逐-head add → `barrier_all()`。`alpha_brd8`(512B) annotate 到 `kv_ub_multi+16KB`（cube_direct only）。
 
-**实现清单（改 .h → `USE_ASCEND=True pip install -e . --no-build-isolation` 重装 .so）**：
-1. **un-stub** `ascend_tile.py` `brcb`（去假警告；C++ 已在）。
-2. **加 `row_muls` runtime 模板**到 `common.h`，照搬 `RowMuls`（fp32：`repeatElementNum=64, blockElementNum=8`；`columnCount<256*8` 分支；`dLoop<=dealRowCount` 走列-repeat；带 `dRemain` 尾段以防非-512 配置）。
-3. 加 `row_muls` Python wrapper（`call_extern "tl::ascend::row_muls<T>"`，传 dst/src0/src1 ptr + dealRowCount/columnCount/actualColumnCount）。
-4. **kernel**（V2 merge cube_direct）：逐-head rescale mul → `brcb(alpha_brd8[MERGE_HEADS,8], alpha[abase:abase+MERGE_HEADS], rep=MERGE_HEADS, blk=1, rep_stride=8)` + `row_muls(acc_o[hbase:hbase+MERGE_HEADS,:], 同, alpha_brd8, MERGE_HEADS, D, D)`；**add 保持逐-head**（acc_o_ub 的跨-pass WAR，§7）。`alpha_brd8`(=MERGE_HEADS*8*4=512B) 别名 idle `kv_ub_multi`。
-5. **验**：重装 .so → `get_kernel_source` dump 核 row_muls 发了 8 个 repeat 填满 512 → fast + decode + perf。
-6. 绿后打 tag：`cfeat-brcb-enable`、`cfeat-row-muls`（攒着提 issue）。
+**编译器侧（fork，已 tag）**：① `common.h` 加 `tl::ascend::row_muls<T>`（镜像 Ascend C RowMuls）。② 注册 `tl.ascend_brcb`/`tl.ascend_row_muls` builtin（`ascend.h` 声明 + `ascend.cc` `TIR_DEFINE_TL_BUILTIN` kOpaque + `codegen_ascend.cc` `PrintOpCall`，模板名走 args[0]）。③ brcb/row_muls 吃 BufferLoad 切片。
+
+**踩坑链（5 个坑，全进 §7）**：Broadcast 宽-dst = 厂商 bug → 换 brcb/row_muls → BufferLoad handling → **`call_extern` 被 codegen 丢弃**（必须注册 builtin，这就是 brcb「NOT implemented」的真意）→ 缺 `PIPE_V` 同步（brcb→row_muls RAW）→ **adds→下一 pass `T.copy(ws_o,acc_o_ub)` 的 VEC→MTE2 WAR**（row_muls 时序新暴露的 fa63798 同款，要 full barrier 或 V→MTE2 flag，`pipe_barrier("v")` 守不住）。诊断法：3× barrier_all 绿 → 是同步不是 row_muls bug → 再收回轻屏障。
+
+---
+
+## 3.7 新 session 接着干什么（按优先级）
+
+**A. 收尾/小修（快）**：
+1. **复测 scfa**（14.9 vs 旧 16.3）：scfa 走 per-head barriered（非 cube_direct），brcb/row_muls 不碰它，应是噪声 —— 重跑 `perf_compare` 确认；若真降，查 `alpha_brd8` 无条件 alloc（512B）有没有扰动 scfa 布局。
+2. **3rd 同步轻量化**：V2 merge 那个 `barrier_all()`（adds→copy 的 acc_o_ub WAR）换成 `T.set_flag("v","mte2",eid)`/`T.wait_flag`（精确跨-pipe flag，eid 别撞现有；只守 acc_o_ub、不全核 drain）→ 抠一点 perf，绿了验。
+3. **补 tag**：`d789b93`（binary/unary BufferLoad）现在有 green user 了（brcb/row_muls 用 `_handle_buffer_load`）→ 可打 `cfeat-tile-op-bufferload`。`1a70fed`（broadcast BufferLoad）仍无 green user（lever-3A 回退）、先不打。
+
+**B. 继续复刻 §3.5 ③ 轻量 vector idiom（中，降 pipe-sum）**：Ascend C 的 `SoftmaxFlashV2` 融合 max-sub/exp/sum；`actualColumnCount==0` 全-mask chunk 快路径（`swa_block_vector.h:356/584`）；cube unitFlag 融合 fixpipe drain（`swa_block_cube.h:577`）。逐条复刻、NPU 验、攒 tag。
+
+**C. 大头 = §3.5 ① 跨-slot 软件流水（项目，破 80% 唯一路）**：前提 `acc_o`（64KB UB，单缓冲）→ GM workspace（slot-parity 双缓冲，像 Ascend C `vec2ResGm`），腾 64KB UB + 解锁 slot k 尾叠 slot k+1 头（SWA `NI_total=1`，跨-slot 才有并行）。slot loop = `kernel.py:530`，blocker = acc_o-in-UB（本 session 用 agent map 过，blocker/carry-state 清单见对话）。all-or-nothing 多轮高风险、本地不能验，得用户拍板投入。
+
+**北极星不变**（§0）：复刻 Ascend C 方案到 80–100%，别发明 kernel 侧小技巧；过不去改 fork 编译器、打 `cfeat` tag。
 
 **预期**：16 标量 mul/pass → 1 brcb + 1 row_muls/pass，降 V2 vector scalar（§3.5 ③「轻量 vector idiom」第一刀）；perf 增益中等，但正解 lever-3A + 攒 2 个编译器特性。
 
@@ -131,4 +139,7 @@
 - **把 debarrier 的逐行 VEC op 合并成一条宽 op，会暴露被窄 op 时序掩盖的跨-pass WAR**（fa63798 血泪）：16 条 `acc_o[h]+=acc_o_ub[h]` 合成一条 `acc_o[hbase:hbase+16]+=acc_o_ub`，intrinsic 完全等价（已核 `binary_op`），但宽读 `acc_o_ub` 排空慢，与下一 pass 的 `T.copy(...,acc_o_ub)`(MTE2) 抢 → **decode 回归 97-98%**（prefill 跑得少没踩到）。合宽 op 时补 drain/flag，或别跨 pass 复用同一 buffer。已回退 `b68dffa`。**判读**：失败比例 1-3%、两个 dtype 都崩、max rel err 2.0 整齐 → 结构性 bug 不是尾噪声；fast 套件绿不代表覆盖（V2 merge 要 `t>=2` 多 chunk 才跑，decode 才压满）。
 - **AscendC `Broadcast` 不填满宽 dst（512）—— 每行尾部留旧值**（lever 3-A 血泪）：broadcast `[N]`→`[N,512]`(axis=1) 只填了 ~前 448 列，最后 ~64-block 留上一次的值 → rescale 乘了错的 alpha → prefill swa/cfa ~87%（`4257616/65536 行 ≈ 65/512 列错 = 12.7%`，max rel 2.0）。**128 宽（V1 softmax `m_i_brd[32,128]`）填得满、没事**；512 宽崩。lowering 正确（`get_kernel_source` dump 实锤 axis/extent/ptr 全对、buffer 地址不重叠）—— 是 AscendC Broadcast op 本身的宽-dst 上限。要做宽广播得先查它（或切 ≤128 列块）。已回退 `9b073f5`。
 - **`get_kernel_source()` dump 大法 + 失败算术 这次立功**（[[reference-get-kernel-source]]）：先 dump 排除 lowering（broadcast 的 axis/extent/ptr、buffer 地址全对）→ 锁定不是 codegen；再用「失败元素数 / 行数 = 每行错几列」（65/512）直接指向「按列尾部没填」。**本地无 NPU 时，dump + 失败形态比盲改快得多**——写完改动先 dump 验同步/extent/地址，别盲烧 NPU。
+- **TileLang tile op 不发射？→ 它是不是走 `call_extern`**（brcb/row_muls 血泪）：`T.call_extern` 在这套 Ascend codegen 会被**丢弃**（dump `grep -c fn_name`=0、生成码里没有就是它）；能用的 tile op 全是**注册的 `tl.ascend_*` builtin** —— 加一个要 4 处：`ascend.h` 声明 `const Op& ascend_X()` + `ascend.cc` `TIR_DEFINE_TL_BUILTIN(ascend_X).set_attr<TCallEffectKind>(kOpaque)` + `codegen_ascend.cc` else-if 调 `PrintOpCall`（模板名 `f"X<{dtype}>"` 当 args[0] 传、codegen 前缀 `tl::ascend::`）+ Python 用 `tir.call_intrin(Op.get("tl.ascend_X"), ...)`。**brcb 的「NOT implemented」假警告就是这意思**（C++ 模板在、TIR 没接）。
+- **同步原语分层（别动不动 `barrier_all`）**：`T.pipe_barrier("v")` = AscendC `PipeBarrier<PIPE_V>`（同-pipe VEC drain，轻）；`T.set_flag(src,dst,eid)`/`T.wait_flag` = 跨-pipe flag（VEC↔MTE2 等，轻）；`T.barrier_all()` = 全 pipe + 跨核（重）。**VEC→VEC RAW**（brcb→row_muls）用 `pipe_barrier("v")`；**VEC→MTE2 WAR**（row_muls/adds 写完 → 下一 pass `T.copy` 抢 acc_o_ub）`pipe_barrier("v")` **守不住**，要 `barrier_all` 或 `set_flag("v","mte2")/wait_flag`。Ascend C 的分层（`PipeBarrier<PIPE_V>` ×3 + `SetFlag<V_MTE2>`，`swa_block_vector.h:689-696`）是模板。
+- **诊断「同步 vs 真 bug」**：可疑同步问题 → 临时把相关同步全换 `barrier_all` 看绿不绿。绿 = 同步覆盖不足（再逐个收回轻屏障）；还红 = 真算法/codegen bug（回退）。
 - 每刀通用手段记进 tilelang-perf/pitfalls skill（源仓库 + 缓存两处，MEMORY 有约定）。
