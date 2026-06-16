@@ -1871,6 +1871,710 @@ def build_sparse_attn_sharedkv(
                                     ],
                                 )
 
-        return sparse_attn_sharedkv
+        # ============================================================
+        # SWA-specialized cross-slot-pipelined kernel (S3b).
+        # ============================================================
+        # Returned ONLY for SWA (NI_total == 1 -> cube_direct, NI_ori == 1,
+        # NI_cmp == 0). It replaces the per-slot `for slot` loop (each slot
+        # self-contained, cube idle during the vector tail = the S1 -7) with
+        # a flat gloop that skews work across slots: cube does MM1(g) ||
+        # MM2(g-1), vector does V0(g) || V1(g-1) || V2+tail(g-2). The slot
+        # g-2's GM round-trip (merge + normalize + writeback + LSE) is now
+        # buried under slot g-1/g's VEC -- the cross-slot interleave Q4's
+        # intra-slot debarrier could not reach. Mirrors the Ascend C
+        # PreloadPipeline (a flat gloop with `if AIC{..} if AIV{..}` and
+        # isValid gating; the +2 trailing steps = extraLoop drain).
+        #
+        # The existing `sparse_attn_sharedkv` is left byte-identical (it
+        # serves CFA/SCFA). This one is SWA-only, so every chunk is the
+        # single ori window (c0 == 0, t == 0): the `for t` loop collapses,
+        # cube_direct is always True, and the cmp / SCFA branches are dead.
+        @T.prim_func
+        def sparse_attn_sharedkv_swa(
+            Q: T.Tensor(q_shape, dtype),  # type: ignore[valid-type]
+            ori_KV: T.Tensor(ori_kv_shape, dtype),  # type: ignore[valid-type]
+            ori_block_table: T.Tensor(ori_bt_shape, indices_dtype),  # type: ignore[valid-type]
+            cmp_KV: T.Tensor(cmp_kv_shape, dtype),  # type: ignore[valid-type]
+            cmp_block_table: T.Tensor(cmp_bt_shape, indices_dtype),  # type: ignore[valid-type]
+            cmp_indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore[valid-type]
+            q_prefix: T.Tensor([batch], indices_dtype),  # type: ignore[valid-type]
+            actual_q_len: T.Tensor([batch], indices_dtype),  # type: ignore[valid-type]
+            actual_kv_len: T.Tensor([batch], indices_dtype),  # type: ignore[valid-type]
+            Sinks: T.Tensor([n_heads], accum_dtype),  # type: ignore[valid-type]
+            Metadata: T.Tensor([_SAS_META_SIZE], indices_dtype),  # type: ignore[valid-type]
+            Output: T.Tensor(out_shape, dtype),  # type: ignore[valid-type]
+            LSE_out: T.Tensor([total_tokens, n_heads], accum_dtype),  # type: ignore[valid-type]
+            ws_kv: T.Tensor([core_num, 2, BI, D], dtype),  # type: ignore[valid-type]
+            ws_score: T.Tensor([core_num, 2, H_per_block, BI], accum_dtype),  # type: ignore[valid-type]
+            ws_p: T.Tensor([core_num, 2, H_per_block, BI], dtype),  # type: ignore[valid-type]
+            ws_o: T.Tensor([core_num, 2, H_per_block, D], accum_dtype),  # type: ignore[valid-type]
+            ws_acc_o: T.Tensor([core_num, 2, H_per_block, D], accum_dtype),  # type: ignore[valid-type]
+        ):
+            with T.Kernel(core_num, is_npu=True) as (cid, vid):
+                # ---- L1 / L0 (cube). ----
+                # q_l1 is gloop double-buffered ([2, H, D]): MM1(g) loads slot
+                # g's Q into q_l1[g%2] while MM2(g-1) still reads slot g-1's
+                # gemm operands. L1 repacked so nothing overlaps: q_l1 @0
+                # (128KB), kv_lo @128KB, kv_hi @256KB, p_lo @384KB, p_hi @392KB
+                # -> 400KB <= 512KB.
+                q_l1 = T.alloc_L1([2, H_per_block, D], dtype)
+                kv_lo = T.alloc_L1([2, BI_half, D], dtype)
+                kv_hi = T.alloc_L1([2, BI_half, D], dtype)
+                p_lo = T.alloc_L1([H_per_block, BI_half], dtype)
+                p_hi = T.alloc_L1([H_per_block, BI_half], dtype)
+                acc_s_l0c = T.alloc_L0C([H_per_block, BI_half], accum_dtype)
+                acc_o_l0c = T.alloc_L0C([H_per_block, D], accum_dtype)
+
+                # ---- UB (vector). ---- (SWA subset of the main kernel; see
+                # the byte-identical decls above for the full commentary.)
+                acc_o = T.alloc_ub([v_block, D], accum_dtype)
+                acc_o_work = T.alloc_ub([MERGE_HEADS, D], accum_dtype)
+                acc_o_work2 = T.alloc_ub([MERGE_HEADS, D], accum_dtype)
+                acc_o_ub = T.alloc_ub([MERGE_HEADS, D], accum_dtype)
+                acc_o_half = T.alloc_ub([v_block, D], dtype)
+                m_i = T.alloc_ub([ub_len], accum_dtype)
+                m_i_prev = T.alloc_ub([ub_len], accum_dtype)
+                sumexp = T.alloc_ub([ub_len], accum_dtype)
+                sumexp_i_ub = T.alloc_ub([ub_len], accum_dtype)
+                sinks_ub = T.alloc_ub([ub_len], accum_dtype)
+                lse_ub = T.alloc_ub([ub_len], accum_dtype)
+                alpha = T.alloc_ub([2 * ub_len], accum_dtype)
+                acc_s_ub = T.alloc_ub([v_block, BI], accum_dtype)
+                acc_s_ub_ = T.alloc_ub([2 * v_block, BI], accum_dtype)
+                acc_s_half = T.alloc_ub([v_block, BI], dtype)
+                idx_int = T.alloc_ub([BI], indices_dtype)
+                idx_float = T.alloc_ub([BI], accum_dtype)
+                kv_ub_multi = T.alloc_ub([2 * GATHER_ROWS, D], dtype)
+                softmax_tmp = T.alloc_ub([16 * KB], "uint8")
+                alpha_exp = T.alloc_ub([ub_len], accum_dtype)
+                alpha_brd8 = T.alloc_ub([MERGE_HEADS, 8], accum_dtype)
+                mask_ub = T.alloc_ub([2, mask_w], "uint8")
+                mask_sel = T.alloc_ub([mask_w], "uint8")
+                # S3b carry buffers: V1(g-1) writes slot g-1's new softmax
+                # state (sumexp / m_i) into the (g-1)%2 half while V2+tail(g-2)
+                # still reads slot g-2's OLD state -- single-buffered sumexp /
+                # m_i would be clobbered, so save the per-slot state by parity
+                # ([2]) and restore the single-buffer copy the tail's
+                # ln/add/div consume (a flat [2] region copy is :1499-safe; the
+                # tail's tile-ops then read the single-buffer *_rt, no Var
+                # parity on a tile-op operand). sumexp_sv / m_i_sv (parity
+                # save) are [2, ub_len]; sumexp_rt / m_i_rt (restore target)
+                # are [ub_len].
+                sumexp_sv = T.alloc_ub([2, ub_len], accum_dtype)
+                m_i_sv = T.alloc_ub([2, ub_len], accum_dtype)
+                sumexp_rt = T.alloc_ub([ub_len], accum_dtype)
+                m_i_rt = T.alloc_ub([ub_len], accum_dtype)
+
+                T.annotate_address(
+                    {
+                        # L1 REPACKED for the gloop-double-buffered q_l1
+                        # ([2, H, D] = 128KB, vs the main kernel's single-buffer
+                        # 64KB): q_l1 @0 (128KB), kv_lo @128KB (128KB), kv_hi
+                        # @256KB (128KB), p_lo @384KB (8KB), p_hi @392KB (8KB)
+                        # -> 400KB <= 512KB. The shared l1_addr dict (q_l1 @0,
+                        # kv_lo @64KB) sizes the single-buffer q_l1 and would
+                        # make kv_lo overlap the doubled q_l1, so use literals.
+                        q_l1: 0,
+                        kv_lo: 128 * KB,
+                        kv_hi: 256 * KB,
+                        p_lo: 384 * KB,
+                        p_hi: 392 * KB,
+                        acc_s_l0c: l0c_addr["acc_s_l0c"],
+                        acc_o_l0c: l0c_addr["acc_o_l0c"],
+                        acc_o: ub_addr["acc_o"],
+                        acc_s_ub: ub_addr["acc_s_ub"],
+                        acc_s_ub_: ub_addr["acc_s_ub_"],
+                        acc_s_half: ub_addr["acc_s_half"],
+                        m_i: ub_addr["m_i"],
+                        m_i_prev: ub_addr["m_i_prev"],
+                        sumexp: ub_addr["sumexp"],
+                        sumexp_i_ub: ub_addr["sumexp_i_ub"],
+                        sinks_ub: ub_addr["sinks_ub"],
+                        lse_ub: ub_addr["lse_ub"],
+                        idx_int: ub_addr["idx_int"],
+                        idx_float: ub_addr["idx_float"],
+                        alpha: ub_addr["alpha"],
+                        kv_ub_multi: ub_addr["kv_ub_multi"],
+                        mask_ub: ub_addr["mask_ub"],
+                        mask_sel: ub_addr["mask_sel"],
+                        acc_o_ub: ub_addr["acc_o_ub"],
+                        acc_o_half: ub_addr["acc_o_half"],
+                        # cube_direct V1/V2 scratch alias the idle kv_ub_multi
+                        # (same layout as the main kernel's second annotate).
+                        softmax_tmp: ub_addr["kv_ub_multi"],
+                        alpha_brd8: ub_addr["kv_ub_multi"] + 16 * KB,
+                        alpha_exp: ub_addr["kv_ub_multi"] + 16 * KB + 512,
+                        acc_o_work: ub_addr["acc_o"],
+                        acc_o_work2: ub_addr["acc_o"] + 32 * KB,
+                        # S3b carry buffers packed onto the UB tail after
+                        # mask_sel (mask_sel ends at +2336). sumexp_sv /
+                        # m_i_sv are 2*ub_len*4 = 256B each; sumexp_rt /
+                        # m_i_rt are ub_len*4 = 128B each. New top = 176KB +
+                        # 3104 (~179KB) keeps a ~13KB tail for hidden tmps.
+                        sumexp_sv: ub_addr["mask_sel"] + 32,
+                        m_i_sv: ub_addr["mask_sel"] + 32 + 256,
+                        sumexp_rt: ub_addr["mask_sel"] + 32 + 512,
+                        m_i_rt: ub_addr["mask_sel"] + 32 + 640,
+                    }
+                )
+
+                # ---- Read this AIC core's metadata row. ----
+                meta_base = cid * _FA_METADATA_SIZE
+                core_enable = Metadata[meta_base + _FA_CORE_ENABLE_INDEX]
+                bn2_start = Metadata[meta_base + _FA_BN2_START_INDEX]
+                m_start = Metadata[meta_base + _FA_M_START_INDEX]
+                bn2_end = Metadata[meta_base + _FA_BN2_END_INDEX]
+                m_end = Metadata[meta_base + _FA_M_END_INDEX]
+                linear_start = bn2_start * max_seq + m_start
+                linear_end = bn2_end * max_seq + m_end
+                total_work = batch * max_seq
+
+                # ============ CUBE (flat gloop) ============
+                # Step g: MM1(g) [Q@K^T of slot g] then MM2(g-1) [P@V of slot
+                # g-1]. +2 trailing steps drain MM2/V1/V2 for the last slots.
+                # Every cross-flag's set and its matching wait are guarded by
+                # the SAME valid(slot): SCORE_READY set@MM1(g)/valid0,
+                # wait@V0(g)/valid0; P_READY set@V1(g-1)/valid1,
+                # wait@MM2(g-1)/valid1; PV_READY set@MM2(g-1)/valid1,
+                # wait@V2(g-2)/valid2. Over g in [0, total_work+2) all three
+                # phases iterate the same valid-slot set, so set-count ==
+                # wait-count per flag -> no leak -> no prefill deadlock.
+                with T.Scope("C"):
+                    for g in T.serial(total_work + 2):
+                        # ---- decode(g) (OOB-safe; off = g >= 0 always) ----
+                        pid0 = linear_start + g
+                        in_range0 = T.if_then_else(
+                            core_enable != 0,
+                            T.if_then_else(
+                                pid0 < linear_end, pid0 >= linear_start, False
+                            ),
+                            False,
+                        )
+                        b0_safe = T.if_then_else(in_range0, pid0 // max_seq, 0)
+                        s0 = pid0 % max_seq
+                        act_q0 = actual_q_len[b0_safe]
+                        act_kv0 = actual_kv_len[b0_safe]
+                        valid0 = T.if_then_else(in_range0, s0 < act_q0, False)
+                        t0 = q_prefix[b0_safe] + s0
+                        s_global0 = act_kv0 - act_q0 + s0
+                        ori_left0_raw = s_global0 - ori_win_left
+                        ori_left0 = T.if_then_else(ori_left0_raw < 0, 0, ori_left0_raw)
+                        # ---- decode(g-1) (off = g-1 can be < 0 in prologue;
+                        # in_range1 requires pid1 >= linear_start, which folds
+                        # in off >= 0) ----
+                        pid1 = linear_start + g - 1
+                        in_range1 = T.if_then_else(
+                            core_enable != 0,
+                            T.if_then_else(
+                                pid1 < linear_end, pid1 >= linear_start, False
+                            ),
+                            False,
+                        )
+                        b1_safe = T.if_then_else(in_range1, pid1 // max_seq, 0)
+                        s1 = pid1 % max_seq
+                        act_q1 = actual_q_len[b1_safe]
+                        valid1 = T.if_then_else(in_range1, s1 < act_q1, False)
+
+                        # ---- MM1(g): Q@K^T of slot g ----
+                        if valid0:
+                            T.copy(Q[t0, 0:n_heads, 0:D], q_l1[g % 2])
+                            T.barrier_all()
+                            pa = g % 2
+                            # CUBE-DIRECT KV (AscendC form): SWA's single ori
+                            # window is pulled GM->L1 by the cube itself, 16-row
+                            # blocks, with the paged-block-boundary split (the
+                            # window start ori_left0 is not block-aligned). The
+                            # chunk offset is 0 (SWA NI_ori == 1, the old t was
+                            # always 0), so g0 = ori_left0 + gp*GATHER_ROWS for
+                            # the lo half and + BI_half for the hi half.
+                            for gp in range(BI_half // GATHER_ROWS):
+                                g0 = ori_left0 + gp * GATHER_ROWS
+                                bidx = g0 // ori_block_size
+                                rowc = g0 % ori_block_size
+                                if ori_block_size - rowc >= GATHER_ROWS:
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx],
+                                            rowc : rowc + GATHER_ROWS,
+                                            0,
+                                            :,
+                                        ],
+                                        kv_lo[
+                                            pa,
+                                            gp * GATHER_ROWS : (gp + 1) * GATHER_ROWS,
+                                            :,
+                                        ],
+                                    )
+                                else:
+                                    n0 = ori_block_size - rowc
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx],
+                                            rowc : rowc + n0,
+                                            0,
+                                            :,
+                                        ],
+                                        kv_lo[
+                                            pa,
+                                            gp * GATHER_ROWS : gp * GATHER_ROWS + n0,
+                                            :,
+                                        ],
+                                    )
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx + 1],
+                                            0 : GATHER_ROWS - n0,
+                                            0,
+                                            :,
+                                        ],
+                                        kv_lo[
+                                            pa,
+                                            gp * GATHER_ROWS + n0 : (gp + 1)
+                                            * GATHER_ROWS,
+                                            :,
+                                        ],
+                                    )
+                            for gp in range(BI_half // GATHER_ROWS):
+                                g0 = ori_left0 + BI_half + gp * GATHER_ROWS
+                                bidx = g0 // ori_block_size
+                                rowc = g0 % ori_block_size
+                                if ori_block_size - rowc >= GATHER_ROWS:
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx],
+                                            rowc : rowc + GATHER_ROWS,
+                                            0,
+                                            :,
+                                        ],
+                                        kv_hi[
+                                            pa,
+                                            gp * GATHER_ROWS : (gp + 1) * GATHER_ROWS,
+                                            :,
+                                        ],
+                                    )
+                                else:
+                                    n0 = ori_block_size - rowc
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx],
+                                            rowc : rowc + n0,
+                                            0,
+                                            :,
+                                        ],
+                                        kv_hi[
+                                            pa,
+                                            gp * GATHER_ROWS : gp * GATHER_ROWS + n0,
+                                            :,
+                                        ],
+                                    )
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx + 1],
+                                            0 : GATHER_ROWS - n0,
+                                            0,
+                                            :,
+                                        ],
+                                        kv_hi[
+                                            pa,
+                                            gp * GATHER_ROWS + n0 : (gp + 1)
+                                            * GATHER_ROWS,
+                                            :,
+                                        ],
+                                    )
+                            T.barrier_all()
+                            # MM1 cube debarrier (perf lever 1): targeted pipe
+                            # flags on the serial MAD->FIX->MAD->FIX chain on the
+                            # single acc_s_l0c (see the main kernel for the full
+                            # commentary). Cube pipe flags live on AIC, disjoint
+                            # from the V-scope's AIV flag ids.
+                            T.gemm_v0(
+                                q_l1[g % 2],
+                                kv_lo[pa, :, :],
+                                acc_s_l0c,
+                                transpose_B=True,
+                                init=True,
+                            )
+                            T.set_flag("m", "fix", 0)  # gemm_lo -> copy_lo
+                            T.wait_flag("m", "fix", 0)
+                            T.copy(
+                                acc_s_l0c,
+                                ws_score[cid, pa, 0:H_per_block, 0:BI_half],
+                            )
+                            T.set_flag("fix", "m", 1)  # copy_lo -> gemm_hi WAR
+                            T.wait_flag("fix", "m", 1)
+                            T.gemm_v0(
+                                q_l1[g % 2],
+                                kv_hi[pa, :, :],
+                                acc_s_l0c,
+                                transpose_B=True,
+                                init=True,
+                            )
+                            T.set_flag("m", "fix", 2)  # gemm_hi -> copy_hi
+                            T.wait_flag("m", "fix", 2)
+                            T.copy(
+                                acc_s_l0c,
+                                ws_score[cid, pa, 0:H_per_block, BI_half:BI],
+                            )
+                            T.barrier_all()
+                            T.set_cross_flag("FIX", _FLAG_SCORE_READY)
+                        # ---- MM2(g-1): P@V of slot g-1 ----
+                        # MM2 references only ws_p / kv / ws_o by parity (cid +
+                        # (g-1)%2), no decode scalars, so it needs only the
+                        # parity. Guarded by valid1 (matches V1(g-1)'s P_READY
+                        # set and V2(g-2)'s PV_READY wait over the loop).
+                        if valid1:
+                            pb = (g - 1) % 2
+                            T.wait_cross_flag(_FLAG_P_READY)
+                            T.barrier_all()
+                            T.copy(
+                                ws_p[cid, pb, 0:H_per_block, 0:BI_half],
+                                p_lo,
+                            )
+                            T.copy(
+                                ws_p[cid, pb, 0:H_per_block, BI_half:BI],
+                                p_hi,
+                            )
+                            T.set_flag("mte2", "m", 0)
+                            T.wait_flag("mte2", "m", 0)
+                            T.gemm_v0(p_lo, kv_lo[pb, :, :], acc_o_l0c, init=True)
+                            T.barrier_all()
+                            T.gemm_v0(p_hi, kv_hi[pb, :, :], acc_o_l0c, init=False)
+                            T.set_flag("m", "fix", 1)
+                            T.wait_flag("m", "fix", 1)
+                            T.copy(
+                                acc_o_l0c,
+                                ws_o[cid, pb, 0:H_per_block, 0:D],
+                            )
+                            T.barrier_all()
+                            T.set_cross_flag("FIX", _FLAG_PV_READY)
+
+                # ============ VECTOR (flat gloop) ============
+                # Step g: V0(g) seed + mask + score-prefetch, V1(g-1) softmax,
+                # V2+tail(g-2) merge + normalize + writeback + LSE. The score
+                # ping-pong (eid 0/1) pre-set / drain is moved OUTSIDE the gloop
+                # (per-slot it leaked across the now-merged steps). Each gloop
+                # step has exactly one set/wait of each score-machine flag, so
+                # the steady-state ping-pong stays balanced (pre-set arms the
+                # cold start, drain consumes the final two dangling sets).
+                with T.Scope("V"):
+                    T.set_flag("v", "mte2", 0)
+                    T.set_flag("v", "mte2", 1)
+                    for g in T.serial(total_work + 2):
+                        # ---- decode(g) ----
+                        pid0 = linear_start + g
+                        in_range0 = T.if_then_else(
+                            core_enable != 0,
+                            T.if_then_else(
+                                pid0 < linear_end, pid0 >= linear_start, False
+                            ),
+                            False,
+                        )
+                        b0_safe = T.if_then_else(in_range0, pid0 // max_seq, 0)
+                        s0 = pid0 % max_seq
+                        act_q0 = actual_q_len[b0_safe]
+                        act_kv0 = actual_kv_len[b0_safe]
+                        valid0 = T.if_then_else(in_range0, s0 < act_q0, False)
+                        s_global0 = act_kv0 - act_q0 + s0
+                        ori_right0 = s_global0
+                        ori_left0_raw = s_global0 - ori_win_left
+                        ori_left0 = T.if_then_else(ori_left0_raw < 0, 0, ori_left0_raw)
+                        # ---- decode(g-1) ----
+                        pid1 = linear_start + g - 1
+                        in_range1 = T.if_then_else(
+                            core_enable != 0,
+                            T.if_then_else(
+                                pid1 < linear_end, pid1 >= linear_start, False
+                            ),
+                            False,
+                        )
+                        b1_safe = T.if_then_else(in_range1, pid1 // max_seq, 0)
+                        s1 = pid1 % max_seq
+                        act_q1 = actual_q_len[b1_safe]
+                        valid1 = T.if_then_else(in_range1, s1 < act_q1, False)
+                        # ---- decode(g-2) ----
+                        pid2 = linear_start + g - 2
+                        in_range2 = T.if_then_else(
+                            core_enable != 0,
+                            T.if_then_else(
+                                pid2 < linear_end, pid2 >= linear_start, False
+                            ),
+                            False,
+                        )
+                        b2_safe = T.if_then_else(in_range2, pid2 // max_seq, 0)
+                        s2 = pid2 % max_seq
+                        act_q2 = actual_q_len[b2_safe]
+                        valid2 = T.if_then_else(in_range2, s2 < act_q2, False)
+                        t2 = q_prefix[b2_safe] + s2
+
+                        # ---- V0(g): seed slot g's GM accumulator + build mask
+                        # + prefetch score ----
+                        # DEVIATION from the spec's literal V0 placement (see
+                        # the report): the softmax max/sum seed (m_i <- Sinks,
+                        # sumexp <- 1.0) is NOT seeded here. Seeding single-buffer
+                        # m_i/sumexp in V0(g) is only correct if V0(g) runs in the
+                        # same step that V1(g-1) consumes them; but V0(g) is
+                        # skipped whenever slot g is padded/past-end while slot
+                        # g-1 is still valid (every batch's last query), leaving
+                        # m_i/sumexp holding slot g-2's stale softmax output. The
+                        # Ascend C blueprint reads the seed from a persistent
+                        # never-clobbered default buffer as the softmax INPUT
+                        # (swa_block_vector.h InitSoftmaxDefaultBuffer +
+                        # SoftmaxFlashV2Compute isFirstSInnerLoop), so the seed
+                        # belongs WITH the softmax. SWA is single-chunk -> the
+                        # seed is the softmax input for EVERY slot, slot-
+                        # independent, so seeding it at the top of V1(g-1) (under
+                        # valid1) is numerically identical and robust. Only the
+                        # GM-accumulator zero-fill (genuinely per-slot-g, parity
+                        # g%2) stays here.
+                        if valid0:
+                            pv0 = g % 2
+                            # No GM-accumulator seed: SWA is single-chunk, so V2+
+                            # tail normalizes ws_o directly and ws_acc_o is unused
+                            # (a dead workspace arg, like SCFA tolerates -- the jit
+                            # still auto-allocs it). This drops the per-slot zero-
+                            # fill's GM stores entirely.
+                            # ---- build mask for slot g (LE compare) ----
+                            # SWA: the single ori chunk starts at ori_left0
+                            # (c0 == 0, so no c0*BI term). No vector gather
+                            # (cube_direct). mask_ub[g%2] is read by V1(g) next
+                            # gloop step.
+                            chunk_start = ori_left0
+                            T.tile.createvecindex(idx_int, chunk_start)
+                            T.copy(idx_int, idx_float)
+                            T.barrier_all()
+                            T.tile.compare(
+                                mask_ub[pv0, :],
+                                idx_float,
+                                T.float32(ori_right0),
+                                "LE",
+                            )
+                            T.barrier_all()
+                            # ---- prefetch slot g's score into acc_s_ub_[g%2] ----
+                            # Score for slot g lands in half g%2, consumed by
+                            # V1(g) next gloop step. Replaces the in-V1
+                            # steady-state prefetch (dead for SWA: t < NI_total
+                            # is 0 < 1 only at the cold start; the V0 prologue
+                            # form below runs every gloop step).
+                            T.wait_cross_flag(_FLAG_SCORE_READY)
+                            T.wait_flag("v", "mte2", g % 2)
+                            T.copy(
+                                ws_score[
+                                    cid,
+                                    g % 2,
+                                    vid * v_block : vid * v_block + v_block,
+                                    :,
+                                ],
+                                acc_s_ub_[
+                                    (g % 2) * v_block : (g % 2) * v_block + v_block,
+                                    :,
+                                ],
+                            )
+                            T.set_flag("mte2", "v", g % 2)
+
+                        # ---- V1(g-1): online softmax of slot g-1 ----
+                        if valid1:
+                            pv1 = (g - 1) % 2
+                            # Seed slot g-1's online-softmax PREV state here (NOT
+                            # in V0): SWA is single-chunk, so the softmax input is
+                            # always the slot-independent seed (m_i <- Sinks,
+                            # sumexp <- 1.0), exactly the Ascend C default-buffer
+                            # seed (swa_block_vector.h SoftmaxFlashV2Compute
+                            # isFirstSInnerLoop). Seeding under valid1 makes it
+                            # robust when V0(g) is skipped (slot g padded while
+                            # slot g-1 is the batch's last valid query). The
+                            # barrier_all drains the Sinks GM->UB DMA (MTE2)
+                            # before m_i / sumexp are read into the softmax inputs
+                            # below; it does not touch flag counters, so the
+                            # score-machine v<->mte2 balance is unaffected
+                            # (mirrors the original seed->barrier_all->loop
+                            # discipline).
+                            T.copy(
+                                Sinks[vid * v_block : vid * v_block + v_block],
+                                m_i,
+                            )
+                            T.tile.fill(sumexp, 1.0)
+                            T.barrier_all()
+                            # Slot g-1's score is in half pv1 (prefetched by
+                            # V0(g-1) last step). RAW: that prefetch (MTE2) wrote
+                            # half pv1.
+                            T.wait_flag("mte2", "v", pv1)
+                            T.copy(mask_ub[pv1, :], mask_sel)
+                            for h_i in T.serial(v_block):
+                                T.tile.select(
+                                    acc_s_ub[h_i, :],
+                                    mask_sel,
+                                    acc_s_ub_[pv1 * v_block + h_i, :],
+                                    -T.infinity(accum_dtype),
+                                    "VSEL_TENSOR_SCALAR_MODE",
+                                )
+                            # WAR (eid pv1): selects done reading half pv1; the
+                            # V0 prefetch one gloop step ahead may overwrite it.
+                            # Balanced by the pre-set pair before the loop + the
+                            # drain after it.
+                            T.set_flag("v", "mte2", pv1)
+                            T.copy(m_i, m_i_prev)
+                            T.tile.mul(acc_s_ub, acc_s_ub, softmax_scale)
+                            # Fused online softmax (replicate Ascend C
+                            # SoftmaxFlashV2Compute): one op does max-subtract +
+                            # exp + row-sum + running-state rescale. Seed prev
+                            # sum into sumexp_i_ub; outputs new max -> m_i, new
+                            # sum -> sumexp, P -> acc_s_ub, alpha = exp(prev-new)
+                            # -> alpha_exp (stashed to the flat alpha[] for V2).
+                            T.copy(sumexp, sumexp_i_ub)
+                            T.tile.softmax_flashv2(
+                                acc_s_ub,
+                                sumexp,
+                                m_i,
+                                alpha_exp,
+                                sumexp_i_ub,
+                                m_i_prev,
+                                softmax_tmp,
+                                v_block,
+                                BI,
+                                BI,
+                            )
+                            T.copy(
+                                alpha_exp,
+                                alpha[pv1 * ub_len : pv1 * ub_len + ub_len],
+                            )
+                            # ---- S3b carry SAVE: stash slot g-1's new softmax
+                            # state by parity so V2+tail(g-2) keeps reading slot
+                            # g-2's OLD single-buffer state until it restores its
+                            # own. Flat [2] region copies (Var parity dst) are
+                            # :1499-safe (no tile-op operand). ----
+                            T.copy(sumexp, sumexp_sv[pv1, :])
+                            T.copy(m_i, m_i_sv[pv1, :])
+                            # ---- cast P, publish for cube ----
+                            T.copy(acc_s_ub, acc_s_half)
+                            # RAW flag: cast (VEC) writes acc_s_half, the ws_p
+                            # write (MTE3) reads it (score-machine v->mte3 eid 0).
+                            T.set_flag("v", "mte3", 0)
+                            T.wait_flag("v", "mte3", 0)
+                            T.copy(
+                                acc_s_half,
+                                ws_p[
+                                    cid,
+                                    pv1,
+                                    vid * v_block : vid * v_block + v_block,
+                                    :,
+                                ],
+                            )
+                            # V1-end barrier KEPT: drains this slot's softmax
+                            # (VEC) before P_READY publishes; step boundary for
+                            # the single-buffered V1 scratch (acc_s_ub/half,
+                            # m_i*, mask_sel).
+                            T.barrier_all()
+                            T.set_cross_flag("MTE3", _FLAG_P_READY)
+
+                        # ---- V2+tail(g-2): merge slot g-2 + normalize + LSE ----
+                        if valid2:
+                            pv2 = (g - 2) % 2
+                            T.wait_cross_flag(_FLAG_PV_READY)
+                            T.barrier_all()
+                            # SWA is SINGLE-CHUNK, so the online-softmax output
+                            # accumulator is trivially acc = 0*alpha + O = O -- O is
+                            # exactly the P@V result the cube wrote to ws_o. There is
+                            # NO cross-chunk accumulation, so there is no accumulator
+                            # to carry: the Ascend C blueprint normalizes its O buffer
+                            # (vec2ResGm) directly. So V2+tail loads ws_o, divides by
+                            # the carried sumexp, writes Output -- dropping the entire
+                            # ws_acc_o GM round-trip (S1's GM accumulator was the -7
+                            # source AND redundant for SWA) and the now-no-op rescale.
+                            # This ALSO fixes a correctness bug: ws_acc_o's 2-deep
+                            # parity cannot survive the accumulator across the 3-gloop-
+                            # step skew -- V0(g)'s zero of half g%2 is clobbered by
+                            # V2(g-2)'s store to the SAME half (g%2 == (g-2)%2), and the
+                            # re-zero that V2(g-2) actually relies on is V0(g+2)'s, which
+                            # is SKIPPED for the last valid slots (g+2 past-end / padded)
+                            # -> V2 would read a stale O(g-4). Reading ws_o (freshly
+                            # written by MM2(g-2), gated by PV_READY) has none of this.
+                            # carry RESTORE: slot g-2's saved softmax state -> the
+                            # single-buffer *_rt the div/ln/add consume (single buffer
+                            # keeps tile-ops off Var parity -> :1499-safe).
+                            T.copy(sumexp_sv[pv2, :], sumexp_rt)
+                            T.copy(m_i_sv[pv2, :], m_i_rt)
+                            # restore (MTE2 UB->UB) -> div/ln (VEC) read *_rt: drain.
+                            T.barrier_all()
+                            # 2-pass debarriered normalize: pass 1's ws_o load (MTE2)
+                            # overlaps pass 0's div (VEC). N_MERGE_PASS == 2 unrolled
+                            # (the work tile must be picked by a Python int).
+                            # ============ pass 0 (heads 0:MERGE_HEADS) ============
+                            T.copy(
+                                ws_o[
+                                    cid,
+                                    pv2,
+                                    vid * v_block : vid * v_block + MERGE_HEADS,
+                                    :,
+                                ],
+                                acc_o_work,
+                            )
+                            T.set_flag("mte2", "v", 2)
+                            T.wait_flag("mte2", "v", 2)
+                            for h_i in range(MERGE_HEADS):
+                                T.tile.div(
+                                    acc_o_work[h_i, :],
+                                    acc_o_work[h_i, :],
+                                    sumexp_rt[h_i],
+                                )
+                            T.pipe_barrier("v")
+                            T.copy(
+                                acc_o_work,
+                                acc_o_half[0:MERGE_HEADS, :],
+                            )
+                            # ====== pass 1 (heads MERGE_HEADS:2*MERGE_HEADS) ======
+                            T.copy(
+                                ws_o[
+                                    cid,
+                                    pv2,
+                                    vid * v_block + MERGE_HEADS : vid * v_block
+                                    + 2 * MERGE_HEADS,
+                                    :,
+                                ],
+                                acc_o_work2,
+                            )
+                            T.set_flag("mte2", "v", 3)
+                            T.wait_flag("mte2", "v", 3)
+                            for h_i in range(MERGE_HEADS):
+                                T.tile.div(
+                                    acc_o_work2[h_i, :],
+                                    acc_o_work2[h_i, :],
+                                    sumexp_rt[MERGE_HEADS + h_i],
+                                )
+                            T.pipe_barrier("v")
+                            T.copy(
+                                acc_o_work2,
+                                acc_o_half[MERGE_HEADS : 2 * MERGE_HEADS, :],
+                            )
+                            T.set_flag("v", "mte3", 1)
+                            T.wait_flag("v", "mte3", 1)
+                            T.copy(
+                                acc_o_half,
+                                Output[
+                                    t2,
+                                    vid * v_block : vid * v_block + v_block,
+                                    :,
+                                ],
+                            )
+                            # ---- LSE epilogue: lse = m_i + ln(sumexp), reading
+                            # the restored slot g-2 state (*_rt). ----
+                            T.tile.ln(lse_ub, sumexp_rt)
+                            T.barrier_all()
+                            T.tile.add(lse_ub, lse_ub, m_i_rt)
+                            T.barrier_all()
+                            T.copy(
+                                lse_ub,
+                                LSE_out[
+                                    t2,
+                                    vid * v_block : vid * v_block + v_block,
+                                ],
+                            )
+                    # Score-machine drain: the last two V0 prefetches set
+                    # mte2->v with their V1 consumer in the next step; the final
+                    # two V1 selects set v->mte2 with no V0 consumer left.
+                    # Consume the 2 dangling v->mte2 (balances the pre-set).
+                    T.wait_flag("v", "mte2", 0)
+                    T.wait_flag("v", "mte2", 1)
+
+        return sparse_attn_sharedkv_swa if NI_total == 1 else sparse_attn_sharedkv
 
     return _make()

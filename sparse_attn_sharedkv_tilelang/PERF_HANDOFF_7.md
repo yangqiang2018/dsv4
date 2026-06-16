@@ -8,7 +8,7 @@
 - **目标（用户北极星）**：复刻 Ascend C 这个算子的计算逻辑 + 性能方案，让 swa 前向做到 AscendC 的 **80–100%**。Ascend C 源码是蓝本，别发明 kernel 侧小技巧；过不去改 fork 编译器（`yangqiang2018/tilelang-ascend`，NPU 验过的成功改动打 `cfeat-*` annotated tag，攒着提上游 issue）。
 - **诚实天花板**：vector 侧便宜刀**已用尽**（brcb/row_muls rescale、SoftmaxFlashV2 fused softmax 都 NPU 验过 = perf 中性，见 _6 §3.6/3.7）。**~50% 是 kernel 侧天花板**。破它只剩 **C（跨-slot 软件流水）**。**注意：即使 C 全成也就 ~55，够不着北极星 80**——80 还得叠 cube 侧（_6 §3.5② L1-ring 预取，又一大改）。**用户已知情拍板「硬上 C」**（知道 ~16-25 容器轮、最好 ~55、砸了全回退）。
 - **perf 现状**：swa **35.6** / cfa **42.3** / scfa 15.0（S1+S2 后）。**比 C 前 baseline swa 42.4 / cfa 49.9 降了 ~7**——这是 S1 把 acc_o 挪 GM 的纯 DMA 成本，**所有恢复+增益押在 S3**。
-- **进度**：S1 ✅、S2 ✅、**Q4 ✅ 容器验绿但 perf 基本没动**（swa 35.0/cfa 43.7，−7 没收回；证实 intra-slot debarrier 不够、要 cross-slot S3b，见 §0.5）。**当前仍 BELOW baseline，决策点：回退 vs S3b vs profile，待用户拍板。**
+- **进度**：S1 ✅、S2 ✅、Q4 ✅(green/perf-flat,证实要 cross-slot)。**S3b ✅ 已实现待容器验**(SWA cross-slot flat-gloop,独立 prim_func;review 抓到「单-chunk SWA 不需要 ws_acc_o」→ 直接 normalize ws_o,修了 stale-read bug + 砍了 −7 源;见 §0.6)。**下一步:容器三验(fast 抓 deadlock / decode 抓 data hazard / perf 看是否冲过 baseline 向 ~50-55)。**
 
 ## 0.6 S3b 设计已定案（2026-06-16，Plan agent 读真源码 + 我审核）—— 纯 kernel 重写、无需改编译器、分阶段把 all-or-nothing 收敛到一步
 
@@ -23,7 +23,15 @@
 6. **复用 S1+S2+Q4**:S1 GM accumulator、Q4 debarrier flag + acc_o_work 双缓冲(与 cross-slot 正交,组合用)全留;S2 的 ws_acc_o parity 从「inert 总被 drain」变「live 跨-slot 双缓冲」。SCFA 全程不动(只 `slot→g` 改名,不上 skew)。
 7. **诚实预期**:S3b 填 ~25% bubble + 埋 vector GM DMA → **swa ~50-55**(VEC 总忙时不减、cube 在 ~2.72ms 成共瓶颈,故封顶 ~55);**到 80 还要叠 cube 侧 L1-ring KV 预取(`_6 §3.5②`,S3b 之外另一大改)。** S3b 估 **~13-23 容器轮**(S3b.0~2 各 1-4 inert,S3b.3 ~6-10 高方差)。失败序:死锁 > no-overlap > cross-slot WAR > `:1499`。
 
-**详细伪代码 + 行号在对话的 Plan agent 报告里(cube/vector 两 scope 的 gloop 体、decode(off) 的 OOB-safe 读、flag 表)。下一步:实现 S3b.0。**
+**详细伪代码 + 行号在对话的 Plan agent 报告里(cube/vector 两 scope 的 gloop 体、decode(off) 的 OOB-safe 读、flag 表)。**
+
+### ✅ S3b 已实现(2026-06-16,construct agent + 2 轮 adversarial review + 我审,待容器验)
+
+**形态:新增独立 lean prim_func `sparse_attn_sharedkv_swa`(kernel.py ~1893-2576),`return ... if NI_total==1 else ...` 选择;旧 prim_func 字节同一(CFA/SCFA 不动)。** flat `for g in range(total_work+2)`,3-深 skew:cube `MM1(g)|MM2(g-1)`、vector `V0(g)|V1(g-1)|V2+tail(g-2)`。死锁铁律(set/wait 同 valid 谓词)+ score-machine pre-set/drain 包 gloop,review 把 1022 种 validity pattern 全模拟过 = 平衡。
+
+**关键发现(review 阶段我抓到、第一轮 review 漏判的真 bug + 同时是大简化)**:**单-chunk SWA 的 online-softmax 累加器 trivially `acc = 0*alpha + O = O = ws_o`(P@V 输出),没有跨-chunk 累加** —— Ascend C 蓝本直接 normalize 它的 O buffer(vec2ResGm),根本没有独立累加器。所以 V2+tail **直接 normalize ws_o**(load ws_o → div sumexp → Output),**砍掉整个 ws_acc_o GM round-trip(S1 的 −7 来源,对 SWA 本就多余)+ no-op 的 rescale**。这同时**修了一个真 bug**:ws_acc_o 的 2-深 parity 撑不过 3-gloop-step skew —— V0(g) 对 half g%2 的清零被 V2(g-2) 的 store 覆写(g%2==(g-2)%2),V2(g-2) 真正依赖的 re-zero 是 V0(g+2) 的,而它对**最后几个有效 slot 被 skip**(g+2 越界/padded)→ 读到 stale O(g-4)。改读 ws_o(MM2(g-2) 刚写、PV_READY 守)无此问题。**`ws_acc_o` 现在是 SWA 路径的 dead arg(auto-alloc,如 SCFA 容忍)。** sumexp/m_i 用 :1499-safe 的 save/restore(region copy + 单缓冲 *_rt 喂 tile-op)跨 slot 带到 tail;q_l1 双缓冲(L1 重排到 400KB)。
+
+**⚠️ 诚实:这是大重写、本地编不了 tilelang。container 三验是真 gate**:① fast(抓 prefill deadlock —— flag review 说低风险但 hang 最坏)② **`decode and dtype0`(抓 data hazard/wrong-output —— 我抓的那类 bug 的真 gate)** ③ perf。**预期**:Fix B 砍了 ws_acc_o round-trip(−7 源)+ cross-slot overlap 填 bubble → swa 有望从 35 冲过 baseline 42 向 ~50-55。砸了(hang/红/没动)→ 查 flag 平衡 / data hazard / overlap,或回退。
 
 ## 0.5 UPDATE 2026-06-16：S3a 前提证伪 → 改做 Q4（debarrier+双缓冲），已 push 待验
 
