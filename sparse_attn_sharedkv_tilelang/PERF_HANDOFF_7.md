@@ -10,6 +10,21 @@
 - **perf 现状**：swa **35.6** / cfa **42.3** / scfa 15.0（S1+S2 后）。**比 C 前 baseline swa 42.4 / cfa 49.9 降了 ~7**——这是 S1 把 acc_o 挪 GM 的纯 DMA 成本，**所有恢复+增益押在 S3**。
 - **进度**：S1 ✅、S2 ✅、**Q4 ✅ 容器验绿但 perf 基本没动**（swa 35.0/cfa 43.7，−7 没收回；证实 intra-slot debarrier 不够、要 cross-slot S3b，见 §0.5）。**当前仍 BELOW baseline，决策点：回退 vs S3b vs profile，待用户拍板。**
 
+## 0.6 S3b 设计已定案（2026-06-16，Plan agent 读真源码 + 我审核）—— 纯 kernel 重写、无需改编译器、分阶段把 all-or-nothing 收敛到一步
+
+> Q4 实证「intra-slot 不够、必须 cross-slot」后,用户拍板「硬上 80,需要就改编译器」。S3b = 复刻 Ascend C 的 `PreloadPipeline` flat-gloop 跨-slot 流水。**只盯 SWA(NI_total=1,task==slot)。** 蓝本源码在本地:`ops-transformer/.../arch32/sparse_attn_sharedkv_swa_kernel.h`(PreloadPipeline `:741-769`)+ `_swa_block_{cube,vector}.h`。
+
+**关键定案(都有源码/pass 实锤):**
+1. **无需改编译器 —— 纯 kernel.py 重写。** `CombineCV`(`tilelang-ascend/src/transform/ascend_combinecv.cc:843-862`)把整个 loop nest **逐字复制**进 cube 程序和 vector 程序两份(只按 scope 把叶子 op 置空),所以在 kernel.py 写一个 flat `for gloop`,cube/vector 各跑自己那份、靠 cross-flag 会合 —— 正是 Ascend C `PreloadPipeline`(一个函数体里 `if AIC{..} if AIV{..}` 并列)。所需原语(TIR for/if、set/wait_cross_flag、set/wait_flag、GM-region Var-parity)全已 NPU 验过,**不用打新 cfeat**。
+2. **flat-gloop 结构(SWA)**:`for g in range(total_tasks+2)`,3-深 skew —— cube 做 `MM1(g) ‖ MM2(g-1)`,vector 做 `V0(g) ‖ V1(g-1) ‖ V2/tail(g-2)`(tail=normalize+writeback+LSE **折进 V2(g-2)**,这样 slot g-2 的 GM round-trip 埋在 slot g-1/g 的 VEC 下 = Q4 做不到的 cross-slot 交织)。每相位 `if 0<=off<total_tasks ∧ valid(off):` 门控(=Ascend C `isValid`),`+2` 是末尾 drain(`extraLoop=PRELOAD_NUM`)。
+3. **死锁铁律(#1 风险,`:1259` 血泪)**:每个 cross-flag 的 set 和它的 wait **用同一个 valid(同一 slot index) 谓词门控** → set 次数 ≡ wait 次数 = `|{i:valid(i)}|`,与 batch×slot 数无关 → 结构上不可能 leak。SWA cube_direct **只 3 个 live flag**(KV_READY dead:cube 自拉 KV)。prologue(g=0,1)/epilogue(g=S,S+1)靠 `0<=off<S` 守,不发空 set/wait。intra-core ping-pong(score eid 0/1、Q4 eid 2/3)的 pre-set/drain 移到**包住 gloop**(不是 per-slot)。
+4. **parity 表**:`ws_acc_o`(S2 已 slot-parity)→ V2/tail 读 `(g-2)%2`、seed 写 `g%2`;**`sumexp`/`m_i` 必须加 gloop-parity**(`_7 §1` 的开放问题:V1(g-1) 写新 max/sum 时 V2/tail(g-2) 还在读旧的 → 单缓冲会被覆写;差一个 slot 故 `[2]` 够。**避 `:1499`**:别在 tile-op 操作数上切 Var-range,用 flat `[2*ub_len]` + 标量 base-offset `sumexp[parity*ub_len+h]`,或整行 region `sumexp[parity]`,哪个能编过在 S3b.1 验);`alpha`/`ws_kv/score/p/o`/`mask_ub`/`acc_s_ub_` 的 `t%2` chunk-parity **重解释成 `g%2`**(GM 不扩、只换索引);**`q_l1` 加 `[2,H,D]` gloop-parity**(MM1(g) 与 MM2(g-1) 用不同 slot 的 Q;L1 64→128KB,峰值 400/512KB 够);`p_lo/p_hi` 可留单缓冲(MM2 内即用即弃);**UB tiles(acc_o_work/work2/ub/half、acc_s_ub/half)留单缓冲**(Var-parity 踩 `:1499`,跨 step 复用靠 step 边界 barrier drain)。
+5. **分阶段(把 all-or-nothing 收到一步)**:**S3b.0** gloop 重构成 no-op(还串行、0-skew,验 byte-identical via `get_kernel_source` dump diff + fast + decode)→ **S3b.1** sumexp/m_i 加 parity(还串行=inert,**最险 IR 编辑,隔离验**)→ **S3b.2** 重解释 ws_*/alpha/... parity + q_l1 双缓冲(还串行=inert)→ **S3b.3 引入 skew**(唯一改时序的一步=硬 gate:counter-audit flag 平衡 → fast(leak) → decode(race) → perf;过不了/hang/regress 就**整体回退 acc_o→GM 栈**,`_7 §5`)→ **S3b.4** 收紧剩余 barrier_all 为精确 flag(可选 perf 抛光)。前三步都 inert/可单验,风险全压在 S3b.3。
+6. **复用 S1+S2+Q4**:S1 GM accumulator、Q4 debarrier flag + acc_o_work 双缓冲(与 cross-slot 正交,组合用)全留;S2 的 ws_acc_o parity 从「inert 总被 drain」变「live 跨-slot 双缓冲」。SCFA 全程不动(只 `slot→g` 改名,不上 skew)。
+7. **诚实预期**:S3b 填 ~25% bubble + 埋 vector GM DMA → **swa ~50-55**(VEC 总忙时不减、cube 在 ~2.72ms 成共瓶颈,故封顶 ~55);**到 80 还要叠 cube 侧 L1-ring KV 预取(`_6 §3.5②`,S3b 之外另一大改)。** S3b 估 **~13-23 容器轮**(S3b.0~2 各 1-4 inert,S3b.3 ~6-10 高方差)。失败序:死锁 > no-overlap > cross-slot WAR > `:1499`。
+
+**详细伪代码 + 行号在对话的 Plan agent 报告里(cube/vector 两 scope 的 gloop 体、decode(off) 的 OOB-safe 读、flag 表)。下一步:实现 S3b.0。**
+
 ## 0.5 UPDATE 2026-06-16：S3a 前提证伪 → 改做 Q4（debarrier+双缓冲），已 push 待验
 
 **两条独立 dataflow 分析（本人 + Plan agent，读全代码）一致证伪 S3a 对 SWA 的前提**：
