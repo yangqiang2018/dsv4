@@ -116,6 +116,25 @@
 
 **现状**：kernel 已回退 per-head 绿（`9333fda` == `b68dffa`）；fork 留着 row_muls C++ 模板 + Python wrapper + BufferLoad（inert，等 builtin 注册）。kernel-side rescale（alpha_brd8 + brcb/row_muls 调用）等 builtin 接上再重贴（git `bb643fc` 有原版）。
 
+## 3.8 C（跨-slot 软件流水）设计/可行性 pass（2026-06-16，本地分析+agent 交叉验证，未动代码）
+
+**结论先行**：C ≠「把 acc_o 挪到 GM」这种局部改，而是**把主循环重写成 Ascend C 的 flat `gloop` preload 流水** —— kernel 可能的最大改动。可行（Ascend C 是实证），但高风险、估 ~15-25 容器轮、S3 增益 all-or-nothing。
+
+**Ascend C 蓝本**（agent 读 `swa_kernel.h`/`swa_block_vector.h`）：① O 存 **GM `vec2ResGm`**，slot-parity 双缓冲 `[(loop%PRELOAD_NUM=2)*bmm2ResUbSize+off]`（`swa_block_vector.h:653/679/715`）；merge 从 GM load 上一 slot O→UB、rescale、加 P@V、存回当前 parity；末 chunk 除 sum 写最终输出。② **flat `gloop` 流水**（`swa_kernel.h:726-769`）：一个循环跑所有 (slot×chunk) task，3-深 skew（Mm1(loop)‖Vec1(loop-1)‖Vec2(loop-2)），**只最末 drain**（`extraLoop=isEnd?PRELOAD_NUM:0`）→ slot k 的 Vec2(O merge) 天然叠 slot k+1 的 Mm1。③ SWA `NI_total=1`：slot 内无 chunk 并行，**并行全在跨-slot**。
+
+**我们 vs 蓝本**：我们是**嵌套 + 串行 slot**（`for slot in T.serial`@547 → 每 slot 一对 `T.Scope("C")`@584/`T.Scope("V")`@972，chunk-skew 在 slot 内；slot 间串行）。蓝本是 **flat gloop**。跨-slot 叠就得把主循环从「串行 slot」改成「skewed slot 流水」。
+
+**blocker 全清单**（acc_o-in-UB 只是其一）：
+1. **acc_o**（64KB 单缓冲 UB；sites: fill@978 / V2 merge@1490-1568 / normalize@1587-1592 / writeback `copy(acc_o,acc_o_half)`@1602 + `copy(acc_o_half,Output)`@1604）→ GM slot-parity 双缓冲（腾 64KB UB + slot k+1 用另一 parity）。
+2. **slot 尾状态 sumexp/m_i**（normalize@1591 + LSE@1626-1628 读）→ slot-parity（否则 slot k+1 softmax 覆盖 slot k 尾未读的 sumexp/m_i）。
+3. **workspaces ws_kv/ws_score/ws_p/ws_o**（现 chunk-parity `t%2`；SWA `NI_total=1` 时 slot 只用 parity 0 → slot k/k+1 撞）→ 加 slot-parity。
+4. **主循环**：串行 `for slot`@547 → skewed slot 流水 / flat gloop。**这是大头**。
+5. **cross-flags**：现 within-slot（`_FLAG_KV/SCORE/P/PV_READY`）→ 跨-slot（gloop-indexed）。**⚠️ line 1223 注释记载跨-slot flag 失衡曾「leaked +2 per slot 死锁 prefill」——已知死锁雷区**。
+
+**分阶段**（降风险，但增益只在 S3 兑现）：**S1** acc_o→GM 单缓冲（load/store per merge），腾 64KB UB，数值可验绿、perf 中性偏降，~2-4 轮 → **S2** acc_o GM slot-parity 双缓冲 + sumexp/m_i + workspaces slot-parity，仍串行，数值可验、perf 仍中性，~3-5 轮 → **S3** 主循环改 skewed 流水 + 去 slot flush + 跨-slot flags，**增益在此（约到 swa ~55%）+ 风险在此**（死锁/overlap 不及预期/回归），~8-15 轮高方差。
+
+**诚实建议**：C 是破 50→80% 唯一路,但是 kernel 最大改、高风险、本地全验不了。**只在确认冲 80% 且愿投容器带宽时才值得**;否则当前 swa~42/cfa~49（vector 刀干净收官 + 6 cfeat tag）是体面停点。若上,严格 S1→S2→S3、每阶段数值验绿再走,把 all-or-nothing 压到 S3。
+
 ## 4. 编译器修改纪律（用户定，必守）
 
 - **兼容性铁律**：改编译器**必须 additive / 向后兼容**，别破坏现有路径（Buffer/BufferRegion 等已有分支原样保留），**别影响其他用 tilelang 写算子/用编译器的人**。`d789b93` 范例：只**新加** BufferLoad 分支。
