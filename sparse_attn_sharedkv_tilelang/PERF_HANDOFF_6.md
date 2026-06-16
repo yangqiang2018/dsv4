@@ -151,6 +151,10 @@
 
 **诚实 ROI(Plan agent + 我都认同)**:技术可行(Ascend C 是实证、无需新编译器特性),但 **~16-25 高方差轮、死锁雷区活的、本地全验不了**;且即使**成功也就 ~50-55、不是 80**(vector 便宜刀已证用尽,§3.6/3.7;§3 早写 ~50% 是 kernel 侧天花板)。S1 已把 swa 压到 35.6,所有恢复全押 S3b;**S3b 砸 = 整套 acc_o→GM(S1+S2+S3)全回退、~20 轮换回原点**。**建议:除非 80% 是硬承诺 + 愿投专门容器带宽 + 接受可能全回退,否则回退 S1 到干净里程碑(swa 42.4 / cfa 49.9、vector 刀收官、6 cfeat tag)是诚实终点。**
 
+**进度(用户拍板「硬上 S3」2026-06-16)**:
+- **S2 ✅ 验绿（`d88dca9`,inert,fast+decode byte-identical,swa 35.6 不变）**:`ws_acc_o` 加 slot-parity `2` 维 + 4 个 GM copy 点 `slot%2` 索引（Var-parity 只落在 GM `T.copy` region,避开 `:1499` 的 UB tile-op Var-parity 坑）;SCFA 不变。`sumexp`/`m_i`/`alpha`/`ws_*` 的 parity 留到 S3a。
+- **S3a 设计（下一步实现,1-深 tail overlap,硬 gate）**:重排 **vector scope** 的 for-slot 循环成 `{ V0(slot)[提前→早设 KV_READY]; deferred tail(slot-1)=normalize+writeback+LSE[读 ws_acc_o[(slot-1)%2]]; V1(slot); V2(slot) }` + prologue(slot0 无 tail)+ epilogue(末 slot 的 tail)。**cube scope 不动**:它的 MM1(slot) 等 KV_READY(slot),V0(slot) 提前设 → MM1(slot) 在 tail(slot-1) 期间跑 = overlap。**carried state**:`ws_acc_o[slot%2]`(S2 已备);**`sumexp`/`m_i` 单缓冲够**(vector 串行:tail(slot-1) 在 V1(slot) 覆写前读它们,无中间写)。**overlap = cube MM1(slot) ‖ vector tail(slot-1)**,填的正是 S1 加重的 normalize/writeback 那段 cube 空泡。**死锁风险**:deferred tail 不设 cross-flag(只写 LSE_out GM),不应改 flag set/wait 计数 —— 但必须 prefill(抓 leak)+ decode(抓 race)都验。**硬 gate:S3a 连 S1 的 −7 都收不回就 abort + 回退,不进 S3b。**（注:CFA NI_total>1 的 chunk-skew 与 slot-skew 的交互更复杂,S3a 先盯 SWA;CFA 可能要 S3b 的 full flat-gloop 才干净。）
+
 ## 4. 编译器修改纪律（用户定，必守）
 
 - **兼容性铁律**：改编译器**必须 additive / 向后兼容**，别破坏现有路径（Buffer/BufferRegion 等已有分支原样保留），**别影响其他用 tilelang 写算子/用编译器的人**。`d789b93` 范例：只**新加** BufferLoad 分支。
