@@ -345,12 +345,14 @@ def build_sparse_attn_sharedkv(
             ws_score: T.Tensor([core_num, 2, H_per_block, BI], accum_dtype),  # type: ignore[valid-type]
             ws_p: T.Tensor([core_num, 2, H_per_block, BI], dtype),  # type: ignore[valid-type]
             ws_o: T.Tensor([core_num, 2, H_per_block, D], accum_dtype),  # type: ignore[valid-type]
-            # S1 (cross-slot pipeline): acc_o's persistent store moves UB -> GM
-            # (single-buffer for now; slot-parity double-buffer is S2). Mirrors
-            # ws_o's [core_num, H_per_block, D] per-core layout; each AIV indexes
-            # its half by vid*v_block. cube_direct (swa/cfa) only -- on the SCFA
-            # trace this arg is unreferenced (acc_o stays the UB accumulator).
-            ws_acc_o: T.Tensor([core_num, H_per_block, D], accum_dtype),  # type: ignore[valid-type]
+            # S1/S2 (cross-slot pipeline): acc_o's persistent store moves UB -> GM.
+            # S2 adds the leading slot-parity dim (2), indexed by slot%2, so slot k
+            # and k+1's accumulators don't collide once S3 overlaps them -- INERT
+            # under the still-serial slot loop (each slot is self-contained in its
+            # parity, fully drained before the next). Mirrors ws_o's [core_num, 2,
+            # H_per_block, D]; each AIV indexes its half by vid*v_block. cube_direct
+            # (swa/cfa) only -- on the SCFA trace this arg is unreferenced.
+            ws_acc_o: T.Tensor([core_num, 2, H_per_block, D], accum_dtype),  # type: ignore[valid-type]
         ):
             with T.Kernel(core_num, is_npu=True) as (cid, vid):
                 # ---- L1 / L0 (cube). ----
@@ -1007,6 +1009,7 @@ def build_sparse_attn_sharedkv(
                                             acc_o_work,
                                             ws_acc_o[
                                                 cid,
+                                                slot % 2,
                                                 vid * v_block + hb : vid * v_block
                                                 + hb
                                                 + MERGE_HEADS,
@@ -1506,6 +1509,7 @@ def build_sparse_attn_sharedkv(
                                                 T.copy(
                                                     ws_acc_o[
                                                         cid,
+                                                        slot % 2,
                                                         vid * v_block + hbase : vid
                                                         * v_block
                                                         + hbase
@@ -1605,6 +1609,7 @@ def build_sparse_attn_sharedkv(
                                                     acc_o_work,
                                                     ws_acc_o[
                                                         cid,
+                                                        slot % 2,
                                                         vid * v_block + hbase : vid
                                                         * v_block
                                                         + hbase
@@ -1661,6 +1666,7 @@ def build_sparse_attn_sharedkv(
                                         T.copy(
                                             ws_acc_o[
                                                 cid,
+                                                slot % 2,
                                                 vid * v_block + hb : vid * v_block
                                                 + hb
                                                 + MERGE_HEADS,
