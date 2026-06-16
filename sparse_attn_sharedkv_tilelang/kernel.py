@@ -1486,14 +1486,17 @@ def build_sparse_attn_sharedkv(
                                                     1,
                                                     8,
                                                 )
-                                                # DIAGNOSTIC: full barrier_all at the 3
-                                                # spots Ascend C has PipeBarrier<PIPE_V>
-                                                # (after brcb/row_muls/add). pipe_barrier
-                                                # ("v") got swa 90->97 but a per-rescale
-                                                # residual remains; this isolates sync-vs-
-                                                # bug. If green, refine back to the light
-                                                # pipe_barrier("v").
-                                                T.barrier_all()
+                                                # Sync (matches Ascend C swa_block_vector.h
+                                                # 689/692/694-696): brcb->row_muls and
+                                                # row_muls->add are VEC->VEC RAW -> light
+                                                # PIPE_V (pipe_barrier "v"). The add->next-
+                                                # pass T.copy(ws_o, acc_o_ub) is a VEC->MTE2
+                                                # WAR on acc_o_ub (the fa63798 hazard, which
+                                                # the row_muls timing newly exposes) -> needs
+                                                # a full barrier (cross-pipe), not PIPE_V.
+                                                # Diagnostic: 3x barrier_all green; PIPE_V x2
+                                                # alone = 97% (missed the WAR).
+                                                T.pipe_barrier("v")
                                                 T.tile.row_muls(
                                                     acc_o[
                                                         hbase : hbase + MERGE_HEADS, :
@@ -1506,7 +1509,7 @@ def build_sparse_attn_sharedkv(
                                                     D,
                                                     D,
                                                 )
-                                                T.barrier_all()
+                                                T.pipe_barrier("v")
                                                 for h_i in range(MERGE_HEADS):
                                                     T.tile.add(
                                                         acc_o[hbase + h_i, :],
