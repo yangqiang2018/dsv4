@@ -8,7 +8,7 @@
 - **目标（用户北极星）**：复刻 Ascend C 这个算子的计算逻辑 + 性能方案，让 swa 前向做到 AscendC 的 **80–100%**。Ascend C 源码是蓝本，别发明 kernel 侧小技巧；过不去改 fork 编译器（`yangqiang2018/tilelang-ascend`，NPU 验过的成功改动打 `cfeat-*` annotated tag，攒着提上游 issue）。
 - **诚实天花板**：vector 侧便宜刀**已用尽**（brcb/row_muls rescale、SoftmaxFlashV2 fused softmax 都 NPU 验过 = perf 中性，见 _6 §3.6/3.7）。**~50% 是 kernel 侧天花板**。破它只剩 **C（跨-slot 软件流水）**。**注意：即使 C 全成也就 ~55，够不着北极星 80**——80 还得叠 cube 侧（_6 §3.5② L1-ring 预取，又一大改）。**用户已知情拍板「硬上 C」**（知道 ~16-25 容器轮、最好 ~55、砸了全回退）。
 - **perf 现状**：swa **35.6** / cfa **42.3** / scfa 15.0（S1+S2 后）。**比 C 前 baseline swa 42.4 / cfa 49.9 降了 ~7**——这是 S1 把 acc_o 挪 GM 的纯 DMA 成本，**所有恢复+增益押在 S3**。
-- **进度**：S1 ✅、S2 ✅、Q4 ✅、S3b ✅(swa 35→41.3)、C1 cube debarrier ✅(swa 41.3→45.3,+4,过 baseline)、**C2=cube SCALAR 削减(bulk KV gather,8+8→2+2 div/mod)已实现,待容器验**。**C1 后 re-profile 实锤瓶颈搬到 cube SCALAR(51%/1584us,长板核最大 pipe;cube util 96.7%,vector idle 24% 被卡)**——故 C2 打 cube scalar(复刻 Ascend C bulk DataCopy)而非 vector(profile-first 防打错目标)。详见 §0.6.2。下一步看 profile:若 cube 退位则 decode-carry + vector debarrier。
+- **进度**：S1✅ S2✅ Q4✅ S3b✅(swa35→41.3) C1 cube debarrier✅(41.3→45.3,+4,过baseline) C2 bulk KV gather✅但**perf平**(45.3→45.1) **C3=L0C ping-pong(M-tiling)已实现+双审过,待容器验**。**关键转折**:C2 平→re-profile 实锤 cube scalar 51% 不是 gather(是 3× decode + C1 加的 flag,C2 只把 mte2 820→754);真瓶颈=C1 让 cube pipe 真重叠(和126%)后**暴露的单块 128KB L0C 串行 MAD/FIX**。C3 复刻 Ascend C 的 2×64KB L0C ping-pong 重叠 MAD/FIX(gemm_v0 不能切操作数→用 **M-tiling 切 heads**(连续切片)而非 D-tiling,免编译器改+保住 C2;详见 §0.6.3)。到 80 仍需叠 decode-carry(削 scalar)+ vector。
 
 ## 0.6 S3b 设计已定案（2026-06-16，Plan agent 读真源码 + 我审核）—— 纯 kernel 重写、无需改编译器、分阶段把 all-or-nothing 收敛到一步
 
@@ -71,6 +71,18 @@
 **预期**:cube scalar 8+8→2+2 div/mod(gather 大头)→ cube 时间往 vector floor(2407us)掉 → swa 45→~55+?(若 cube 掉破 vector floor,vector 变瓶颈,再轮到 vector debarrier / decode-carry)。**这刀单独应见效**(gather 占 scalar `//`/`%` 的大头,~73%,非组合拳——不像 cube/vector debarrier 互相依赖)。**风险**:correctness(错地址→错 KV→错输出),decode/dtype0 gate 抓得到;无死锁风险(纯地址算术,无新同步)。砸了回退本 commit。
 
 **下一步若 cube 不再是瓶颈**:decode-carry(把 valid(g) 存 3-深 rotating UB,g-1/g-2 不重算,省 2+2 div/mod,**cube+vector scalar 都受益**)+ vector debarrier(seed/restore/LSE 的 glue barrier)。先 profile 再定。
+
+### 0.6.3 C3 = L0C ping-pong(M-tiling)已实现(2026-06-17,construct + 2 轮对抗审 + 我审,待容器验)
+
+> **C2 平 → 第二次 re-profile(swa,post-C2)实锤真瓶颈**:cube aicore_time 3047us(util 96.7%,长板),scalar 1577us(51%,C2 后**几乎没变** 1584→1577,证实 gather 不是 scalar 大头);mte2 820→754(C2 唯一效果)。cube pipe **和 126%**(C1 让它们真重叠了),但 cube 时间没怎么降——因为**单块 128KB L0C 逼着 MAD/FIX 串行**(acc_o[64,512]=128KB 占满 L0C,acc_s 只能别名它,故 MM1/MM2 整条 gemm→copy 链串行)。Ascend C 用 **2×64KB L0C ping-pong**(`cL0BufIter%2`,swa_block_cube.h:560)让 copy(FIX)叠到下个 gemm(MAD)下——这是我们最大的结构性差异。
+
+**关键障碍 + 解法**:Ascend C 靠 **D-tiling**(D_SPLIT=256)切出 64KB L0C tile。但 **TileLang `gemm_v0` 不切操作数**(kernel.py:246,N 从 output C 的 shape 推、要 B 的 N=output N)→ D-tiling 需要 D-切的 strided kv 操作数,gemm_v0 不吃(要么 KV D-split 大改+撤销 C2,要么改编译器)。**解 = 改用 M-tiling(切 heads)**:P@V 的 output acc_o[64,512] 按 head 切成 acc_o_a[0:32]、acc_o_b[32:64](各 [32,512]=64KB,正好一个 slot),A 操作数 `p_lo[0:32,:]`/`p_lo[32:64,:]` 是**连续行切片**(gemm_v0 吃,reviewer 读 codegen 确认 offset/M-from-C 都对)。**免编译器改、保住 C2、不碰 KV load**。MM1 用 acc_s_lo/acc_s_hi 当两个 ping-pong output(本就两个 [64,64])。
+
+**实现**:L0C 两 slot acc_s_a/acc_o_a@0、acc_s_b/acc_o_b@64KB(slot 内 acc_s⊂acc_o 别名,disjoint MM1/MM2 phase)。flag:per-slot RAW(m→fix eid{0=A,1=B}:copy 等 gemm)+ WAR(fix→m eid{0=A,1=B}:下个 gemm 等本 slot 上次 copy),pre-set 两 WAR、loop 后 drain 两个。**替掉旧 BACK_LC**(acc_s/acc_o 不再别名一块串行 buffer,改 2-slot ping-pong)。BACK1/load-RAW/p-load-RAW 不动。groups 顺序 MM1_lo(A)/MM1_hi(B)/MM2_m0(A)/MM2_m1(B)→相邻 group 不同 slot→copy 叠下个 gemm。
+
+**对抗审(2 reviewer + 我)**:① flag 平衡/死锁:全 (src,dst,eid) set==wait,gap/冷启/空核全过,无环;唯一 load-bearing 前提 N0==N1==N2(+2 epilogue 保证)。② 正确性 5 项全 PASS——M-tiling 重构出与旧 acc_o[0:64] 字节同一;slot 内 acc_s⊂acc_o 别名被 per-slot WAR 完整覆盖(gate 整 slot 非字节范围);**gemm_v0 M-slice(p_lo[32:64,:] 非零起点连续行切片)reviewer 读 codegen 确认对**(_retrieve_ptr offset=2048→GetSliceInfo 出 [32,64]→CreateCubeVariable base+offset,M 从 C 取);残留只是「静态确认非编译确认」,容器一跑即知。
+
+**预期**:copy(FIX,大头是 acc_o[*,512] 的 O 写)叠到 MAD 下 → cube 往 vector floor(~2407us)掉 → swa 45→~52-54。**scalar 51% 仍在**(C3 不碰 decode),到 80 还要 decode-carry + vector。砸了(hang→flag;红→M-tiling 地址/gemm_v0 M-slice;尤其若 build error 提示 gemm operand)回退本 commit(只动 swa cube L0C/MM1/MM2)。
 
 ## 0.5 UPDATE 2026-06-16：S3a 前提证伪 → 改做 Q4（debarrier+双缓冲），已 push 待验
 
