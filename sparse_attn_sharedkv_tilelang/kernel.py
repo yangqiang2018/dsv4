@@ -2079,6 +2079,24 @@ def build_sparse_attn_sharedkv(
                     #     replicated per slot.)
                     T.set_flag("fix", "m", 0)  # BACK_A pre-set (L0C slot A @0)
                     T.set_flag("fix", "m", 1)  # BACK_B pre-set (L0C slot B @64KB)
+                    # PROBE (cube scalar): for batch==1 (single sequence) b_safe
+                    # is 0 for every in-range pid (in_range forces pid <
+                    # linear_end <= max_seq, so pid//max_seq == 0), making
+                    # actual_q_len / actual_kv_len / q_prefix loop-invariant. The
+                    # gloop otherwise reloads 5 scalar GM values per step (act_q
+                    # for g/g-1/g-2 + act_kv + q_prefix). profile shows cube is the
+                    # gate (cube_utilization ~95% vs vector ~72% busy); this hoist
+                    # tests whether the cube scalar pipe (GM-load) is on the
+                    # critical path -- if swa moves, a big cube-scalar cut (the
+                    # fork unitFlag) is worth it; if flat (like C2), the scalar
+                    # cost is the software flags and only the fork removes it.
+                    # (batch==1 is the perf scenario; would be generalized to
+                    # within-batch cores if it pays. Cube-only on purpose, to
+                    # isolate the cube pipe.)
+                    if batch == 1:
+                        act_q_h = actual_q_len[0]
+                        act_kv_h = actual_kv_len[0]
+                        qp_h = q_prefix[0]
                     for g in T.serial(total_work + 2):
                         # ---- decode(g) (OOB-safe; off = g >= 0 always) ----
                         pid0 = linear_start + g
@@ -2091,10 +2109,10 @@ def build_sparse_attn_sharedkv(
                         )
                         b0_safe = T.if_then_else(in_range0, pid0 // max_seq, 0)
                         s0 = pid0 % max_seq
-                        act_q0 = actual_q_len[b0_safe]
-                        act_kv0 = actual_kv_len[b0_safe]
+                        act_q0 = act_q_h if batch == 1 else actual_q_len[b0_safe]
+                        act_kv0 = act_kv_h if batch == 1 else actual_kv_len[b0_safe]
                         valid0 = T.if_then_else(in_range0, s0 < act_q0, False)
-                        t0 = q_prefix[b0_safe] + s0
+                        t0 = (qp_h if batch == 1 else q_prefix[b0_safe]) + s0
                         s_global0 = act_kv0 - act_q0 + s0
                         ori_left0_raw = s_global0 - ori_win_left
                         ori_left0 = T.if_then_else(ori_left0_raw < 0, 0, ori_left0_raw)
@@ -2111,7 +2129,7 @@ def build_sparse_attn_sharedkv(
                         )
                         b1_safe = T.if_then_else(in_range1, pid1 // max_seq, 0)
                         s1 = pid1 % max_seq
-                        act_q1 = actual_q_len[b1_safe]
+                        act_q1 = act_q_h if batch == 1 else actual_q_len[b1_safe]
                         valid1 = T.if_then_else(in_range1, s1 < act_q1, False)
                         # ---- decode(g-2): only valid2 is needed, to gate the
                         # BACK1 WAR wait by the same slot (g-2) that its set used
@@ -2126,7 +2144,7 @@ def build_sparse_attn_sharedkv(
                         )
                         b2_safe = T.if_then_else(in_range2, pid2 // max_seq, 0)
                         s2 = pid2 % max_seq
-                        act_q2 = actual_q_len[b2_safe]
+                        act_q2 = act_q_h if batch == 1 else actual_q_len[b2_safe]
                         valid2 = T.if_then_else(in_range2, s2 < act_q2, False)
 
                         # ---- BACK1 WAR wait: step g's MTE2 loads must not
