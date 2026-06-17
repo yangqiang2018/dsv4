@@ -2149,41 +2149,81 @@ def build_sparse_attn_sharedkv(
                             # (ori_block_size / BI_half are compile-time ints, so the
                             # guard picks ONE path -- no runtime branch, no IR bloat.)
                             if ori_block_size >= BI_half:
-                                for half in range(2):
-                                    kv_buf = kv_lo if half == 0 else kv_hi
-                                    g0 = ori_left0 + half * BI_half
-                                    bidx0 = g0 // ori_block_size
-                                    rowc0 = g0 % ori_block_size
-                                    n_in_blk0 = ori_block_size - rowc0
-                                    if n_in_blk0 >= BI_half:
-                                        T.copy(
-                                            ori_KV[
-                                                ori_block_table[b0_safe, bidx0],
-                                                rowc0 : rowc0 + BI_half,
-                                                0,
-                                                :,
-                                            ],
-                                            kv_buf[pa, 0:BI_half, :],
-                                        )
-                                    else:
-                                        T.copy(
-                                            ori_KV[
-                                                ori_block_table[b0_safe, bidx0],
-                                                rowc0 : rowc0 + n_in_blk0,
-                                                0,
-                                                :,
-                                            ],
-                                            kv_buf[pa, 0:n_in_blk0, :],
-                                        )
-                                        T.copy(
-                                            ori_KV[
-                                                ori_block_table[b0_safe, bidx0 + 1],
-                                                0 : BI_half - n_in_blk0,
-                                                0,
-                                                :,
-                                            ],
-                                            kv_buf[pa, n_in_blk0:BI_half, :],
-                                        )
+                                # Hand-unrolled per half: a `for half in range(2)`
+                                # loop var is a TIR Var, so `kv_lo if half == 0
+                                # else kv_hi` would call __bool__ on the TIR expr
+                                # `half == 0` (the range-var pitfall -- py_compile
+                                # misses it, only the container parse catches it).
+                                # Bare `if cond:` on a runtime PrimExpr is fine
+                                # (the parser intercepts it); a Python ternary is
+                                # not. So spell out the lo / hi halves.
+                                # ---- lo half: rows [ori_left0, ori_left0+BI_half) ----
+                                bidx_lo = ori_left0 // ori_block_size
+                                rowc_lo = ori_left0 % ori_block_size
+                                n_lo = ori_block_size - rowc_lo
+                                if n_lo >= BI_half:
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx_lo],
+                                            rowc_lo : rowc_lo + BI_half,
+                                            0,
+                                            :,
+                                        ],
+                                        kv_lo[pa, 0:BI_half, :],
+                                    )
+                                else:
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx_lo],
+                                            rowc_lo : rowc_lo + n_lo,
+                                            0,
+                                            :,
+                                        ],
+                                        kv_lo[pa, 0:n_lo, :],
+                                    )
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx_lo + 1],
+                                            0 : BI_half - n_lo,
+                                            0,
+                                            :,
+                                        ],
+                                        kv_lo[pa, n_lo:BI_half, :],
+                                    )
+                                # ---- hi half: rows [ori_left0+BI_half, ori_left0+BI) ----
+                                g0_hi = ori_left0 + BI_half
+                                bidx_hi = g0_hi // ori_block_size
+                                rowc_hi = g0_hi % ori_block_size
+                                n_hi = ori_block_size - rowc_hi
+                                if n_hi >= BI_half:
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx_hi],
+                                            rowc_hi : rowc_hi + BI_half,
+                                            0,
+                                            :,
+                                        ],
+                                        kv_hi[pa, 0:BI_half, :],
+                                    )
+                                else:
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx_hi],
+                                            rowc_hi : rowc_hi + n_hi,
+                                            0,
+                                            :,
+                                        ],
+                                        kv_hi[pa, 0:n_hi, :],
+                                    )
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx_hi + 1],
+                                            0 : BI_half - n_hi,
+                                            0,
+                                            :,
+                                        ],
+                                        kv_hi[pa, n_hi:BI_half, :],
+                                    )
                             else:
                                 # Fallback (small paged blocks, a half could span
                                 # >2 blocks): original GATHER_ROWS=16 chunk loop,
