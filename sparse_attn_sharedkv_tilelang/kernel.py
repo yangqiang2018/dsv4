@@ -1256,9 +1256,6 @@ def build_sparse_attn_sharedkv(
                 with T.Scope("C"):
                     T.set_flag("fix", "m", 0)
                     T.set_flag("fix", "m", 1)
-                    act_q_h = actual_q_len[0]
-                    act_kv_h = actual_kv_len[0]
-                    qp_h = q_prefix[0]
                     for g in T.serial(total_work + 2):
                         pid0 = linear_start + g
                         in_range0 = T.if_then_else(
@@ -1270,10 +1267,10 @@ def build_sparse_attn_sharedkv(
                         )
                         b0_safe = T.if_then_else(in_range0, pid0 // max_seq, 0)
                         s0 = pid0 % max_seq
-                        act_q0 = act_q_h if batch == 1 else actual_q_len[b0_safe]
-                        act_kv0 = act_kv_h if batch == 1 else actual_kv_len[b0_safe]
+                        act_q0 = actual_q_len[b0_safe]
+                        act_kv0 = actual_kv_len[b0_safe]
                         valid0 = T.if_then_else(in_range0, s0 < act_q0, False)
-                        t0 = (qp_h if batch == 1 else q_prefix[b0_safe]) + s0
+                        t0 = q_prefix[b0_safe] + s0
                         s_global0 = act_kv0 - act_q0 + s0
                         ori_left0_raw = s_global0 - ori_win_left
                         ori_left0 = T.if_then_else(ori_left0_raw < 0, 0, ori_left0_raw)
@@ -1287,7 +1284,7 @@ def build_sparse_attn_sharedkv(
                         )
                         b1_safe = T.if_then_else(in_range1, pid1 // max_seq, 0)
                         s1 = pid1 % max_seq
-                        act_q1 = act_q_h if batch == 1 else actual_q_len[b1_safe]
+                        act_q1 = actual_q_len[b1_safe]
                         valid1 = T.if_then_else(in_range1, s1 < act_q1, False)
                         pid2 = linear_start + g - 2
                         in_range2 = T.if_then_else(
@@ -1299,7 +1296,7 @@ def build_sparse_attn_sharedkv(
                         )
                         b2_safe = T.if_then_else(in_range2, pid2 // max_seq, 0)
                         s2 = pid2 % max_seq
-                        act_q2 = act_q_h if batch == 1 else actual_q_len[b2_safe]
+                        act_q2 = actual_q_len[b2_safe]
                         valid2 = T.if_then_else(in_range2, s2 < act_q2, False)
 
                         if valid2:
