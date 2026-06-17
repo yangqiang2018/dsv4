@@ -2077,7 +2077,7 @@ def build_sparse_attn_sharedkv(
 
                         # ---- MM1(g): Q@K^T of slot g ----
                         if valid0:
-                            T.copy(Q[t0, 0:n_heads, 0:D], q_l1[g % 2])
+                            T.copy(Q[t0, 0:n_heads, 0:D], q_l1[g % 2, :, :])
                             T.barrier_all()
                             pa = g % 2
                             # CUBE-DIRECT KV (AscendC form): SWA's single ori
@@ -2188,7 +2188,7 @@ def build_sparse_attn_sharedkv(
                             # commentary). Cube pipe flags live on AIC, disjoint
                             # from the V-scope's AIV flag ids.
                             T.gemm_v0(
-                                q_l1[g % 2],
+                                q_l1[g % 2, :, :],
                                 kv_lo[pa, :, :],
                                 acc_s_l0c,
                                 transpose_B=True,
@@ -2203,7 +2203,7 @@ def build_sparse_attn_sharedkv(
                             T.set_flag("fix", "m", 1)  # copy_lo -> gemm_hi WAR
                             T.wait_flag("fix", "m", 1)
                             T.gemm_v0(
-                                q_l1[g % 2],
+                                q_l1[g % 2, :, :],
                                 kv_hi[pa, :, :],
                                 acc_s_l0c,
                                 transpose_B=True,
