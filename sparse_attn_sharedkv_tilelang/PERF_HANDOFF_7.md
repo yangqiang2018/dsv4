@@ -8,7 +8,7 @@
 - **目标（用户北极星）**：复刻 Ascend C 这个算子的计算逻辑 + 性能方案，让 swa 前向做到 AscendC 的 **80–100%**。Ascend C 源码是蓝本，别发明 kernel 侧小技巧；过不去改 fork 编译器（`yangqiang2018/tilelang-ascend`，NPU 验过的成功改动打 `cfeat-*` annotated tag，攒着提上游 issue）。
 - **诚实天花板**：vector 侧便宜刀**已用尽**（brcb/row_muls rescale、SoftmaxFlashV2 fused softmax 都 NPU 验过 = perf 中性，见 _6 §3.6/3.7）。**~50% 是 kernel 侧天花板**。破它只剩 **C（跨-slot 软件流水）**。**注意：即使 C 全成也就 ~55，够不着北极星 80**——80 还得叠 cube 侧（_6 §3.5② L1-ring 预取，又一大改）。**用户已知情拍板「硬上 C」**（知道 ~16-25 容器轮、最好 ~55、砸了全回退）。
 - **perf 现状**：swa **35.6** / cfa **42.3** / scfa 15.0（S1+S2 后）。**比 C 前 baseline swa 42.4 / cfa 49.9 降了 ~7**——这是 S1 把 acc_o 挪 GM 的纯 DMA 成本，**所有恢复+增益押在 S3**。
-- **进度**：S1✅ S2✅ Q4✅ S3b✅(swa35→41.3) **C1 cube debarrier✅(41.3→45.3,+4,过baseline)** C2 bulk KV gather✅但**perf平**(→45.1,保留:更像 Ascend C 的 bulk DataCopy) **C3=L0C ping-pong(M-tiling)❌回退(45→42,−3)**。**当前 swa≈45(C2 态,kernel revert 回 617af1d)**。**关键转折/结论**:kernel 层微调已**见顶 ~45**(C1 是主要增益;C2 平;C3 regression)。真瓶颈=C1 让 cube pipe 真重叠后**暴露的单块 128KB L0C 串行 MAD/FIX**;Ascend C 用 2×64KB L0C ping-pong(gemm 内部跨 N/K-tile)。**但 `gemm_v0` 是黑盒、不暴露 intra-gemm L0 ping-pong → kernel.py 够不着 → 追 Ascend C 必须改编译器(method 第③步)**。**已暂停等用户拍板**(见 §0.6.4)。
+- **进度**：S1✅ S2✅ Q4✅ S3b✅(swa35→41.3) C1 cube debarrier✅(→45.3,+4,过baseline) C2 bulk KV gather✅平(→45.1) C3 L0C ping-pong **M-tiling❌回退**(45→42) → **改 kernel-first L0C ping-pong(N 轴,非 M 轴)**:**C4=MM1 L0C 2-slot ping-pong ✅ 容器验绿(45.1→46.5,+1.4)**。**当前 swa=46.5(green,已 push 2c3e871)**。**下一步=N-tile MM2(把 128KB acc_o 切 D=512→2×256=64KB×2,放进 C4 已建好的 2 slot,ping-pong O-drain;这是真正的大头,见 §0.6.4)**。**关键复盘(Plan agent 读 fork codegen+蓝本)**:① 编译器 gemm **已经 L0A/L0B ping-pong**(common.h:572-631);② cube 串行的真因=单块/别名 L0C + 每-gemm FIX-drain barrier;③ **C3 错在 M 轴**(M=32 gemm 低效),正解是 **N 轴**(保 M=64);④ MM2 的 acc_o=128KB 占满 L0C 是结构墙,N-tile 才能 ping-pong;⑤ 编译器 `gemm_v0_pp`(unitFlag-drain)单独天花板 ~50-58%,**暂缓**(用户要先看设计;设计已在 §0.6.4),N-tile MM2 是 kernel 层、优先。
 
 ## 0.6 S3b 设计已定案（2026-06-16，Plan agent 读真源码 + 我审核）—— 纯 kernel 重写、无需改编译器、分阶段把 all-or-nothing 收敛到一步
 
@@ -101,7 +101,21 @@
 
 **提议的编译器改(fork `tilelang-ascend`,method 第③④步,兼容性 additive)**:给 `gemm_v0` 加一个 **pipelined 变体**(或 flag/参数),让它内部做 Ascend C 式的 L0A/L0B/L0C 2×64KB ping-pong + N/K-tile 流水(复刻 `swa_block_cube.h` 的手写 gemm)。这样单次 `T.gemm_v0_pp(...)` 就能 intra-gemm 重叠 MTE1/MAD/FIX,cube 往 vector floor 掉。NPU 验过打 `cfeat-gemm-l0-pingpong` tag。**风险**:动 codegen 的 gemm 发射,要保证旧 gemm_v0 路径字节不变(其它 kernel 在用)。**工作量大、需谨慎设计 + 对抗审。**
 
-**⚠️ 已暂停**:用户要求改编译器前先确认。**下一步 = 等用户拍板「上编译器改」**;若同意,先 Plan agent 读 `swa_block_cube.h` 的 gemm + fork `gemm_v0`/`ascend_gemm_v0` codegen,设计 additive 的 pipelined 变体。备选(若不上编译器):接受 ~45 收官,或回头啃 vector/decode-carry 的小钱(profile 显示 vector idle 24%、cube scalar 51%,但 cube 是长板、降 vector 不直接涨,降 scalar C2 已证基本不涨)。
+**用户拍板 = kernel-first(2026-06-17)**:不上编译器,先做 kernel 层 L0C ping-pong(N 轴)。`gemm_v0_pp` 编译器改设计保留备用(上面 + Plan agent 报告),天花板 ~50-58%、暂缓。
+
+#### 0.6.4a C4 = MM1 L0C 2-slot probe ✅ green(swa 45.1→46.5,+1.4),下一步 N-tile MM2
+
+**C4 已 ship(2c3e871,green)**:acc_s_l0c 拆成 acc_s_a@0 / acc_s_b@64KB(= 未来 N-tile 的 2 slot 地址),MM1 lo→A、hi→B,hi gemm(MAD)叠 lo copy(FIX)。BACK_LC 拆成 per-slot **BACK_A(fix,m,0)/BACK_B(fix,m,1)**,acc_o(128KB)跨两 slot 故 MM2 wait/set **两个**。每个 per-slot flag = 验证过的 BACK_LC 模式(set 在 slot 最后一次 FIX 读后、wait 在下次 MAD 写前,沿 MM1/MM2 缝交替;各自 pre-set+drain)。eid(per-direction):FIX_M{BACK_A=0,BACK_B=1};M_FIX{MM1lo=0,MM2=1,MM1hi=2};MTE2_M{MM2p=0,MM1load=3};M_MTE2{BACK1=0}。
+
+**下一步 = N-tile MM2(真正大头,kernel 层)**:现在 MM2 是 `gemm(p_lo,kv_lo[pb],acc_o[64,512],init=T)+gemm(p_hi,kv_hi[pb],acc_o,init=F)→copy_o(acc_o→ws_o,128KB FIX,最大单笔)`。改:把 acc_o 切成 **acc_o_0[64,256]@slot A(0)、acc_o_1[64,256]@slot B(64KB)**(各 64KB,正好 C4 的两 slot)。
+```
+# dtile 0 -> slot A:   acc_o_0 = p_lo@kv_lo[:,0:256] + p_hi@kv_hi[:,0:256]
+# dtile 1 -> slot B:   acc_o_1 = p_lo@kv_lo[:,256:512] + p_hi@kv_hi[:,256:512]
+# copy_o_0(acc_o_0→ws_o[...,0:256]) 叠 dtile1 的 gemm(MAD);copy_o_1 叠下步 MM1
+```
+每 dtile 的 acc_o WAR 用它那 slot 的 BACK_A/BACK_B(C4 已建)。MM2 不再 wait/set **两个**、而是每 dtile 各 wait/set **它自己那一个**(回到 BACK_LC-per-slot 的干净交替;MM1 仍 lo→A/hi→B)。**保 M=64**(不重蹈 C3 的 M=32)。
+- **⚠️ 操作数坑(实现前必看)**:gemm B = `kv_lo[pb, :, 0:256]`(D-slice)。`gemm_v0`(`ascend.py`,非 pto)只吃 `Buffer`/`BufferRegion`;**前导标量索引**才出 BufferRegion(`kv_lo[pb,:,:]` 行),纯 range-slice 出 BufferLoad 被拒(C3 踩过 `p_lo[0:32,:]`)。`kv_lo[pb,:,0:256]` 有前导标量 pb——**大概率是 BufferRegion**(降 1 维),但**没验过**,容器一跑即知。若被拒(BufferLoad):把 kv reshape 成 `[2,2,BI_half,256]`(parity,dtile,K,N)、gather 时按 dtile 拆 D 写入(T.copy 吃 D-slice 源),gemm 用 `kv_lo[pb,dtile,:,:]`(前导标量→BufferRegion);代价=KV load 翻倍 mte2。acc_o_0/acc_o_1 是整块 buffer(C 操作数,免坑)。ws_o copy 也 D-slice(`ws_o[...,0:256]`,T.copy 吃)。
+- **预期**:copy_o 的 128KB FIX 大头叠到 MAD 下 + 叠下步 MM1 → cube 往 vector floor(~2407us)掉 → swa 46.5→~52-58?(诚实:到 80 可能还需 gemm_v0_pp + vector;N-tile 是最大单刀)。**风险**:操作数形(build,易判)、flag(每 dtile 的 BACK 交替,沿用 C4 已验模式)、数值(decode/dtype0 gate)。砸了回退本 commit(C4 态 46.5 仍是新高)。
 
 ## 0.5 UPDATE 2026-06-16：S3a 前提证伪 → 改做 Q4（debarrier+双缓冲），已 push 待验
 
