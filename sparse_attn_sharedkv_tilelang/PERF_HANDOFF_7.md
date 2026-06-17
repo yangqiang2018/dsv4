@@ -8,7 +8,7 @@
 - **目标（用户北极星）**：复刻 Ascend C 这个算子的计算逻辑 + 性能方案，让 swa 前向做到 AscendC 的 **80–100%**。Ascend C 源码是蓝本，别发明 kernel 侧小技巧；过不去改 fork 编译器（`yangqiang2018/tilelang-ascend`，NPU 验过的成功改动打 `cfeat-*` annotated tag，攒着提上游 issue）。
 - **诚实天花板**：vector 侧便宜刀**已用尽**（brcb/row_muls rescale、SoftmaxFlashV2 fused softmax 都 NPU 验过 = perf 中性，见 _6 §3.6/3.7）。**~50% 是 kernel 侧天花板**。破它只剩 **C（跨-slot 软件流水）**。**注意：即使 C 全成也就 ~55，够不着北极星 80**——80 还得叠 cube 侧（_6 §3.5② L1-ring 预取，又一大改）。**用户已知情拍板「硬上 C」**（知道 ~16-25 容器轮、最好 ~55、砸了全回退）。
 - **perf 现状**：swa **35.6** / cfa **42.3** / scfa 15.0（S1+S2 后）。**比 C 前 baseline swa 42.4 / cfa 49.9 降了 ~7**——这是 S1 把 acc_o 挪 GM 的纯 DMA 成本，**所有恢复+增益押在 S3**。
-- **进度**：S1✅ S2✅ Q4✅ S3b✅(swa35→41.3) C1 cube debarrier✅(→45.3,+4,过baseline) C2 bulk KV gather✅平(→45.1) C3 L0C ping-pong **M-tiling❌回退**(45→42) → **改 kernel-first L0C ping-pong(N 轴,非 M 轴)**:**C4=MM1 L0C 2-slot ping-pong ✅ 容器验绿(45.1→46.5,+1.4,push 2c3e871)** → **C5=N-tile MM2 + MM1 K-split(D-split 全重写)📝 已写完待容器验(本次)**。**关键发现(读蓝本 block_cube.h + fork common.h gemm_v0)**:**N-tile MM2 与 MM1 K-split 是绑定的、不可能"只动 MM2"**——kv 被 MM1(score,D 是 K 收缩维,transpose_B)和 MM2(P@V,D 是 N 输出维)共用,N-tile MM2 要按 D 切 kv 成 dense [rows,256] 块,而 `gemm_v0` 只吃 (M,N,K) 无独立 stride → kv 必须 D-split 存 L1 → 逼 MM1 也按 D K-split 累加。**这正是 Ascend C 真实结构**(`K_L1_SPLIT_SIZE=256` MM1 K 切 2×256 累加进 1 个 L0C slot 跨调用 ping-pong;`D_SPLIT_SIZE=256` MM2 输出 D 切 2×256 各进一 slot;Q/K/V 在 L1 都 nd2nz D-split,`dValue=256/srcDValue=512`)。**C5 改动**:q_l1/kv_lo/kv_hi reshape 成 `[parity,dtile(2),rows,256]`(同字节、dtile-major 重排,L1 地址不变);gather 每段写 2 次(D[0:256]→[*,0]、D[256:512]→[*,1]);MM1 lo/hi 各按 dtile 累加(2 gemm,init=T/F,MAD 总数同 C4——gemm_v0 内部 K-tile 128,2×K256==1×K512);MM2 dtile0→acc_o_0@slotA、dtile1→acc_o_1@slotB(各 64KB),**per-dtile gemm→copy**,copy_o_0(FIX,slotA)叠 dtile1 gemm(MAD,slotB)+叠下步 MM1 lo(只等 BACK_A 不等 copy_o_1)。保 M=64。flag 沿用 C4 的 per-slot BACK_A(fix,m,0)/BACK_B(fix,m,1)对称链;M_FIX eid:MM1lo=0/MM2d0=1/MM1hi=2/MM2d1=3。**预期**:128KB copy_o 大头拆 2×64KB 与 MAD 流水 → cube 往 vector floor 掉 → 46.5→~52-58?(到 80 仍可能需 gemm_v0_pp + vector)。**风险(只容器暴露)**:① T.copy 吃 GM D-slice 源(realSrcN=512/tile=256,模板 copy_gm_to_l1 line88 支持,蓝本同款,但 codegen 是否正确传 realSrcN 没本地验);② D-split gemm 操作数(`kv_lo[pb,0,:,:]` 前导标量→BufferRegion[64,256],应过);③ 数值(K-split/N-split 重组,decode/dtype0 gate)。砸了回退本 commit(C4 态 46.5 仍是新高)。详见 §0.6.4b。
+- **进度**：S1✅ S2✅ Q4✅ S3b✅(swa35→41.3) C1 cube debarrier✅(→45.3,+4,过baseline) C2 bulk KV gather✅平(→45.1) C3 L0C ping-pong **M-tiling❌回退**(45→42) → **改 kernel-first L0C ping-pong(N 轴,非 M 轴)**:**C4=MM1 L0C 2-slot ping-pong ✅ 容器验绿(45.1→46.5,+1.4,push 2c3e871)** → **C5=N-tile MM2 + MM1 K-split(D-split 全重写)✅容器验绿但 −2(46.5→44.5),已回退到 C4**。**当前 swa=46.5(C4,kernel.py 回退到 ca7a77f)**。**🔑 C5 profile 颠覆了整条 matmul-tiling 路线(C3/C4/C5/unitFlag 全瞄错 pipe)**:msprof(swa,稳态)cube aicore=3179us,各 pipe:**scalar 49%(1557us,最大)/ mte2 24.7%(785)/ mte1 17.8%(566)/ fixpipe 17.5%(555)/ mac 仅 15.5%(492)**;**vector aiv=3244us ≈ cube,还略高**。**结论**:① cube **不是 compute-bound**(mac 只 15.5%,矩阵单元 84% 空转)——L0C ping-pong/N-tile/unitFlag 优化的是 mac+fix(合 33%),**搬的不是瓶颈**;② **unitFlag 收益≈0**:它让 mac(492)∥fix(555) 重叠最多省 ~492 → cube 3179→2687,但 **vector 3244 是长板**,cube 降下去仍被 vector 卡 → kernel 不动(**profile 省了一次零收益改编译器**);③ **C5 −2 因**给 scalar(49%)+mte2(24.7%) 已吃紧的 cube 又加 scalar(4 个额外 gemm 的 flag 发射)+mte2(gather 翻倍),加错 pipe。**真瓶颈=cube scalar(控制/flag 发射/decode 49%)+ mte2(KV gather 24.7%),且 vector≈cube 平衡在 ~3200us**(吻合 memory 早判的 ~50% kernel 天花板)。**下一步候选(全是没碰过的 pipe)**:① 削 cube scalar(C1 debarrier 加了大量精确 flag,每个 set/wait 都是 scalar 发射;decode 每步 g/g-1/g-2 算 3 遍)②查 mte2 是不是 sliding-window 跨步重复载 KV(可复用?)③ vector(cheap 刀已尽,memory)。详见 §0.6.4b/§0.6.4c。
 
 ## 0.6 S3b 设计已定案（2026-06-16，Plan agent 读真源码 + 我审核）—— 纯 kernel 重写、无需改编译器、分阶段把 all-or-nothing 收敛到一步
 
@@ -138,6 +138,28 @@
 **本地已验**:py_compile + ruff + 操作数形分析(全是整块 Buffer 或前导标量 BufferRegion[64,256/64])+ flag 平衡(每 eid block 内或跨步配平)+ 蓝本忠实度。**只容器能验**:① T.copy 的 GM D-slice 源 codegen 是否正确传 realSrcN=512(模板支持、蓝本同款、但没本地跑过);② D-split gemm 操作数被接受;③ 数值(decode/dtype0)。**风险=build(操作数/D-slice)易判,deadlock(flag 同构 C4,低),数值(K/N-split 重组,中)**。砸了回退 → C4 态 swa 46.5 仍新高。
 
 **下一步(C5 验绿后)**:re-profile 看 cube 是否往 vector floor 掉、瓶颈搬哪;若 swa 仍 <60 且 cube 仍长板 → 评估 `gemm_v0_pp`(unitFlag-drain,§0.6.4,需用户确认才动 fork)或 vector debarrier。CFA(43.6,<baseline 49.9)仍走旧 prim_func 未上流水。
+
+#### 0.6.4c C5 容器验证 = green 但 −2 + profile 颠覆 matmul 路线（2026-06-17，重大转折）
+
+**C5 容器结果**:fast✅ decode/dtype0✅(数值对、不死锁) 但 **swa 46.5→44.5(−2)**,cfa 43.9,scfa 15.4。**已回退 kernel.py 到 C4(ca7a77f),swa 恢复 46.5。** 数值正确证明 D-split 全套(gather D-split / MM1 K-split / MM2 N-split / per-slot flag)逻辑无误——**纯粹是优化错 pipe**。
+
+**msprof PipeUtilization(swa_prefill,C5 态,稳态行 task 77)**:
+```
+cube aicore=3179us  mac 492(15.5%)  scalar 1557(49.0%)  mte1 566(17.8%)  mte2 785(24.7%)  fixpipe 555(17.5%)  util 95%
+vector aiv =3244us  vec 1015(31.3%)  scalar 834(25.7%)  mte2 319(9.8%)  mte3 237(7.3%)   [busy 2405,idle ~840=等 cube cross-flag]
+task duration ~3338us
+```
+**关键读数**:
+1. **cube mac 仅 15.5%** → 矩阵单元 84% 空转,cube **绝不是 compute-bound**。我们 C3(M-tile)/C4(MM1 2-slot)/C5(N-tile MM2)/想做的 unitFlag(gemm_v0_pp)**全在优化 mac+fixpipe(合 33%)= 非瓶颈**。这解释了为何 C3 −3、C5 −2、C4 仅 +1.4——**matmul-tiling 整条路线方向错了**。
+2. **cube scalar 49%(1557us)= 最大单 pipe**。这是控制开销:每步 decode 算 g/g-1/g-2 三遍(各 ~6-8 个 if_then_else/div/mod)、**每个 flag set/wait/cross-flag 都是一条 scalar 发射指令**(C1 debarrier 为去 barrier 加了大量精确 flag)、每个 copy/gemm 发射。C2 当年削 gather 的 div/mod 却 flat,正因 div/mod 只是 49% 里的一小块,大头是 **flag 发射 + decode 冗余**。
+3. **cube(3179)≈vector(3244),vector 还略高 → vector 是(微弱)长板**。意味着任何纯 cube 优化(包括 unitFlag,即便让 mac∥fix 完美重叠省 ~492us → cube 2687)**都被 vector 3244 卡住,kernel 一点不动**。**这是 unitFlag 收益≈0 的硬证据,profile 救了一次零收益的 fork 改动**(用户「先 profile」的判断正确)。
+4. vector busy 2405 + idle ~840(等 cube 的 SCORE_READY/PV_READY)。cube↔vector 已基本重叠(kernel 3338 ≈ max(3179,3244)+bubble)。
+
+**战略转向(matmul 路线作废)**:真瓶颈 = **cube scalar(49%,控制/flag/decode)+ cube mte2(24.7%,KV gather)**,且 **vector 与 cube 平衡在 ~3200us**(= memory 早判的 ~50% kernel 天花板)。破它要同时砍两边、或砍正确的 pipe。**没碰过的候选刀**:
+- **A. 削 cube scalar(最大、最可能)**:① flag 瘦身——C1 debarrier 加的精确 flag 可能过多(scalar 发射爆表),评估哪些 barrier_all 其实更便宜(barrier 1 条 vs 多条 set/wait);② decode 去冗余——每步 g/g-1/g-2 算 3 遍 decode,g-1 这步==g 上步,可跨迭代 carry(寄存器/UB)省 2/3;③ gather 索引预算/外提。**风险**:scalar 是否真在临界路径需再 profile 验(C2 教训:削错了部分 = flat)。
+- **B. 查 mte2(24.7%)KV 重复载**:SWA 滑窗每步移 1 token、KV 块 128 宽 → 连续步窗口重叠 ~127/128,**可能每步重载几乎相同的 KV**。Ascend C 是否滚动复用?若能跨步复用 KV → 砍 mte2 大头。读蓝本确认。
+- **C. vector**:cheap 刀(brcb/row_muls/SoftmaxFlashV2)已尽(memory),vec 31% 硬;但 vector scalar 25.7% 同样是 flag/控制,可同 A 思路瘦身;idle 840us 是 cube↔vector 同步 bubble,改善重叠深度可削。
+- **诚实**:cube/vector 双 ~3200 平衡平台 = ~46-50%,与 memory 预判一致。**破到 60+ 需同时砍 cube scalar + mte2,且很可能 vector 也要动**(组合拳)。先 Plan-agent 读全代码定位 49% cube scalar 的确切来源 + B 的 KV 复用可行性,再定刀。**不再碰 matmul-tiling / unitFlag(已证非瓶颈)。**
 
 ## 0.5 UPDATE 2026-06-16：S3a 前提证伪 → 改做 Q4（debarrier+双缓冲），已 push 待验
 
