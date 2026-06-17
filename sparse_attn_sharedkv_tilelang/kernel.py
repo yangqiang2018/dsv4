@@ -181,6 +181,15 @@ def build_sparse_attn_sharedkv(
     # Ramp ("int() argument ... not 'Var'"). Each cube gemm processes one
     # [BI_half, D] = 64KB KV half so the operand fits the 64KB L0B.
     BI_half = BI // 2  # 64
+    # D-half = MM2 output N-tile / MM1 K-tile width (AscendC D_SPLIT_SIZE=256).
+    # The shared KV buffer can't be both row-contiguous (MM1 wants D as the K
+    # contraction) and D-tile-contiguous (MM2 wants D as the N output), so --
+    # exactly as Ascend C -- KV/Q live in L1 D-split ([.., dtile, rows, D_HALF])
+    # and MM1 K-accumulates over the 2 D-tiles while MM2 N-splits the O across
+    # them. Each [H, D_HALF] / [BI_half, D_HALF] tile is half a 64KB L0C slot's
+    # worth, letting the two MM2 D-tiles ping-pong the L0C drain (the 128KB
+    # acc_o that filled both slots was the structural wall to overlap).
+    D_HALF = D // 2  # 256
     # CFA: the cmp indices are the dense range [0, topk_cmp); the kernel
     # generates them per chunk with createvecindex instead of reading a
     # host-synthesized cmp_indices array (mirrors the Ascend C CFA path).
@@ -1917,19 +1926,29 @@ def build_sparse_attn_sharedkv(
                 # gemm operands. L1 repacked so nothing overlaps: q_l1 @0
                 # (128KB), kv_lo @128KB, kv_hi @256KB, p_lo @384KB, p_hi @392KB
                 # -> 400KB <= 512KB.
-                q_l1 = T.alloc_L1([2, H_per_block, D], dtype)
-                kv_lo = T.alloc_L1([2, BI_half, D], dtype)
-                kv_hi = T.alloc_L1([2, BI_half, D], dtype)
+                # D-split L1 (AscendC layout): leading [parity, dtile] selectors,
+                # then the [rows, D_HALF] matrix tile. Same bytes as the old
+                # [2, *, D] (a dtile-major re-view), so the L1 addresses below are
+                # unchanged; only the gemm operands index a dtile.
+                q_l1 = T.alloc_L1([2, 2, H_per_block, D_HALF], dtype)
+                kv_lo = T.alloc_L1([2, 2, BI_half, D_HALF], dtype)
+                kv_hi = T.alloc_L1([2, 2, BI_half, D_HALF], dtype)
                 p_lo = T.alloc_L1([H_per_block, BI_half], dtype)
                 p_hi = T.alloc_L1([H_per_block, BI_half], dtype)
                 # L0C 2-slot ping-pong (replicate Ascend C cL0BufIter%2): slot A
                 # @0, slot B @64KB. MM1's lo/hi score gemms write acc_s_a / acc_s_b
-                # so the hi gemm (MAD) overlaps the lo copy (FIX) instead of
-                # serializing on one acc_s. acc_o_l0c (128KB) still spans BOTH
-                # slots for now; N-tiling it into the two 64KB slots is next.
+                # (slot A / B). MM2's O is N-tiled across D into acc_o_0 (slot A) /
+                # acc_o_1 (slot B) -- each [H, D_HALF] = 64KB fills one slot, so
+                # the dtile0 copy (FIX, slot A) overlaps the dtile1 gemm (MAD, slot
+                # B) and the next step's MM1, instead of the old 128KB acc_o (which
+                # spanned BOTH slots and forced copy_o to fully drain before any
+                # next-block MAD). acc_s_a aliases acc_o_0 (both slot A) and acc_s_b
+                # aliases acc_o_1 (both slot B): disjoint phases (MM1 then MM2),
+                # the per-slot BACK_A/BACK_B WAR flags serialize the alias seam.
                 acc_s_a = T.alloc_L0C([H_per_block, BI_half], accum_dtype)
                 acc_s_b = T.alloc_L0C([H_per_block, BI_half], accum_dtype)
-                acc_o_l0c = T.alloc_L0C([H_per_block, D], accum_dtype)
+                acc_o_0 = T.alloc_L0C([H_per_block, D_HALF], accum_dtype)
+                acc_o_1 = T.alloc_L0C([H_per_block, D_HALF], accum_dtype)
 
                 # ---- UB (vector). ---- (SWA subset of the main kernel; see
                 # the byte-identical decls above for the full commentary.)
@@ -1985,11 +2004,15 @@ def build_sparse_attn_sharedkv(
                         kv_hi: 256 * KB,
                         p_lo: 384 * KB,
                         p_hi: 392 * KB,
-                        # L0C 2-slot ping-pong: acc_s_a @ slot A (0), acc_s_b @
-                        # slot B (64KB); acc_o spans both (0..128KB) until N-tiled.
+                        # L0C 2-slot ping-pong: slot A @0 holds acc_s_a (MM1 lo)
+                        # then acc_o_0 (MM2 dtile0); slot B @64KB holds acc_s_b
+                        # (MM1 hi) then acc_o_1 (MM2 dtile1). Aliases per slot are
+                        # safe (MM1 / MM2 are disjoint phases, BACK_A/BACK_B gate
+                        # the seam). Each O D-tile is 64KB = exactly one slot.
                         acc_s_a: 0,
                         acc_s_b: 64 * KB,
-                        acc_o_l0c: l0c_addr["acc_o_l0c"],
+                        acc_o_0: 0,
+                        acc_o_1: 64 * KB,
                         acc_o: ub_addr["acc_o"],
                         acc_s_ub: ub_addr["acc_s_ub"],
                         acc_s_ub_: ub_addr["acc_s_ub_"],
@@ -2140,7 +2163,17 @@ def build_sparse_attn_sharedkv(
 
                         # ---- MM1(g): Q@K^T of slot g ----
                         if valid0:
-                            T.copy(Q[t0, 0:n_heads, 0:D], q_l1[g % 2, :, :])
+                            # Q D-split into the 2 dtiles (AscendC kL1 layout):
+                            # q_l1[g%2, 0] gets D[0:256], q_l1[g%2, 1] gets
+                            # D[256:512]. MM1 K-accumulates over the 2 dtiles.
+                            T.copy(
+                                Q[t0, 0:n_heads, 0:D_HALF],
+                                q_l1[g % 2, 0, :, :],
+                            )
+                            T.copy(
+                                Q[t0, 0:n_heads, D_HALF:D],
+                                q_l1[g % 2, 1, :, :],
+                            )
                             pa = g % 2
                             # CUBE-DIRECT KV (AscendC form): SWA's single ori
                             # window is a CONTIGUOUS run pulled GM->L1 by the cube.
@@ -2170,15 +2203,31 @@ def build_sparse_attn_sharedkv(
                                 bidx_lo = ori_left0 // ori_block_size
                                 rowc_lo = ori_left0 % ori_block_size
                                 n_lo = ori_block_size - rowc_lo
+                                # Each row segment is gathered TWICE: source
+                                # D[0:256] -> kv_lo[pa, 0], source D[256:512] ->
+                                # kv_lo[pa, 1] -- the AscendC nd2nz dValue=256 /
+                                # srcDValue=512 D-split (CopyGmToL1 :427). T.copy's
+                                # GM->L1 path carries realSrcN (the 512-wide source
+                                # row stride) distinct from the 256-wide tile, so
+                                # the strided column read is exact.
                                 if n_lo >= BI_half:
                                     T.copy(
                                         ori_KV[
                                             ori_block_table[b0_safe, bidx_lo],
                                             rowc_lo : rowc_lo + BI_half,
                                             0,
-                                            :,
+                                            0:D_HALF,
                                         ],
-                                        kv_lo[pa, 0:BI_half, :],
+                                        kv_lo[pa, 0, 0:BI_half, :],
+                                    )
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx_lo],
+                                            rowc_lo : rowc_lo + BI_half,
+                                            0,
+                                            D_HALF:D,
+                                        ],
+                                        kv_lo[pa, 1, 0:BI_half, :],
                                     )
                                 else:
                                     T.copy(
@@ -2186,18 +2235,36 @@ def build_sparse_attn_sharedkv(
                                             ori_block_table[b0_safe, bidx_lo],
                                             rowc_lo : rowc_lo + n_lo,
                                             0,
-                                            :,
+                                            0:D_HALF,
                                         ],
-                                        kv_lo[pa, 0:n_lo, :],
+                                        kv_lo[pa, 0, 0:n_lo, :],
+                                    )
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx_lo],
+                                            rowc_lo : rowc_lo + n_lo,
+                                            0,
+                                            D_HALF:D,
+                                        ],
+                                        kv_lo[pa, 1, 0:n_lo, :],
                                     )
                                     T.copy(
                                         ori_KV[
                                             ori_block_table[b0_safe, bidx_lo + 1],
                                             0 : BI_half - n_lo,
                                             0,
-                                            :,
+                                            0:D_HALF,
                                         ],
-                                        kv_lo[pa, n_lo:BI_half, :],
+                                        kv_lo[pa, 0, n_lo:BI_half, :],
+                                    )
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx_lo + 1],
+                                            0 : BI_half - n_lo,
+                                            0,
+                                            D_HALF:D,
+                                        ],
+                                        kv_lo[pa, 1, n_lo:BI_half, :],
                                     )
                                 # ---- hi half: rows [ori_left0+BI_half, ori_left0+BI) ----
                                 g0_hi = ori_left0 + BI_half
@@ -2210,9 +2277,18 @@ def build_sparse_attn_sharedkv(
                                             ori_block_table[b0_safe, bidx_hi],
                                             rowc_hi : rowc_hi + BI_half,
                                             0,
-                                            :,
+                                            0:D_HALF,
                                         ],
-                                        kv_hi[pa, 0:BI_half, :],
+                                        kv_hi[pa, 0, 0:BI_half, :],
+                                    )
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx_hi],
+                                            rowc_hi : rowc_hi + BI_half,
+                                            0,
+                                            D_HALF:D,
+                                        ],
+                                        kv_hi[pa, 1, 0:BI_half, :],
                                     )
                                 else:
                                     T.copy(
@@ -2220,23 +2296,45 @@ def build_sparse_attn_sharedkv(
                                             ori_block_table[b0_safe, bidx_hi],
                                             rowc_hi : rowc_hi + n_hi,
                                             0,
-                                            :,
+                                            0:D_HALF,
                                         ],
-                                        kv_hi[pa, 0:n_hi, :],
+                                        kv_hi[pa, 0, 0:n_hi, :],
+                                    )
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx_hi],
+                                            rowc_hi : rowc_hi + n_hi,
+                                            0,
+                                            D_HALF:D,
+                                        ],
+                                        kv_hi[pa, 1, 0:n_hi, :],
                                     )
                                     T.copy(
                                         ori_KV[
                                             ori_block_table[b0_safe, bidx_hi + 1],
                                             0 : BI_half - n_hi,
                                             0,
-                                            :,
+                                            0:D_HALF,
                                         ],
-                                        kv_hi[pa, n_hi:BI_half, :],
+                                        kv_hi[pa, 0, n_hi:BI_half, :],
+                                    )
+                                    T.copy(
+                                        ori_KV[
+                                            ori_block_table[b0_safe, bidx_hi + 1],
+                                            0 : BI_half - n_hi,
+                                            0,
+                                            D_HALF:D,
+                                        ],
+                                        kv_hi[pa, 1, n_hi:BI_half, :],
                                     )
                             else:
                                 # Fallback (small paged blocks, a half could span
                                 # >2 blocks): original GATHER_ROWS=16 chunk loop,
-                                # each chunk spanning <=1 boundary.
+                                # each chunk spanning <=1 boundary. D-split too --
+                                # every chunk is written D[0:256] -> [pa, 0] and
+                                # D[256:512] -> [pa, 1] (compile-time dead for the
+                                # supported configs where ori_block_size >= BI_half,
+                                # but kept shape-consistent with the 4D layout).
                                 for gp in range(BI_half // GATHER_ROWS):
                                     g0 = ori_left0 + gp * GATHER_ROWS
                                     bidx = g0 // ori_block_size
@@ -2247,10 +2345,26 @@ def build_sparse_attn_sharedkv(
                                                 ori_block_table[b0_safe, bidx],
                                                 rowc : rowc + GATHER_ROWS,
                                                 0,
-                                                :,
+                                                0:D_HALF,
                                             ],
                                             kv_lo[
                                                 pa,
+                                                0,
+                                                gp * GATHER_ROWS : (gp + 1)
+                                                * GATHER_ROWS,
+                                                :,
+                                            ],
+                                        )
+                                        T.copy(
+                                            ori_KV[
+                                                ori_block_table[b0_safe, bidx],
+                                                rowc : rowc + GATHER_ROWS,
+                                                0,
+                                                D_HALF:D,
+                                            ],
+                                            kv_lo[
+                                                pa,
+                                                1,
                                                 gp * GATHER_ROWS : (gp + 1)
                                                 * GATHER_ROWS,
                                                 :,
@@ -2263,10 +2377,26 @@ def build_sparse_attn_sharedkv(
                                                 ori_block_table[b0_safe, bidx],
                                                 rowc : rowc + n0,
                                                 0,
-                                                :,
+                                                0:D_HALF,
                                             ],
                                             kv_lo[
                                                 pa,
+                                                0,
+                                                gp * GATHER_ROWS : gp * GATHER_ROWS
+                                                + n0,
+                                                :,
+                                            ],
+                                        )
+                                        T.copy(
+                                            ori_KV[
+                                                ori_block_table[b0_safe, bidx],
+                                                rowc : rowc + n0,
+                                                0,
+                                                D_HALF:D,
+                                            ],
+                                            kv_lo[
+                                                pa,
+                                                1,
                                                 gp * GATHER_ROWS : gp * GATHER_ROWS
                                                 + n0,
                                                 :,
@@ -2277,10 +2407,26 @@ def build_sparse_attn_sharedkv(
                                                 ori_block_table[b0_safe, bidx + 1],
                                                 0 : GATHER_ROWS - n0,
                                                 0,
-                                                :,
+                                                0:D_HALF,
                                             ],
                                             kv_lo[
                                                 pa,
+                                                0,
+                                                gp * GATHER_ROWS + n0 : (gp + 1)
+                                                * GATHER_ROWS,
+                                                :,
+                                            ],
+                                        )
+                                        T.copy(
+                                            ori_KV[
+                                                ori_block_table[b0_safe, bidx + 1],
+                                                0 : GATHER_ROWS - n0,
+                                                0,
+                                                D_HALF:D,
+                                            ],
+                                            kv_lo[
+                                                pa,
+                                                1,
                                                 gp * GATHER_ROWS + n0 : (gp + 1)
                                                 * GATHER_ROWS,
                                                 :,
@@ -2296,10 +2442,26 @@ def build_sparse_attn_sharedkv(
                                                 ori_block_table[b0_safe, bidx],
                                                 rowc : rowc + GATHER_ROWS,
                                                 0,
-                                                :,
+                                                0:D_HALF,
                                             ],
                                             kv_hi[
                                                 pa,
+                                                0,
+                                                gp * GATHER_ROWS : (gp + 1)
+                                                * GATHER_ROWS,
+                                                :,
+                                            ],
+                                        )
+                                        T.copy(
+                                            ori_KV[
+                                                ori_block_table[b0_safe, bidx],
+                                                rowc : rowc + GATHER_ROWS,
+                                                0,
+                                                D_HALF:D,
+                                            ],
+                                            kv_hi[
+                                                pa,
+                                                1,
                                                 gp * GATHER_ROWS : (gp + 1)
                                                 * GATHER_ROWS,
                                                 :,
@@ -2312,10 +2474,26 @@ def build_sparse_attn_sharedkv(
                                                 ori_block_table[b0_safe, bidx],
                                                 rowc : rowc + n0,
                                                 0,
-                                                :,
+                                                0:D_HALF,
                                             ],
                                             kv_hi[
                                                 pa,
+                                                0,
+                                                gp * GATHER_ROWS : gp * GATHER_ROWS
+                                                + n0,
+                                                :,
+                                            ],
+                                        )
+                                        T.copy(
+                                            ori_KV[
+                                                ori_block_table[b0_safe, bidx],
+                                                rowc : rowc + n0,
+                                                0,
+                                                D_HALF:D,
+                                            ],
+                                            kv_hi[
+                                                pa,
+                                                1,
                                                 gp * GATHER_ROWS : gp * GATHER_ROWS
                                                 + n0,
                                                 :,
@@ -2326,10 +2504,26 @@ def build_sparse_attn_sharedkv(
                                                 ori_block_table[b0_safe, bidx + 1],
                                                 0 : GATHER_ROWS - n0,
                                                 0,
-                                                :,
+                                                0:D_HALF,
                                             ],
                                             kv_hi[
                                                 pa,
+                                                0,
+                                                gp * GATHER_ROWS + n0 : (gp + 1)
+                                                * GATHER_ROWS,
+                                                :,
+                                            ],
+                                        )
+                                        T.copy(
+                                            ori_KV[
+                                                ori_block_table[b0_safe, bidx + 1],
+                                                0 : GATHER_ROWS - n0,
+                                                0,
+                                                D_HALF:D,
+                                            ],
+                                            kv_hi[
+                                                pa,
+                                                1,
                                                 gp * GATHER_ROWS + n0 : (gp + 1)
                                                 * GATHER_ROWS,
                                                 :,
@@ -2341,31 +2535,52 @@ def build_sparse_attn_sharedkv(
                             # MTE2 pipe keeps prefetching past it.
                             T.set_flag("mte2", "m", 3)
                             T.wait_flag("mte2", "m", 3)
-                            # MM1 scores into the 2 L0C ping-pong slots: lo gemm
-                            # -> acc_s_a (slot A), hi gemm -> acc_s_b (slot B).
-                            # Different buffers, so the hi gemm (MAD) issues
-                            # WITHOUT waiting for the lo copy (FIX) -- the overlap
-                            # the old single-acc_s fix/m WAR forbade.
-                            # BACK_A WAR: lo gemm (MAD) is slot A's first write;
-                            # wait its previous FIX reader (prior MM2 copy_o, or
+                            # MM1 scores into the 2 L0C ping-pong slots: lo ->
+                            # acc_s_a (slot A), hi -> acc_s_b (slot B). Different
+                            # buffers, so the hi gemm (MAD) issues WITHOUT waiting
+                            # for the lo copy (FIX). Each score is K-split over the
+                            # 2 D-tiles (AscendC kL1): score = q[*,0]@kv[*,0]^T +
+                            # q[*,1]@kv[*,1]^T, accumulated (init=True on dtile0,
+                            # init=False on dtile1, in-order on the MAD pipe -- no
+                            # barrier between, like MM2's p_lo/p_hi accumulate).
+                            # Same total MADs as the old K=512 gemm (gemm_v0
+                            # internally K-tiles at 128: 2 calls of K=256 == 1 call
+                            # of K=512), so no extra MAD work, just the D-split
+                            # layout MM2's N-tile needs.
+                            # BACK_A WAR: dtile0's lo gemm is slot A's first write;
+                            # wait its previous FIX reader (prior MM2 copy_o_0, or
                             # this slot's prior MM1 lo copy / the pre-set).
                             T.wait_flag("fix", "m", 0)
                             T.gemm_v0(
-                                q_l1[g % 2, :, :],
-                                kv_lo[pa, :, :],
+                                q_l1[g % 2, 0, :, :],
+                                kv_lo[pa, 0, :, :],
                                 acc_s_a,
                                 transpose_B=True,
                                 init=True,
                             )
+                            T.gemm_v0(
+                                q_l1[g % 2, 1, :, :],
+                                kv_lo[pa, 1, :, :],
+                                acc_s_a,
+                                transpose_B=True,
+                                init=False,
+                            )
                             T.set_flag("m", "fix", 0)  # lo gemm -> lo copy RAW
-                            # BACK_B WAR: hi gemm (MAD) is slot B's first write.
+                            # BACK_B WAR: dtile0's hi gemm is slot B's first write.
                             T.wait_flag("fix", "m", 1)
                             T.gemm_v0(
-                                q_l1[g % 2, :, :],
-                                kv_hi[pa, :, :],
+                                q_l1[g % 2, 0, :, :],
+                                kv_hi[pa, 0, :, :],
                                 acc_s_b,
                                 transpose_B=True,
                                 init=True,
+                            )
+                            T.gemm_v0(
+                                q_l1[g % 2, 1, :, :],
+                                kv_hi[pa, 1, :, :],
+                                acc_s_b,
+                                transpose_B=True,
+                                init=False,
                             )
                             T.set_flag("m", "fix", 2)  # hi gemm -> hi copy RAW
                             # lo copy (FIX) -- overlaps the hi gemm (MAD) above.
@@ -2409,34 +2624,55 @@ def build_sparse_attn_sharedkv(
                             )
                             T.set_flag("mte2", "m", 0)
                             T.wait_flag("mte2", "m", 0)
-                            # BACK_A + BACK_B WAR: acc_o (128KB) spans BOTH L0C
-                            # slots, so this first P@V gemm (MAD, init=True) waits
-                            # until BOTH slots' last FIX readers (MM1(g)'s lo & hi
-                            # copies, or the loop pre-sets if MM1(g) was skipped)
-                            # are done.
+                            # MM2 N-split over the 2 D-tiles (AscendC nL1 / D_SPLIT
+                            # ping-pong): O[:, 0:256] = p_lo@V_lo[*,0] + p_hi@V_hi[*,0]
+                            # -> acc_o_0 (slot A); O[:, 256:512] -> acc_o_1 (slot B).
+                            # V_lo / V_hi are the lo / hi BI-half rows (= kv_lo /
+                            # kv_hi, shared KV), each D-sliced by dtile. Per dtile:
+                            # gemm (MAD) then copy (FIX), so copy_o_0 (slot A) on
+                            # FIX overlaps dtile1's gemms (slot B) on MAD; and the
+                            # next step's MM1 lo gemm (slot A) waits only copy_o_0
+                            # (BACK_A set right after it), not copy_o_1. This splits
+                            # the old single 128KB copy_o -- the largest FIX, the
+                            # serial drain wall that filled both slots -- into two
+                            # 64KB copies that pipeline with the surrounding MADs.
+                            # ---- dtile0 -> acc_o_0 (slot A) ----
+                            # BACK_A WAR: acc_o_0 first write; wait slot A's last
+                            # FIX reader (MM1(g)'s lo copy, or the pre-set).
                             T.wait_flag("fix", "m", 0)
+                            T.gemm_v0(p_lo, kv_lo[pb, 0, :, :], acc_o_0, init=True)
+                            # MAD in-order: init=False accumulates right after
+                            # init=True on the same pipe, no barrier.
+                            T.gemm_v0(p_hi, kv_hi[pb, 0, :, :], acc_o_0, init=False)
+                            T.set_flag("m", "fix", 1)  # dtile0 gemms -> copy_o_0 RAW
+                            # ---- dtile1 -> acc_o_1 (slot B) ----
+                            # BACK_B WAR: acc_o_1 first write.
                             T.wait_flag("fix", "m", 1)
-                            T.gemm_v0(p_lo, kv_lo[pb, :, :], acc_o_l0c, init=True)
-                            # MAD in-order: init=False accumulates into acc_o_l0c
-                            # right after init=True on the same pipe, no barrier.
-                            T.gemm_v0(p_hi, kv_hi[pb, :, :], acc_o_l0c, init=False)
-                            # BACK1 set: MM2(g-1) done reading kv[(g-1)%2] (and
-                            # p_lo) on MAD; step g+1's MM1 KV load (which writes
+                            T.gemm_v0(p_lo, kv_lo[pb, 1, :, :], acc_o_1, init=True)
+                            T.gemm_v0(p_hi, kv_hi[pb, 1, :, :], acc_o_1, init=False)
+                            T.set_flag("m", "fix", 3)  # dtile1 gemms -> copy_o_1 RAW
+                            # BACK1 set: both dtiles done reading kv[(g-1)%2] (and
+                            # p_lo/p_hi) on MAD -- after dtile1's gemms == after all
+                            # KV reads; step g+1's MM1 KV load (which writes
                             # kv[(g+1)%2] == kv[(g-1)%2]) waits this. Gated by
                             # valid1 to match the valid2 wait one step later.
                             T.set_flag("m", "mte2", 0)
-                            T.set_flag("m", "fix", 1)
+                            # copy_o_0 (FIX, slot A) -- overlaps dtile1's gemms (MAD)
+                            # issued just above.
                             T.wait_flag("m", "fix", 1)
                             T.copy(
-                                acc_o_l0c,
-                                ws_o[cid, pb, 0:H_per_block, 0:D],
+                                acc_o_0,
+                                ws_o[cid, pb, 0:H_per_block, 0:D_HALF],
                             )
-                            # BACK_A + BACK_B set: copy_o (FIX) read BOTH slots;
-                            # free both for the next block's MAD writes (next
-                            # step's MM1 lo/hi gemms). PV_READY (set_cross_flag
-                            # "FIX") is ordered by the same FIX pipe as copy_o.
-                            T.set_flag("fix", "m", 0)
-                            T.set_flag("fix", "m", 1)
+                            T.set_flag("fix", "m", 0)  # BACK_A: slot A free
+                            # copy_o_1 (FIX, slot B).
+                            T.wait_flag("m", "fix", 3)
+                            T.copy(
+                                acc_o_1,
+                                ws_o[cid, pb, 0:H_per_block, D_HALF:D],
+                            )
+                            T.set_flag("fix", "m", 1)  # BACK_B: slot B free
+                            # PV_READY ordered by the FIX pipe (both copies done).
                             T.set_cross_flag("FIX", _FLAG_PV_READY)
                     # BACK_A / BACK_B drain: each slot's last FIX-read set has no
                     # next-block MAD write to consume it; these balance the two

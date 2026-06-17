@@ -8,7 +8,7 @@
 - **目标（用户北极星）**：复刻 Ascend C 这个算子的计算逻辑 + 性能方案，让 swa 前向做到 AscendC 的 **80–100%**。Ascend C 源码是蓝本，别发明 kernel 侧小技巧；过不去改 fork 编译器（`yangqiang2018/tilelang-ascend`，NPU 验过的成功改动打 `cfeat-*` annotated tag，攒着提上游 issue）。
 - **诚实天花板**：vector 侧便宜刀**已用尽**（brcb/row_muls rescale、SoftmaxFlashV2 fused softmax 都 NPU 验过 = perf 中性，见 _6 §3.6/3.7）。**~50% 是 kernel 侧天花板**。破它只剩 **C（跨-slot 软件流水）**。**注意：即使 C 全成也就 ~55，够不着北极星 80**——80 还得叠 cube 侧（_6 §3.5② L1-ring 预取，又一大改）。**用户已知情拍板「硬上 C」**（知道 ~16-25 容器轮、最好 ~55、砸了全回退）。
 - **perf 现状**：swa **35.6** / cfa **42.3** / scfa 15.0（S1+S2 后）。**比 C 前 baseline swa 42.4 / cfa 49.9 降了 ~7**——这是 S1 把 acc_o 挪 GM 的纯 DMA 成本，**所有恢复+增益押在 S3**。
-- **进度**：S1✅ S2✅ Q4✅ S3b✅(swa35→41.3) C1 cube debarrier✅(→45.3,+4,过baseline) C2 bulk KV gather✅平(→45.1) C3 L0C ping-pong **M-tiling❌回退**(45→42) → **改 kernel-first L0C ping-pong(N 轴,非 M 轴)**:**C4=MM1 L0C 2-slot ping-pong ✅ 容器验绿(45.1→46.5,+1.4)**。**当前 swa=46.5(green,已 push 2c3e871)**。**下一步=N-tile MM2(把 128KB acc_o 切 D=512→2×256=64KB×2,放进 C4 已建好的 2 slot,ping-pong O-drain;这是真正的大头,见 §0.6.4)**。**关键复盘(Plan agent 读 fork codegen+蓝本)**:① 编译器 gemm **已经 L0A/L0B ping-pong**(common.h:572-631);② cube 串行的真因=单块/别名 L0C + 每-gemm FIX-drain barrier;③ **C3 错在 M 轴**(M=32 gemm 低效),正解是 **N 轴**(保 M=64);④ MM2 的 acc_o=128KB 占满 L0C 是结构墙,N-tile 才能 ping-pong;⑤ 编译器 `gemm_v0_pp`(unitFlag-drain)单独天花板 ~50-58%,**暂缓**(用户要先看设计;设计已在 §0.6.4),N-tile MM2 是 kernel 层、优先。
+- **进度**：S1✅ S2✅ Q4✅ S3b✅(swa35→41.3) C1 cube debarrier✅(→45.3,+4,过baseline) C2 bulk KV gather✅平(→45.1) C3 L0C ping-pong **M-tiling❌回退**(45→42) → **改 kernel-first L0C ping-pong(N 轴,非 M 轴)**:**C4=MM1 L0C 2-slot ping-pong ✅ 容器验绿(45.1→46.5,+1.4,push 2c3e871)** → **C5=N-tile MM2 + MM1 K-split(D-split 全重写)📝 已写完待容器验(本次)**。**关键发现(读蓝本 block_cube.h + fork common.h gemm_v0)**:**N-tile MM2 与 MM1 K-split 是绑定的、不可能"只动 MM2"**——kv 被 MM1(score,D 是 K 收缩维,transpose_B)和 MM2(P@V,D 是 N 输出维)共用,N-tile MM2 要按 D 切 kv 成 dense [rows,256] 块,而 `gemm_v0` 只吃 (M,N,K) 无独立 stride → kv 必须 D-split 存 L1 → 逼 MM1 也按 D K-split 累加。**这正是 Ascend C 真实结构**(`K_L1_SPLIT_SIZE=256` MM1 K 切 2×256 累加进 1 个 L0C slot 跨调用 ping-pong;`D_SPLIT_SIZE=256` MM2 输出 D 切 2×256 各进一 slot;Q/K/V 在 L1 都 nd2nz D-split,`dValue=256/srcDValue=512`)。**C5 改动**:q_l1/kv_lo/kv_hi reshape 成 `[parity,dtile(2),rows,256]`(同字节、dtile-major 重排,L1 地址不变);gather 每段写 2 次(D[0:256]→[*,0]、D[256:512]→[*,1]);MM1 lo/hi 各按 dtile 累加(2 gemm,init=T/F,MAD 总数同 C4——gemm_v0 内部 K-tile 128,2×K256==1×K512);MM2 dtile0→acc_o_0@slotA、dtile1→acc_o_1@slotB(各 64KB),**per-dtile gemm→copy**,copy_o_0(FIX,slotA)叠 dtile1 gemm(MAD,slotB)+叠下步 MM1 lo(只等 BACK_A 不等 copy_o_1)。保 M=64。flag 沿用 C4 的 per-slot BACK_A(fix,m,0)/BACK_B(fix,m,1)对称链;M_FIX eid:MM1lo=0/MM2d0=1/MM1hi=2/MM2d1=3。**预期**:128KB copy_o 大头拆 2×64KB 与 MAD 流水 → cube 往 vector floor 掉 → 46.5→~52-58?(到 80 仍可能需 gemm_v0_pp + vector)。**风险(只容器暴露)**:① T.copy 吃 GM D-slice 源(realSrcN=512/tile=256,模板 copy_gm_to_l1 line88 支持,蓝本同款,但 codegen 是否正确传 realSrcN 没本地验);② D-split gemm 操作数(`kv_lo[pb,0,:,:]` 前导标量→BufferRegion[64,256],应过);③ 数值(K-split/N-split 重组,decode/dtype0 gate)。砸了回退本 commit(C4 态 46.5 仍是新高)。详见 §0.6.4b。
 
 ## 0.6 S3b 设计已定案（2026-06-16，Plan agent 读真源码 + 我审核）—— 纯 kernel 重写、无需改编译器、分阶段把 all-or-nothing 收敛到一步
 
@@ -116,6 +116,28 @@
 每 dtile 的 acc_o WAR 用它那 slot 的 BACK_A/BACK_B(C4 已建)。MM2 不再 wait/set **两个**、而是每 dtile 各 wait/set **它自己那一个**(回到 BACK_LC-per-slot 的干净交替;MM1 仍 lo→A/hi→B)。**保 M=64**(不重蹈 C3 的 M=32)。
 - **⚠️ 操作数坑(实现前必看)**:gemm B = `kv_lo[pb, :, 0:256]`(D-slice)。`gemm_v0`(`ascend.py`,非 pto)只吃 `Buffer`/`BufferRegion`;**前导标量索引**才出 BufferRegion(`kv_lo[pb,:,:]` 行),纯 range-slice 出 BufferLoad 被拒(C3 踩过 `p_lo[0:32,:]`)。`kv_lo[pb,:,0:256]` 有前导标量 pb——**大概率是 BufferRegion**(降 1 维),但**没验过**,容器一跑即知。若被拒(BufferLoad):把 kv reshape 成 `[2,2,BI_half,256]`(parity,dtile,K,N)、gather 时按 dtile 拆 D 写入(T.copy 吃 D-slice 源),gemm 用 `kv_lo[pb,dtile,:,:]`(前导标量→BufferRegion);代价=KV load 翻倍 mte2。acc_o_0/acc_o_1 是整块 buffer(C 操作数,免坑)。ws_o copy 也 D-slice(`ws_o[...,0:256]`,T.copy 吃)。
 - **预期**:copy_o 的 128KB FIX 大头叠到 MAD 下 + 叠下步 MM1 → cube 往 vector floor(~2407us)掉 → swa 46.5→~52-58?(诚实:到 80 可能还需 gemm_v0_pp + vector;N-tile 是最大单刀)。**风险**:操作数形(build,易判)、flag(每 dtile 的 BACK 交替,沿用 C4 已验模式)、数值(decode/dtype0 gate)。砸了回退本 commit(C4 态 46.5 仍是新高)。
+
+#### 0.6.4b C5 = N-tile MM2 + MM1 K-split（D-split 全重写）📝 已写完待容器验（2026-06-17）
+
+**§0.6.4a 的"只动 MM2"设想被证伪——读蓝本后改成 MM1+MM2 一起的 D-split 全重写。** 关键链条（实现前我读了 `block_cube.h` 的 MM1/MM2 + fork `common.h:572-631` 的 `gemm_v0` + `copy_l1_to_l0b`）：
+
+1. **`gemm_v0` 无独立 stride**：intrinsic 签名只传 `(M,N,K)`+指针，B 操作数走 `copy_l1_to_l0b<T,K,N>` 用 `MakeLayout<LayoutL1>(K,N)` 当**密集**布局寻址。所以 `kv_lo[pb,:,0:256]`(D-slice)即便解析成 BufferRegion 能 build 过,gemm 也会按 N=256 当行宽密集读、而真实行 stride 是 512 → **数值错(本地测不出)**。→ §0.6.4a 记的"D-slice 大概率能过"是**错的**;reshape 不是 fallback、是**必须**。
+2. **kv 被 MM1/MM2 共用、两者要的布局相反**：MM1 score=`q@kv^T`(transpose_B),D 是 **K 收缩维**,要 kv 行连续 [rows,512];MM2 `P@V`,D 是 **N 输出维**,N-tile 要 kv 的 D-tile 连续 [rows,256]。一块 buffer 不能同时满足 → 必须 D-split 存 [.,dtile,rows,256],**MM1 也只能按 D K-split 累加**(读每个 D-tile 的 dense 块)。**绑定、不可分。**
+3. **这正是 Ascend C 的真实结构**(不是我发明):`K_L1_SPLIT_SIZE=256`(MM1 K 切 2×256)、`D_SPLIT_SIZE=256`(MM2 输出 D 切 2)、Q/K/V 的 `CopyGmToL1` 用 `nd2nzPara.dValue=headDim>>1=256, srcDValue=headDim=512`(D-split 装 L1)、MM2 `nL1` 循环每 D-tile `cL0BufIter++` 轮 L0C ping-pong slot。**忠实复刻 ✓。**
+
+**C5 实际改动(kernel.py swa prim_func only;旧 prim_func/CFA/SCFA 字节不动)**:
+- 常量加 `D_HALF = D // 2 = 256`。
+- `q_l1`/`kv_lo`/`kv_hi` alloc:`[2,*,D]` → `[2, 2(dtile), *, D_HALF]`(同字节 dtile-major 重排,annotate L1 地址不变)。
+- L0C:`acc_o_l0c[H,D]`(128KB 跨双 slot) → `acc_o_0[H,D_HALF]@0`(slotA) + `acc_o_1[H,D_HALF]@64KB`(slotB);`acc_s_a`/`acc_s_b` 仍 @0/@64KB(各与 acc_o_0/1 同 slot 别名,disjoint phase + BACK 守缝)。
+- gather:每行段拆 2 个 T.copy(源 D[0:256]→[*,0]、D[256:512]→[*,1]),主路径(lo/hi 各 contiguous/boundary)+ fallback(dead,也 D-split 保 shape 一致)全改。
+- MM1:lo = `gemm(q[*,0],kv_lo[*,0],acc_s_a,T,init=T)` + `gemm(q[*,1],kv_lo[*,1],acc_s_a,T,init=F)`;hi 同理 → acc_s_b。**MAD 总数同 C4**(gemm_v0 内部 K-tile 128:2×K256 == 1×K512)。
+- MM2:dtile0 = `gemm(p_lo,kv_lo[pb,0],acc_o_0,init=T)+gemm(p_hi,kv_hi[pb,0],acc_o_0,init=F)` → `set m_fix 1` → `copy acc_o_0→ws_o[:,0:256]` → `set BACK_A`;dtile1 同理用 kv[*,1]/acc_o_1/m_fix 3/ws_o[:,256:512]/BACK_B。`BACK1(m,mte2,0)` set 在 dtile1 gemm 后(所有 kv 读完)。
+- **per-dtile gemm→copy 交错**(贴 Ascend C nL1):copy_o_0(FIX,slotA)叠 dtile1 gemm(MAD,slotB);下步 MM1 lo(slotA)只等 BACK_A(copy_o_0 后立即 set)不等 copy_o_1。
+- flag:沿用 C4 per-slot **BACK_A(fix,m,0)/BACK_B(fix,m,1)** 对称链(set 在 slot 最后 FIX 读后、wait 在下次 MAD 写前,沿 MM1↔MM2 缝交替,pre-set + 2 drain)。**M_FIX eid:MM1lo=0/MM2d0=1/MM1hi=2/MM2d1=3**(全 distinct);MTE2_M{MM1load=3,MM2p=0};M_MTE2{BACK1=0}。gemm_v0 内部 FIX_M(0)/M_FIX(0) 是模板里**相邻 set+wait 自包含对**(common.h:588-589/629-630),加多少 gemm 都不动我的 BACK 协议(C4 已验同款交互)。
+
+**本地已验**:py_compile + ruff + 操作数形分析(全是整块 Buffer 或前导标量 BufferRegion[64,256/64])+ flag 平衡(每 eid block 内或跨步配平)+ 蓝本忠实度。**只容器能验**:① T.copy 的 GM D-slice 源 codegen 是否正确传 realSrcN=512(模板支持、蓝本同款、但没本地跑过);② D-split gemm 操作数被接受;③ 数值(decode/dtype0)。**风险=build(操作数/D-slice)易判,deadlock(flag 同构 C4,低),数值(K/N-split 重组,中)**。砸了回退 → C4 态 swa 46.5 仍新高。
+
+**下一步(C5 验绿后)**:re-profile 看 cube 是否往 vector floor 掉、瓶颈搬哪;若 swa 仍 <60 且 cube 仍长板 → 评估 `gemm_v0_pp`(unitFlag-drain,§0.6.4,需用户确认才动 fork)或 vector debarrier。CFA(43.6,<baseline 49.9)仍走旧 prim_func 未上流水。
 
 ## 0.5 UPDATE 2026-06-16：S3a 前提证伪 → 改做 Q4（debarrier+双缓冲），已 push 待验
 
