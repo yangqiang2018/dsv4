@@ -8,7 +8,7 @@
 - **目标（用户北极星）**：复刻 Ascend C 这个算子的计算逻辑 + 性能方案，让 swa 前向做到 AscendC 的 **80–100%**。Ascend C 源码是蓝本，别发明 kernel 侧小技巧；过不去改 fork 编译器（`yangqiang2018/tilelang-ascend`，NPU 验过的成功改动打 `cfeat-*` annotated tag，攒着提上游 issue）。
 - **诚实天花板**：vector 侧便宜刀**已用尽**（brcb/row_muls rescale、SoftmaxFlashV2 fused softmax 都 NPU 验过 = perf 中性，见 _6 §3.6/3.7）。**~50% 是 kernel 侧天花板**。破它只剩 **C（跨-slot 软件流水）**。**注意：即使 C 全成也就 ~55，够不着北极星 80**——80 还得叠 cube 侧（_6 §3.5② L1-ring 预取，又一大改）。**用户已知情拍板「硬上 C」**（知道 ~16-25 容器轮、最好 ~55、砸了全回退）。
 - **perf 现状**：swa **35.6** / cfa **42.3** / scfa 15.0（S1+S2 后）。**比 C 前 baseline swa 42.4 / cfa 49.9 降了 ~7**——这是 S1 把 acc_o 挪 GM 的纯 DMA 成本，**所有恢复+增益押在 S3**。
-- **进度**：S1 ✅、S2 ✅、Q4 ✅、S3b ✅(swa 35→41.3)、**C1=cube debarrier/L1-ring ✅ 容器验绿(swa 41.3→45.3,+4,首次过 baseline 42.4!cfa 43.3/scfa 16.9 噪声不变)**。组合拳第①刀(cube,root)**单独就 +4**——印证 cube 是瓶颈、unblock 它就喂快 vector。**下一步=第②刀 vector debarrier**(去掉 vector gloop 的 barrier_all,V0/V1/V2 + VEC/MTE 重叠,消 vector idle),叠在 +4 上看组合 perf(见 §0.6.1 + [[feedback-combined-levers]])。
+- **进度**：S1 ✅、S2 ✅、Q4 ✅、S3b ✅(swa 35→41.3)、C1 cube debarrier ✅(swa 41.3→45.3,+4,过 baseline)、**C2=cube SCALAR 削减(bulk KV gather,8+8→2+2 div/mod)已实现,待容器验**。**C1 后 re-profile 实锤瓶颈搬到 cube SCALAR(51%/1584us,长板核最大 pipe;cube util 96.7%,vector idle 24% 被卡)**——故 C2 打 cube scalar(复刻 Ascend C bulk DataCopy)而非 vector(profile-first 防打错目标)。详见 §0.6.2。下一步看 profile:若 cube 退位则 decode-carry + vector debarrier。
 
 ## 0.6 S3b 设计已定案（2026-06-16，Plan agent 读真源码 + 我审核）—— 纯 kernel 重写、无需改编译器、分阶段把 all-or-nothing 收敛到一步
 
@@ -59,6 +59,18 @@
 **预期**:cube 把 mte2(25%,最大 pipe)prefetch 叠到 MAD/FIX 串行链下 → cube 每步更快 → 喂快 SCORE/PV → 砍 vector 34% idle。**按 [[feedback-combined-levers]]:这是组合拳第①刀(root),先单独验 correctness**(死锁风险集中在 cube 跨-gloop WAR)。**perf 可能只部分兑现甚至持平**(vector 自己的 barrier 还在,消费速度受限)——别据此判死,第②刀 vector debarrier 下一轮叠上才看组合 perf。砸了(hang→查 flag 平衡;红→查 data hazard;尤其再查别名):回退本 commit 即可(只动 swa cube scope)。
 
 **容器三验**(改 kernel.py,`cd /sdb/yq/dsv4 && git pull` 即生效):① `pytest -q sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv_fast.py`(prefill deadlock/leak)② `pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "decode and dtype0"`(真数值,抓 race/WAR)③ `python sparse_attn_sharedkv_perf_compare.py`(perf%)。
+
+### 0.6.2 C2 = cube SCALAR 削减(bulk KV gather)已实现(2026-06-17,待容器验)
+
+> **C1 后重新 profile(msprof PipeUtilization,swa)实锤瓶颈搬家了**:C1 让 cube pipe 真重叠(mac+scalar+mte1+mte2+fix **和 126%** vs C1 前串行 82%),**新瓶颈 = cube SCALAR 51%(1584us,长板核的最大 pipe)**。cube aicore_time 3140us(util 96.7%,长板);vector aiv_time 3167us 但 **idle 24%**→busy 仅 2407us(被 cube 卡)。所以**先打 cube scalar,不是 vector**(vector debarrier 会打错目标——这就是 profile-first 的价值)。
+>
+> **cube scalar 来源**:每步整数 `//`/`%`——3× decode(g/g-1/g-2)的 `//max_seq`+`%max_seq`(3+3)+ **KV gather 的 8 个 16-row chunk 各算 `g0//ori_block_size`+`g0%ori_block_size`+边界 if(8+8,大头)**。`//`/`%` 在 Ascend scalar 单元很贵。
+
+**做法(复刻 Ascend C 的 bulk DataCopy,不是发明)**:Ascend C `CopyGmToL1`(swa_block_cube.h:244)用 `DataCopy(nd2nz, nValue=srcN)` **一次 bulk 拷连续段**,不是 16-row chunk。SWA 的 ori window 是连续 run,故把每个 64-row half 用 **1-2 个 runtime-extent `T.copy`(per 分页块段)** 拷,替掉 8-chunk loop。`ori_block_size=128`(测试 `block_size1=128`,来自 KV tensor shape)≥ BI_half=64 → 一个 half 跨 ≤2 块 → 每 half 1 div + 1 mod(**全步 2+2,从 8+8 砍下来**)。编译期 `if ori_block_size >= BI_half:` 守(只 trace 一条路,无 IR bloat),`else` 留原 16-row chunk loop 作小块 fallback。**正确性**:新拷贝产出与原 8-chunk **字节同一** kv_lo/kv_hi(全局行 [ori_left0, ori_left0+128),已逐 case 验:对齐/跨界/lo-vs-hi)。`is-subtile-runtime-extent` cfeat 撑 runtime-extent 拷贝。
+
+**预期**:cube scalar 8+8→2+2 div/mod(gather 大头)→ cube 时间往 vector floor(2407us)掉 → swa 45→~55+?(若 cube 掉破 vector floor,vector 变瓶颈,再轮到 vector debarrier / decode-carry)。**这刀单独应见效**(gather 占 scalar `//`/`%` 的大头,~73%,非组合拳——不像 cube/vector debarrier 互相依赖)。**风险**:correctness(错地址→错 KV→错输出),decode/dtype0 gate 抓得到;无死锁风险(纯地址算术,无新同步)。砸了回退本 commit。
+
+**下一步若 cube 不再是瓶颈**:decode-carry(把 valid(g) 存 3-深 rotating UB,g-1/g-2 不重算,省 2+2 div/mod,**cube+vector scalar 都受益**)+ vector debarrier(seed/restore/LSE 的 glue barrier)。先 profile 再定。
 
 ## 0.5 UPDATE 2026-06-16：S3a 前提证伪 → 改做 Q4（debarrier+双缓冲），已 push 待验
 
