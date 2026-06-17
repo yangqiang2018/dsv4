@@ -1922,7 +1922,13 @@ def build_sparse_attn_sharedkv(
                 kv_hi = T.alloc_L1([2, BI_half, D], dtype)
                 p_lo = T.alloc_L1([H_per_block, BI_half], dtype)
                 p_hi = T.alloc_L1([H_per_block, BI_half], dtype)
-                acc_s_l0c = T.alloc_L0C([H_per_block, BI_half], accum_dtype)
+                # L0C 2-slot ping-pong (replicate Ascend C cL0BufIter%2): slot A
+                # @0, slot B @64KB. MM1's lo/hi score gemms write acc_s_a / acc_s_b
+                # so the hi gemm (MAD) overlaps the lo copy (FIX) instead of
+                # serializing on one acc_s. acc_o_l0c (128KB) still spans BOTH
+                # slots for now; N-tiling it into the two 64KB slots is next.
+                acc_s_a = T.alloc_L0C([H_per_block, BI_half], accum_dtype)
+                acc_s_b = T.alloc_L0C([H_per_block, BI_half], accum_dtype)
                 acc_o_l0c = T.alloc_L0C([H_per_block, D], accum_dtype)
 
                 # ---- UB (vector). ---- (SWA subset of the main kernel; see
@@ -1979,7 +1985,10 @@ def build_sparse_attn_sharedkv(
                         kv_hi: 256 * KB,
                         p_lo: 384 * KB,
                         p_hi: 392 * KB,
-                        acc_s_l0c: l0c_addr["acc_s_l0c"],
+                        # L0C 2-slot ping-pong: acc_s_a @ slot A (0), acc_s_b @
+                        # slot B (64KB); acc_o spans both (0..128KB) until N-tiled.
+                        acc_s_a: 0,
+                        acc_s_b: 64 * KB,
                         acc_o_l0c: l0c_addr["acc_o_l0c"],
                         acc_o: ub_addr["acc_o"],
                         acc_s_ub: ub_addr["acc_s_ub"],
@@ -2056,20 +2065,20 @@ def build_sparse_attn_sharedkv(
                     #     set-count == wait-count -> no leak. One MTE2-draining
                     #     wait covers all three (q_l1/p_lo transitively, via the
                     #     in-order MAD/MTE2 pipes).
-                    #   BACK_LC (fix->m, eid 0): acc_s_l0c and acc_o_l0c ALIAS
-                    #     the same L0C address (l0c_addr both 0 -- "disjoint
-                    #     phases"), so MM1's score copies (FIX read) and MM2's
-                    #     P@V gemm (MAD write) form ONE serial chain on that
-                    #     buffer. A SINGLE WAR flag, set after each block's last
-                    #     FIX read (MM1 copy_hi / MM2 copy_o) and waited before
-                    #     each block's first MAD write (MM1 gemm_lo / MM2 gemm),
-                    #     ALTERNATES block-by-block and so serializes BOTH seams
-                    #     (copy_hi -> MM2 gemm within a step; copy_o -> next
-                    #     gemm_lo across the step). Pre-set arms the first wait;
-                    #     drain after the loop consumes the last set. (Two
-                    #     separate flags would each pair the wrong ops and leave
-                    #     the cross-alias seam unguarded.)
-                    T.set_flag("fix", "m", 0)  # BACK_LC pre-set (aliased L0C)
+                    #   BACK_A (fix->m, eid 0) / BACK_B (fix->m, eid 1): L0C is a
+                    #     2-slot ping-pong (slot A @0, slot B @64KB). MM1's lo
+                    #     score gemm writes acc_s_a (A), hi writes acc_s_b (B), so
+                    #     the hi gemm (MAD) overlaps the lo copy (FIX). acc_o
+                    #     (128KB) still spans BOTH slots, so MM2 touches A and B.
+                    #     Per-slot WAR flag: set after a slot's last FIX read,
+                    #     waited before its next MAD write -- alternating
+                    #     block-by-block (MM1 writes A@lo / B@hi; MM2 writes A+B;
+                    #     reads symmetric) serializes each slot's chain across the
+                    #     MM1/MM2 seam. Pre-set arms each first wait; 2 drains
+                    #     after the loop. (Same proof as the old single BACK_LC,
+                    #     replicated per slot.)
+                    T.set_flag("fix", "m", 0)  # BACK_A pre-set (L0C slot A @0)
+                    T.set_flag("fix", "m", 1)  # BACK_B pre-set (L0C slot B @64KB)
                     for g in T.serial(total_work + 2):
                         # ---- decode(g) (OOB-safe; off = g >= 0 always) ----
                         pid0 = linear_start + g
@@ -2332,52 +2341,52 @@ def build_sparse_attn_sharedkv(
                             # MTE2 pipe keeps prefetching past it.
                             T.set_flag("mte2", "m", 3)
                             T.wait_flag("mte2", "m", 3)
-                            # BACK_LC WAR: gemm_lo (MAD, init=True) is the first
-                            # write to the aliased L0C in this block; wait until
-                            # the previous block's last FIX read of it (the prior
-                            # MM2 copy_o, or MM1 copy_hi if that MM2 was skipped)
-                            # is done -- loop pre-set arms the very first one.
+                            # MM1 scores into the 2 L0C ping-pong slots: lo gemm
+                            # -> acc_s_a (slot A), hi gemm -> acc_s_b (slot B).
+                            # Different buffers, so the hi gemm (MAD) issues
+                            # WITHOUT waiting for the lo copy (FIX) -- the overlap
+                            # the old single-acc_s fix/m WAR forbade.
+                            # BACK_A WAR: lo gemm (MAD) is slot A's first write;
+                            # wait its previous FIX reader (prior MM2 copy_o, or
+                            # this slot's prior MM1 lo copy / the pre-set).
                             T.wait_flag("fix", "m", 0)
-                            # MM1 cube debarrier (perf lever 1): targeted pipe
-                            # flags on the serial MAD->FIX->MAD->FIX chain on the
-                            # single acc_s_l0c (see the main kernel for the full
-                            # commentary). Cube pipe flags live on AIC, disjoint
-                            # from the V-scope's AIV flag ids.
                             T.gemm_v0(
                                 q_l1[g % 2, :, :],
                                 kv_lo[pa, :, :],
-                                acc_s_l0c,
+                                acc_s_a,
                                 transpose_B=True,
                                 init=True,
                             )
-                            T.set_flag("m", "fix", 0)  # gemm_lo -> copy_lo
-                            T.wait_flag("m", "fix", 0)
-                            T.copy(
-                                acc_s_l0c,
-                                ws_score[cid, pa, 0:H_per_block, 0:BI_half],
-                            )
-                            T.set_flag("fix", "m", 1)  # copy_lo -> gemm_hi WAR
+                            T.set_flag("m", "fix", 0)  # lo gemm -> lo copy RAW
+                            # BACK_B WAR: hi gemm (MAD) is slot B's first write.
                             T.wait_flag("fix", "m", 1)
                             T.gemm_v0(
                                 q_l1[g % 2, :, :],
                                 kv_hi[pa, :, :],
-                                acc_s_l0c,
+                                acc_s_b,
                                 transpose_B=True,
                                 init=True,
                             )
-                            T.set_flag("m", "fix", 2)  # gemm_hi -> copy_hi
+                            T.set_flag("m", "fix", 2)  # hi gemm -> hi copy RAW
+                            # lo copy (FIX) -- overlaps the hi gemm (MAD) above.
+                            T.wait_flag("m", "fix", 0)
+                            T.copy(
+                                acc_s_a,
+                                ws_score[cid, pa, 0:H_per_block, 0:BI_half],
+                            )
+                            T.set_flag(
+                                "fix", "m", 0
+                            )  # BACK_A: slot A free (lo copy done)
+                            # hi copy (FIX).
                             T.wait_flag("m", "fix", 2)
                             T.copy(
-                                acc_s_l0c,
+                                acc_s_b,
                                 ws_score[cid, pa, 0:H_per_block, BI_half:BI],
                             )
-                            # BACK_LC set: copy_hi (FIX) is the last read of the
-                            # aliased L0C in this block; the next block's first
-                            # MAD write (this step's MM2 gemm, else next MM1
-                            # gemm_lo) waits it. SCORE_READY (set_cross_flag
-                            # "FIX") is ordered by the same FIX pipe as the
-                            # copies, so no barrier_all is needed before it.
-                            T.set_flag("fix", "m", 0)
+                            T.set_flag(
+                                "fix", "m", 1
+                            )  # BACK_B: slot B free (hi copy done)
+                            # SCORE_READY ordered by the FIX pipe (both copies).
                             T.set_cross_flag("FIX", _FLAG_SCORE_READY)
                         # ---- MM2(g-1): P@V of slot g-1 ----
                         # MM2 references only ws_p / kv / ws_o by parity (cid +
@@ -2400,12 +2409,13 @@ def build_sparse_attn_sharedkv(
                             )
                             T.set_flag("mte2", "m", 0)
                             T.wait_flag("mte2", "m", 0)
-                            # BACK_LC WAR: this P@V gemm (MAD, init=True) is the
-                            # first write to the aliased L0C in MM2's block; wait
-                            # until MM1(g)'s copy_hi (FIX read of the same L0C) is
-                            # done -- BACK_LC was set by that copy_hi above, or by
-                            # the loop pre-set when MM1(g) was skipped.
+                            # BACK_A + BACK_B WAR: acc_o (128KB) spans BOTH L0C
+                            # slots, so this first P@V gemm (MAD, init=True) waits
+                            # until BOTH slots' last FIX readers (MM1(g)'s lo & hi
+                            # copies, or the loop pre-sets if MM1(g) was skipped)
+                            # are done.
                             T.wait_flag("fix", "m", 0)
+                            T.wait_flag("fix", "m", 1)
                             T.gemm_v0(p_lo, kv_lo[pb, :, :], acc_o_l0c, init=True)
                             # MAD in-order: init=False accumulates into acc_o_l0c
                             # right after init=True on the same pipe, no barrier.
@@ -2421,18 +2431,18 @@ def build_sparse_attn_sharedkv(
                                 acc_o_l0c,
                                 ws_o[cid, pb, 0:H_per_block, 0:D],
                             )
-                            # BACK_LC set: copy_o (FIX) is the last read of the
-                            # aliased L0C in this block; the next block's first
-                            # MAD write (next step's MM1 gemm_lo) waits it.
-                            # PV_READY (set_cross_flag "FIX") is ordered by the
-                            # same FIX pipe as copy_o, so no barrier_all needed.
+                            # BACK_A + BACK_B set: copy_o (FIX) read BOTH slots;
+                            # free both for the next block's MAD writes (next
+                            # step's MM1 lo/hi gemms). PV_READY (set_cross_flag
+                            # "FIX") is ordered by the same FIX pipe as copy_o.
                             T.set_flag("fix", "m", 0)
+                            T.set_flag("fix", "m", 1)
                             T.set_cross_flag("FIX", _FLAG_PV_READY)
-                    # BACK_LC drain: the last block's copy_hi/copy_o set has no
-                    # next-block MAD write to consume it; this balances the
-                    # pre-set before the loop (and consumes the pre-set unchanged
-                    # when the core has zero valid slots).
+                    # BACK_A / BACK_B drain: each slot's last FIX-read set has no
+                    # next-block MAD write to consume it; these balance the two
+                    # pre-sets (and consume them unchanged on a zero-valid core).
                     T.wait_flag("fix", "m", 0)
+                    T.wait_flag("fix", "m", 1)
 
                 # ============ VECTOR (flat gloop) ============
                 # Step g: V0(g) seed + mask + score-prefetch, V1(g-1) softmax,
