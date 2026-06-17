@@ -1921,8 +1921,15 @@ def build_sparse_attn_sharedkv(
                 q_l1 = T.alloc_L1([2, H_per_block, D], dtype)
                 kv_lo = T.alloc_L1([2, BI_half, D], dtype)
                 kv_hi = T.alloc_L1([2, BI_half, D], dtype)
-                p_lo = T.alloc_L1([H_per_block, BI_half], dtype)
-                p_hi = T.alloc_L1([H_per_block, BI_half], dtype)
+                # p_lo / p_hi are head-split [2, HALF_HEADS, BI_half] (not
+                # [H_per_block, BI_half]) so the P@V can be M-tiled: p_lo[0,:,:]
+                # = heads 0:HALF_HEADS, p_lo[1,:,:] = heads HALF_HEADS:H_per_block.
+                # A leading-scalar index yields a BufferRegion gemm_v0 accepts (a
+                # 2D range-slice p_lo[0:HALF_HEADS,:] lowers to a BufferLoad that
+                # _retrieve_shape rejects). Same 8KB bytes / same L1 address; the
+                # head-halves are already contiguous in the old [64,64] layout.
+                p_lo = T.alloc_L1([2, HALF_HEADS, BI_half], dtype)
+                p_hi = T.alloc_L1([2, HALF_HEADS, BI_half], dtype)
                 # L0C ping-pong (replicate Ascend C cL0BufIter%2,
                 # swa_block_cube.h:560): two 64KB slots (A@0, B@64KB) so each
                 # gemm result's copy-out (FIX) overlaps the next gemm (MAD). The
@@ -2397,13 +2404,23 @@ def build_sparse_attn_sharedkv(
                             # No barrier_all: the BACK1 wait at the top of this
                             # step already drained the MTE2 pipe past MM2(g-2)'s
                             # read of p_lo, so this p load is WAR-safe.
+                            # p load, head-split to match the [2,HALF_HEADS,*]
+                            # layout (heads 0:HALF_HEADS -> [0], rest -> [1]).
                             T.copy(
-                                ws_p[cid, pb, 0:H_per_block, 0:BI_half],
-                                p_lo,
+                                ws_p[cid, pb, 0:HALF_HEADS, 0:BI_half],
+                                p_lo[0, :, :],
                             )
                             T.copy(
-                                ws_p[cid, pb, 0:H_per_block, BI_half:BI],
-                                p_hi,
+                                ws_p[cid, pb, HALF_HEADS:H_per_block, 0:BI_half],
+                                p_lo[1, :, :],
+                            )
+                            T.copy(
+                                ws_p[cid, pb, 0:HALF_HEADS, BI_half:BI],
+                                p_hi[0, :, :],
+                            )
+                            T.copy(
+                                ws_p[cid, pb, HALF_HEADS:H_per_block, BI_half:BI],
+                                p_hi[1, :, :],
                             )
                             T.set_flag("mte2", "m", 0)  # p load -> gemm RAW
                             T.wait_flag("mte2", "m", 0)
@@ -2416,13 +2433,13 @@ def build_sparse_attn_sharedkv(
                             # ---- group MM2_m0 (heads 0:HALF_HEADS) -> slot A ----
                             T.wait_flag("fix", "m", 0)  # slot A free (MM1_lo copy)
                             T.gemm_v0(
-                                p_lo[0:HALF_HEADS, :],
+                                p_lo[0, :, :],
                                 kv_lo[pb, :, :],
                                 acc_o_a,
                                 init=True,
                             )
                             T.gemm_v0(
-                                p_hi[0:HALF_HEADS, :],
+                                p_hi[0, :, :],
                                 kv_hi[pb, :, :],
                                 acc_o_a,
                                 init=False,
@@ -2437,13 +2454,13 @@ def build_sparse_attn_sharedkv(
                             # ---- group MM2_m1 (heads HALF_HEADS:2*) -> slot B ----
                             T.wait_flag("fix", "m", 1)  # slot B free (MM1_hi copy)
                             T.gemm_v0(
-                                p_lo[HALF_HEADS:H_per_block, :],
+                                p_lo[1, :, :],
                                 kv_lo[pb, :, :],
                                 acc_o_b,
                                 init=True,
                             )
                             T.gemm_v0(
-                                p_hi[HALF_HEADS:H_per_block, :],
+                                p_hi[1, :, :],
                                 kv_hi[pb, :, :],
                                 acc_o_b,
                                 init=False,
