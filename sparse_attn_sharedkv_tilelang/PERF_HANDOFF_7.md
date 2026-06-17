@@ -8,7 +8,7 @@
 - **目标（用户北极星）**：复刻 Ascend C 这个算子的计算逻辑 + 性能方案，让 swa 前向做到 AscendC 的 **80–100%**。Ascend C 源码是蓝本，别发明 kernel 侧小技巧；过不去改 fork 编译器（`yangqiang2018/tilelang-ascend`，NPU 验过的成功改动打 `cfeat-*` annotated tag，攒着提上游 issue）。
 - **诚实天花板**：vector 侧便宜刀**已用尽**（brcb/row_muls rescale、SoftmaxFlashV2 fused softmax 都 NPU 验过 = perf 中性，见 _6 §3.6/3.7）。**~50% 是 kernel 侧天花板**。破它只剩 **C（跨-slot 软件流水）**。**注意：即使 C 全成也就 ~55，够不着北极星 80**——80 还得叠 cube 侧（_6 §3.5② L1-ring 预取，又一大改）。**用户已知情拍板「硬上 C」**（知道 ~16-25 容器轮、最好 ~55、砸了全回退）。
 - **perf 现状**：swa **35.6** / cfa **42.3** / scfa 15.0（S1+S2 后）。**比 C 前 baseline swa 42.4 / cfa 49.9 降了 ~7**——这是 S1 把 acc_o 挪 GM 的纯 DMA 成本，**所有恢复+增益押在 S3**。
-- **进度**：S1 ✅、S2 ✅、Q4 ✅、**S3b ✅ 容器验绿(swa 35→41.3,cfa 44.2/scfa 15.9 不变)**。profile 实锤**不是天花板**:vector 34% idle 等 cube,cube data-movement-bound(KV 载入 mte2 25% 串行)。**下一步=组合拳:cube debarrier/L1-ring(喂快 SCORE/PV)+ vector debarrier(消快),按组合评估 perf(见 §0.6 + [[feedback-combined-levers]])。cube L1-ring 卡 L1 预算→跨-gloop WAR back-flag 是死锁雷区,需谨慎。**
+- **进度**：S1 ✅、S2 ✅、Q4 ✅、S3b ✅(swa 35→41.3)、**C1=cube debarrier/L1-ring 已实现+双重对抗审过,待容器验**(去掉 cube gloop 全部 6 个 barrier_all,换精确 pipe flag + 跨-gloop WAR back-flag,让 KV 载入 mte2 prefetch 叠到 gemm 下)。profile 实锤**不是天花板**:vector 34% idle 等 cube,cube data-movement-bound(KV 载入 mte2 25% 串行)。**组合拳第①刀(cube,root)先单独验 correctness(死锁风险集中在此),第②刀 vector debarrier 下一轮叠,按组合评估 perf(见 §0.6.1 + [[feedback-combined-levers]])。**
 
 ## 0.6 S3b 设计已定案（2026-06-16，Plan agent 读真源码 + 我审核）—— 纯 kernel 重写、无需改编译器、分阶段把 all-or-nothing 收敛到一步
 
@@ -44,6 +44,19 @@
 - **下一刀 = 组合拳(见 [[feedback-combined-levers]],单上一个可能没涨甚至降)**:**① cube debarrier/L1-ring**(去掉 cube gloop 的 barrier_all,让 KV 载入 mte2 叠到 gemm mac 下 → SCORE/PV 产得快 → 减 vector idle)+ **② vector debarrier**(去掉 vector gloop 的 barrier_all,让 V0/V1/V2 phase + VEC/MTE 重叠 → 减 vector busy)。**为什么必须组合**:只② → vector 变快后**更早撞 SCORE/PV 等待、idle 更多**(cube-bound),不涨;要①把 cube 喂快了②才兑现。cube 是 root,先做/一起做。
   - **⚠️ cube L1-ring 的真障碍 + 解法(实现前必读)**:cube 要 overlap 就得去 step-boundary barrier,但 **kv 只有 2-深 parity** → load(g) 写 kv[g%2] 撞 MM2(g-2) 读 kv[(g-2)%2](同 parity)= **跨-gloop WAR**,要 back-flag;而**3-深 kv 超 L1 预算**(3×kv 384 + 2×q 128 + p 16 = 528>512;q 单缓冲→464 fit 但 q 又生 WAR)。**解法(避死锁)**:这条 WAR back-flag 的 set 和 wait **都用 `valid(g-2)` 谓词门控**(被复用的那块 kv 的 owner slot)—— set 在 MM2(g-2)(step g-1,valid(g-2))读完 kv 后,wait 在 MM1(g) load(step g)写 kv 前;**两端同 valid(g-2) → set==wait,不死锁**(同 S3b 的 forward-flag 铁律)。**代价:cube 要 decode 3 个 offset(g/g-1/g-2,像 vector 那样),多一个 decode 拿 valid(g-2) 当 wait 门。** 这是这刀最难、最该谨慎 construct+review 的点(死锁雷区,但门控对了就安全)。
   - 次要:vector scalar 24%(832us)偏高 = gloop 每步 3× decode,可 carry decode 标量跨步不重算(降 vector busy)。
+
+### 0.6.1 C1 = cube debarrier/L1-ring 已实现(2026-06-17,construct + 2 轮对抗审 + 我审,待容器验)
+
+**做法**:`sparse_attn_sharedkv_swa` 的 cube scope(kernel.py ~2042-2345)**6 个 `barrier_all` 全删**,换成精确 pipe flag。新增 cube `decode(g-2)→valid2`。flag 表(**eid 空间是 per-HardEvent-DIRECTION**,fork 自己的 gemm 模板 `common.h:586-592/932-947` 把 eid 0 跨 M_FIX/FIX_M/MTE2_M/M_MTE2 同时复用就证明了这点 → within-block 的 (m,fix,0/1/2)/(fix,m,1)/(mte2,m,0) 跟 back-flag 不撞,即便 MM1/MM2 现在重叠):
+- **BACK1 = (m→mte2, eid 0)**:kv/q_l1/p_lo 的跨-gloop WAR。wait 在每步顶(gated `valid2`,排空 MTE2 管),set 在 MM2 两个 gemm 读完 kv 后(gated `valid1`)。set/wait 同 pin slot g-2 → set==wait,无 leak。**一个 MTE2-drain 的 wait 覆盖 kv+q_l1+p_lo 三个**(q_l1/p_lo 靠 in-order MAD/MTE2 传递)。无 pre-set(头两次 kv 写无前读者,valid2=F 自动跳)。
+- **BACK_LC = (fix→m, eid 0)**:**关键坑——`acc_s_l0c` 和 `acc_o_l0c` 别名同一 L0C 地址**(`l0c_addr = {"acc_s_l0c":0, "acc_o_l0c":0}` 行 263 注释「disjoint phases ⇒ alias」;acc_s [64,64]=16KB ⊂ acc_o [64,512]=128KB)。原来纯靠 barrier 把 MM1 的 score-L0C(FIX 读)和 MM2 的 out-L0C(MAD 写)隔成「disjoint phases」。去 barrier 后这俩在同一条链 A1→A2→A3→A4(MM1)→B1→B2→B3(MM2)→A1'... **必须一个统一 WAR flag**:set 在每个 block 最后一次 FIX 读后(MM1 copy_hi / MM2 copy_o),wait 在每个 block 第一次 MAD 写前(MM1 gemm_lo / MM2 gemm)。block-by-block **交替 w,s,w,s** 就把两条缝都缝上(缝1:copy_hi→同步 MM2 gemm;缝2:copy_o→下步 gemm_lo)。pre-set 武装第一个 wait,loop 后 drain 吃最后一个 set。**两个独立 flag(分别管 acc_s/acc_o)会各自配错对、漏掉跨-alias 缝**——这是第一版的真 bug,第 2 个 reviewer 抓到、我合并修了。
+- **within-MM1**:load→gemm RAW 新增 (mte2→m,3);原 (m,fix,0)/(fix,m,1)/(m,fix,2) 链不动。**within-MM2**:原 (mte2,m,0)/(m,fix,1) 不动;两个 P@V gemm 之间的 barrier 删(MAD in-order)。`set_cross_flag("FIX", SCORE/PV_READY)` 本就由 FIX 管序,删它前的 barrier 安全。
+
+**对抗审结论**:① flag 平衡/死锁 reviewer:全 (src,dst,eid) set==wait,prefill(多 slot)/decode(单 slot)/gap/空核/+2 epilogue/冷启全过,无环(每个 blocked wait 的 producer 都是已入队的过去 op)。② 数据冒险 reviewer:**抓到 L0C 别名漏洞**(已修)。③ 合并修复 reviewer:6 项全 PASS,无残留。**两个 load-bearing 前提(都成立)**:N0==N1(靠 +2 epilogue 保证每个 slot 的 MM2 都落在 range 内);`if valid` 必须 lower 成设备分支、wait+set 成对进出同一 `if`(现状 GREEN 行为)。
+
+**预期**:cube 把 mte2(25%,最大 pipe)prefetch 叠到 MAD/FIX 串行链下 → cube 每步更快 → 喂快 SCORE/PV → 砍 vector 34% idle。**按 [[feedback-combined-levers]]:这是组合拳第①刀(root),先单独验 correctness**(死锁风险集中在 cube 跨-gloop WAR)。**perf 可能只部分兑现甚至持平**(vector 自己的 barrier 还在,消费速度受限)——别据此判死,第②刀 vector debarrier 下一轮叠上才看组合 perf。砸了(hang→查 flag 平衡;红→查 data hazard;尤其再查别名):回退本 commit 即可(只动 swa cube scope)。
+
+**容器三验**(改 kernel.py,`cd /sdb/yq/dsv4 && git pull` 即生效):① `pytest -q sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv_fast.py`(prefill deadlock/leak)② `pytest sparse_attn_sharedkv_tilelang/test_sparse_attn_sharedkv.py -k "decode and dtype0"`(真数值,抓 race/WAR)③ `python sparse_attn_sharedkv_perf_compare.py`(perf%)。
 
 ## 0.5 UPDATE 2026-06-16：S3a 前提证伪 → 改做 Q4（debarrier+双缓冲），已 push 待验
 
