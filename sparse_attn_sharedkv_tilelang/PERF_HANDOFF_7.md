@@ -8,7 +8,7 @@
 - **目标（用户北极星）**：复刻 Ascend C 这个算子的计算逻辑 + 性能方案，让 swa 前向做到 AscendC 的 **80–100%**。Ascend C 源码是蓝本，别发明 kernel 侧小技巧；过不去改 fork 编译器（`yangqiang2018/tilelang-ascend`，NPU 验过的成功改动打 `cfeat-*` annotated tag，攒着提上游 issue）。
 - **诚实天花板**：vector 侧便宜刀**已用尽**（brcb/row_muls rescale、SoftmaxFlashV2 fused softmax 都 NPU 验过 = perf 中性，见 _6 §3.6/3.7）。**~50% 是 kernel 侧天花板**。破它只剩 **C（跨-slot 软件流水）**。**注意：即使 C 全成也就 ~55，够不着北极星 80**——80 还得叠 cube 侧（_6 §3.5② L1-ring 预取，又一大改）。**用户已知情拍板「硬上 C」**（知道 ~16-25 容器轮、最好 ~55、砸了全回退）。
 - **perf 现状**：swa **35.6** / cfa **42.3** / scfa 15.0（S1+S2 后）。**比 C 前 baseline swa 42.4 / cfa 49.9 降了 ~7**——这是 S1 把 acc_o 挪 GM 的纯 DMA 成本，**所有恢复+增益押在 S3**。
-- **进度**：S1 ✅、S2 ✅、Q4 ✅(green/perf-flat,证实要 cross-slot)。**S3b ✅ 已实现待容器验**(SWA cross-slot flat-gloop,独立 prim_func;review 抓到「单-chunk SWA 不需要 ws_acc_o」→ 直接 normalize ws_o,修了 stale-read bug + 砍了 −7 源;见 §0.6)。**下一步:容器三验(fast 抓 deadlock / decode 抓 data hazard / perf 看是否冲过 baseline 向 ~50-55)。**
+- **进度**：S1 ✅、S2 ✅、Q4 ✅、**S3b ✅ 容器验绿(swa 35→41.3,cfa 44.2/scfa 15.9 不变)**。profile 实锤**不是天花板**:vector 34% idle 等 cube,cube data-movement-bound(KV 载入 mte2 25% 串行)。**下一步=组合拳:cube debarrier/L1-ring(喂快 SCORE/PV)+ vector debarrier(消快),按组合评估 perf(见 §0.6 + [[feedback-combined-levers]])。cube L1-ring 卡 L1 预算→跨-gloop WAR back-flag 是死锁雷区,需谨慎。**
 
 ## 0.6 S3b 设计已定案（2026-06-16，Plan agent 读真源码 + 我审核）—— 纯 kernel 重写、无需改编译器、分阶段把 all-or-nothing 收敛到一步
 
@@ -32,6 +32,18 @@
 **关键发现(review 阶段我抓到、第一轮 review 漏判的真 bug + 同时是大简化)**:**单-chunk SWA 的 online-softmax 累加器 trivially `acc = 0*alpha + O = O = ws_o`(P@V 输出),没有跨-chunk 累加** —— Ascend C 蓝本直接 normalize 它的 O buffer(vec2ResGm),根本没有独立累加器。所以 V2+tail **直接 normalize ws_o**(load ws_o → div sumexp → Output),**砍掉整个 ws_acc_o GM round-trip(S1 的 −7 来源,对 SWA 本就多余)+ no-op 的 rescale**。这同时**修了一个真 bug**:ws_acc_o 的 2-深 parity 撑不过 3-gloop-step skew —— V0(g) 对 half g%2 的清零被 V2(g-2) 的 store 覆写(g%2==(g-2)%2),V2(g-2) 真正依赖的 re-zero 是 V0(g+2) 的,而它对**最后几个有效 slot 被 skip**(g+2 越界/padded)→ 读到 stale O(g-4)。改读 ws_o(MM2(g-2) 刚写、PV_READY 守)无此问题。**`ws_acc_o` 现在是 SWA 路径的 dead arg(auto-alloc,如 SCFA 容忍)。** sumexp/m_i 用 :1499-safe 的 save/restore(region copy + 单缓冲 *_rt 喂 tile-op)跨 slot 带到 tail;q_l1 双缓冲(L1 重排到 400KB)。
 
 **⚠️ 诚实:这是大重写、本地编不了 tilelang。container 三验是真 gate**:① fast(抓 prefill deadlock —— flag review 说低风险但 hang 最坏)② **`decode and dtype0`(抓 data hazard/wrong-output —— 我抓的那类 bug 的真 gate)** ③ perf。**预期**:Fix B 砍了 ws_acc_o round-trip(−7 源)+ cross-slot overlap 填 bubble → swa 有望从 35 冲过 baseline 42 向 ~50-55。砸了(hang/红/没动)→ 查 flag 平衡 / data hazard / overlap,或回退。
+
+### ✅ S3b 容器验绿 + profile(2026-06-17)—— green,swa 35→41.3,但有大 headroom(不是天花板)
+
+- **green**:fast + `decode and dtype0` 全过(两次 build error 先后修:`(tuple)[mp%2]` FloorMod、`q_l1[g%2]` 3D 缺切片 —— 都是 tilelang parse 错、py_compile 抓不到、容器逐个暴露)。
+- **perf**:swa 35.0→**41.3**(cross-slot overlap + 砍 ws_acc_o 有效,逼近 baseline 42.4)。cfa 44.2 / scfa 15.9 不变(S3b 只动 SWA,CFA/SCFA 走旧 prim_func)。
+- **profile(swa,稳态 ~3640us/kernel)—— 实锤「不是天花板」**:
+  - **vector 是长板(aiv 3542us)但 34% 在 idle**(busy 仅 66%:vec 29%+scalar 24%+mte2 7%+mte3 7%)。idle 是**等 cube 的 SCORE/PV**。
+  - **cube data-movement-bound**:`mte2`(KV/Q GM→L1)**25% 是最大 pipe**;数据搬运(mte1+mte2+fixpipe)56% ≫ mac 14%;cube pipe 基本**串行**(和 82%=18% bubble)。cube_util 94%。
+  - **结论**:cube 的 KV 载入暴露+串行 → SCORE/PV 产得慢 → vector 干等 34%。**离 80 有明确路,不是顶。**
+- **下一刀 = 组合拳(见 [[feedback-combined-levers]],单上一个可能没涨甚至降)**:**① cube debarrier/L1-ring**(去掉 cube gloop 的 barrier_all,让 KV 载入 mte2 叠到 gemm mac 下 → SCORE/PV 产得快 → 减 vector idle)+ **② vector debarrier**(去掉 vector gloop 的 barrier_all,让 V0/V1/V2 phase + VEC/MTE 重叠 → 减 vector busy)。**为什么必须组合**:只② → vector 变快后**更早撞 SCORE/PV 等待、idle 更多**(cube-bound),不涨;要①把 cube 喂快了②才兑现。cube 是 root,先做/一起做。
+  - **⚠️ cube L1-ring 的真障碍(实现前必读)**:cube 要 overlap 就得去 step-boundary barrier,但 **kv 只有 2-深 parity** → load(g+1) 写 kv[(g+1)%2] 撞 MM2(g-1) 读 kv[(g-1)%2](同 parity)= **跨-gloop WAR**,要 back-flag;而**3-深 kv 超 L1 预算**(3×kv 384 + 2×q 128 + p 16 = 528>512;除非 q 单缓冲→464 fit,但 q 又生 WAR)。**跨-gloop WAR back-flag set@valid(g-1)/wait@valid(g+1) 是不同 slot/validity = `:1259` 死锁雷区**(Ascend C 用 3-深 ring 天然避开,我们卡 L1 预算)。这是这刀最难、最该谨慎 construct+review 的点。
+  - 次要:vector scalar 24%(832us)偏高 = gloop 每步 3× decode,可 carry decode 标量跨步不重算(降 vector busy)。
 
 ## 0.5 UPDATE 2026-06-16：S3a 前提证伪 → 改做 Q4（debarrier+双缓冲），已 push 待验
 
