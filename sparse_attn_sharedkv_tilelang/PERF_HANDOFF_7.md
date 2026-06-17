@@ -8,7 +8,7 @@
 - **目标（用户北极星）**：复刻 Ascend C 这个算子的计算逻辑 + 性能方案，让 swa 前向做到 AscendC 的 **80–100%**。Ascend C 源码是蓝本，别发明 kernel 侧小技巧；过不去改 fork 编译器（`yangqiang2018/tilelang-ascend`，NPU 验过的成功改动打 `cfeat-*` annotated tag，攒着提上游 issue）。
 - **诚实天花板**：vector 侧便宜刀**已用尽**（brcb/row_muls rescale、SoftmaxFlashV2 fused softmax 都 NPU 验过 = perf 中性，见 _6 §3.6/3.7）。**~50% 是 kernel 侧天花板**。破它只剩 **C（跨-slot 软件流水）**。**注意：即使 C 全成也就 ~55，够不着北极星 80**——80 还得叠 cube 侧（_6 §3.5② L1-ring 预取，又一大改）。**用户已知情拍板「硬上 C」**（知道 ~16-25 容器轮、最好 ~55、砸了全回退）。
 - **perf 现状**：swa **35.6** / cfa **42.3** / scfa 15.0（S1+S2 后）。**比 C 前 baseline swa 42.4 / cfa 49.9 降了 ~7**——这是 S1 把 acc_o 挪 GM 的纯 DMA 成本，**所有恢复+增益押在 S3**。
-- **进度**：S1✅ S2✅ Q4✅ S3b✅(swa35→41.3) C1 cube debarrier✅(41.3→45.3,+4,过baseline) C2 bulk KV gather✅但**perf平**(45.3→45.1) **C3=L0C ping-pong(M-tiling)已实现+双审过,待容器验**。**关键转折**:C2 平→re-profile 实锤 cube scalar 51% 不是 gather(是 3× decode + C1 加的 flag,C2 只把 mte2 820→754);真瓶颈=C1 让 cube pipe 真重叠(和126%)后**暴露的单块 128KB L0C 串行 MAD/FIX**。C3 复刻 Ascend C 的 2×64KB L0C ping-pong 重叠 MAD/FIX(gemm_v0 不能切操作数→用 **M-tiling 切 heads**(连续切片)而非 D-tiling,免编译器改+保住 C2;详见 §0.6.3)。到 80 仍需叠 decode-carry(削 scalar)+ vector。
+- **进度**：S1✅ S2✅ Q4✅ S3b✅(swa35→41.3) **C1 cube debarrier✅(41.3→45.3,+4,过baseline)** C2 bulk KV gather✅但**perf平**(→45.1,保留:更像 Ascend C 的 bulk DataCopy) **C3=L0C ping-pong(M-tiling)❌回退(45→42,−3)**。**当前 swa≈45(C2 态,kernel revert 回 617af1d)**。**关键转折/结论**:kernel 层微调已**见顶 ~45**(C1 是主要增益;C2 平;C3 regression)。真瓶颈=C1 让 cube pipe 真重叠后**暴露的单块 128KB L0C 串行 MAD/FIX**;Ascend C 用 2×64KB L0C ping-pong(gemm 内部跨 N/K-tile)。**但 `gemm_v0` 是黑盒、不暴露 intra-gemm L0 ping-pong → kernel.py 够不着 → 追 Ascend C 必须改编译器(method 第③步)**。**已暂停等用户拍板**(见 §0.6.4)。
 
 ## 0.6 S3b 设计已定案（2026-06-16，Plan agent 读真源码 + 我审核）—— 纯 kernel 重写、无需改编译器、分阶段把 all-or-nothing 收敛到一步
 
@@ -72,7 +72,11 @@
 
 **下一步若 cube 不再是瓶颈**:decode-carry(把 valid(g) 存 3-深 rotating UB,g-1/g-2 不重算,省 2+2 div/mod,**cube+vector scalar 都受益**)+ vector debarrier(seed/restore/LSE 的 glue barrier)。先 profile 再定。
 
-### 0.6.3 C3 = L0C ping-pong(M-tiling)已实现(2026-06-17,construct + 2 轮对抗审 + 我审,待容器验)
+### 0.6.3 C3 = L0C ping-pong(M-tiling)❌ 容器验**回退**(2026-06-17,swa 45→42,−3 regression,已 revert 回 C2)
+
+> **结果**:green(fast + decode/dtype0 过,M-tiling 数值对),但 **swa 45→42.0(−3 regression)**。原因:**M-tiling 把 P@V 从 2 个 M=64 gemm 拆成 4 个 M=32 gemm**(+ O-copy 2×、p-load 4×),M=32 gemm 效率低 + 拆分开销 **> ping-pong 重叠收益**。**已 git revert kernel.py 回 C2(617af1d,swa~45)。** **教训 + 关键结论**:这不是 Ascend C 的忠实复刻——Ascend C ping-pong 是 **gemm 内部** 跨 N/K-tile(M 保持 128 大),而我在 kernel 层只能 M-split(因为 `gemm_v0` 是黑盒、不暴露 intra-gemm L0 tiling/ping-pong)。**真正的 L0 ping-pong 在 gemm_v0 抽象之下,kernel.py 够不着 → 要追 Ascend C 必须改编译器(让 gemm_v0 内部做 L0A/L0B/L0C ping-pong,复刻 Ascend C 手写 gemm)。** 这是 method-priority 第③步,**已暂停等用户拍板**(见 §0.6.4)。reviewer 教训:gemm_v0 静态分析要锁定 `tilelang/language/ascend.py` 那份(不是 pto.py)。
+
+#### (以下为 C3 设计记录,保留作分析;C3 已回退)
 
 > **C2 平 → 第二次 re-profile(swa,post-C2)实锤真瓶颈**:cube aicore_time 3047us(util 96.7%,长板),scalar 1577us(51%,C2 后**几乎没变** 1584→1577,证实 gather 不是 scalar 大头);mte2 820→754(C2 唯一效果)。cube pipe **和 126%**(C1 让它们真重叠了),但 cube 时间没怎么降——因为**单块 128KB L0C 逼着 MAD/FIX 串行**(acc_o[64,512]=128KB 占满 L0C,acc_s 只能别名它,故 MM1/MM2 整条 gemm→copy 链串行)。Ascend C 用 **2×64KB L0C ping-pong**(`cL0BufIter%2`,swa_block_cube.h:560)让 copy(FIX)叠到下个 gemm(MAD)下——这是我们最大的结构性差异。
 
@@ -84,7 +88,20 @@
 
 **对抗审(2 reviewer + 我)**:① flag 平衡/死锁:全 (src,dst,eid) set==wait,gap/冷启/空核全过,无环;唯一 load-bearing 前提 N0==N1==N2(+2 epilogue 保证)。② 正确性 5 项全 PASS——M-tiling 重构出与旧 acc_o[0:64] 字节同一;slot 内 acc_s⊂acc_o 别名被 per-slot WAR 完整覆盖(gate 整 slot 非字节范围);**gemm_v0 M-slice(p_lo[32:64,:] 非零起点连续行切片)reviewer 读 codegen 确认对**(_retrieve_ptr offset=2048→GetSliceInfo 出 [32,64]→CreateCubeVariable base+offset,M 从 C 取);残留只是「静态确认非编译确认」,容器一跑即知。
 
-**预期**:copy(FIX,大头是 acc_o[*,512] 的 O 写)叠到 MAD 下 → cube 往 vector floor(~2407us)掉 → swa 45→~52-54。**scalar 51% 仍在**(C3 不碰 decode),到 80 还要 decode-carry + vector。砸了(hang→flag;红→M-tiling 地址/gemm_v0 M-slice;尤其若 build error 提示 gemm operand)回退本 commit(只动 swa cube L0C/MM1/MM2)。
+**预期(已证伪)**:原以为 copy 叠 MAD → swa 45→~52-54。**实际 −3 regression**(M=32 gemm + 拆分开销 > 重叠收益)。
+
+### 0.6.4 转折点:kernel 层见顶 ~45,追 Ascend C 需改编译器(等用户拍板,2026-06-17)
+
+**诚实盘点**:vector 便宜刀(brcb/softmax)用尽 ~42;C 跨-slot 流水(S3b)+ cube debarrier(C1)拿到 **45**(主要增益是 C1 的 +4);C2 平、C3 regression。**kernel.py 层(把 gemm_v0/copy/flag 当积木)已见顶 ~45。** Ascend C 是 **1.88ms**,TileLang **4.18ms ≈ 2.2×**。
+
+**为什么 kernel 层够不着**:剩下的大结构性差异都在 `gemm_v0` 抽象**之下**:
+1. **L0 ping-pong(L0A/L0B/L0C 各 2×64KB,`cL0BufIter%2`)** —— Ascend C 在**一个 gemm 内部** 跨 N/K-tile ping-pong,让 LoadData(MTE1)/MAD/copy(FIX)流水重叠。`gemm_v0` 是单次黑盒调用(N 从 output 推、整 [M,N,K] 一把算),**不暴露内部 tiling/ping-pong**;kernel 层只能在外面 M-split(C3,M=32 反而更慢)。
+2. **unitFlag fixpipe drain** —— Ascend C `cube_block` 用 unitFlag 把 fixpipe 的 drain 融进 gemm,kernel 层用 set/wait_flag 显式同步、开销更高。
+3. **3-深 L1 ring** —— L1 预算 512KB 装不下 3×kv(528>512),2-深 prefetch 浅。
+
+**提议的编译器改(fork `tilelang-ascend`,method 第③④步,兼容性 additive)**:给 `gemm_v0` 加一个 **pipelined 变体**(或 flag/参数),让它内部做 Ascend C 式的 L0A/L0B/L0C 2×64KB ping-pong + N/K-tile 流水(复刻 `swa_block_cube.h` 的手写 gemm)。这样单次 `T.gemm_v0_pp(...)` 就能 intra-gemm 重叠 MTE1/MAD/FIX,cube 往 vector floor 掉。NPU 验过打 `cfeat-gemm-l0-pingpong` tag。**风险**:动 codegen 的 gemm 发射,要保证旧 gemm_v0 路径字节不变(其它 kernel 在用)。**工作量大、需谨慎设计 + 对抗审。**
+
+**⚠️ 已暂停**:用户要求改编译器前先确认。**下一步 = 等用户拍板「上编译器改」**;若同意,先 Plan agent 读 `swa_block_cube.h` 的 gemm + fork `gemm_v0`/`ascend_gemm_v0` codegen,设计 additive 的 pipelined 变体。备选(若不上编译器):接受 ~45 收官,或回头啃 vector/decode-carry 的小钱(profile 显示 vector idle 24%、cube scalar 51%,但 cube 是长板、降 vector 不直接涨,降 scalar C2 已证基本不涨)。
 
 ## 0.5 UPDATE 2026-06-16：S3a 前提证伪 → 改做 Q4（debarrier+双缓冲），已 push 待验
 
